@@ -123,10 +123,10 @@ const IntegrationsPanel: React.FC = () => {
       .then((s) => setICloudAvailable(!!s.available && !!s.documentsPath))
       .catch(() => setICloudAvailable(false));
   }, []);
-  // Third-party cloud sync will be a premium feature (any paid plan), but it is
-  // temporarily UNGATED while the feature stabilises — `isCloudSyncAllowed`
-  // returns true for every plan until `CLOUD_SYNC_REQUIRES_PREMIUM` is flipped
-  // back on. The `?? 'free'` keeps the (re-gated) loading state non-premium.
+  // Third-party cloud sync is permanently UNGATED in this fork —
+  // `isCloudSyncAllowed` returns true for every plan because
+  // `CLOUD_SYNC_REQUIRES_PREMIUM` is flipped off. The `?? 'free'` keeps the
+  // loading state non-premium in the (hypothetical) re-gated upstream build.
   const { userProfilePlan } = useQuotaStats();
   const isCloudSyncPremium = isCloudSyncAllowed(userProfilePlan ?? 'free');
   // Only surface the tier chip to users who cannot use the feature yet — signed
