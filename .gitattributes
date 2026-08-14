@@ -1,0 +1,3 @@
+# Husky hook scripts must stay LF even with core.autocrlf=true (WSL/Windows
+# mixed setups): a CRLF pre-commit makes `lint-staged\r` ENOENT in bash.
+.husky/* text eol=lf
