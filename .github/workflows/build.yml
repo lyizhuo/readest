@@ -1,0 +1,66 @@
+# Build the readest web client (production-stage) on a native arm64 runner and
+# push to GHCR. The server deploys with `docker compose pull && up -d`.
+#
+# Fork-specific deployment file. Triggered on:
+#   - push to main (rolling `latest` + `main` tags)
+#   - push of a v* tag (immutable release tag, e.g. v1.0.0)
+#   - manual workflow_dispatch
+#
+# NEXT_PUBLIC_* build args are public-by-design values (same values the
+# browser receives); runtime overrides live in the container env on the
+# server (see docker/docker-compose.client.yaml), so changing them needs no
+# rebuild.
+
+name: build-and-push
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          target: production-stage
+          push: true
+          platforms: linux/arm64
+          build-args: |
+            NEXT_PUBLIC_APP_PLATFORM=web
+            NEXT_PUBLIC_SUPABASE_URL=https://fiwgjtjwpzpkuhxzvwmp.supabase.co
+            NEXT_PUBLIC_SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZpd2dqdGp3cHpwa3VoeHp2d21wIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODY3Njc4MTAsImV4cCI6MjEwMjM0MzgxMH0.pM4OK8-mgtlM3ag7wiTdfCrCAD6X76Cbom_-l4Ko6zU
+            NEXT_PUBLIC_API_BASE_URL=https://read.620602.xyz
+            NEXT_PUBLIC_OBJECT_STORAGE_TYPE=s3
+            NEXT_PUBLIC_STORAGE_FIXED_QUOTA=10737418240
+            NEXT_PUBLIC_TRANSLATION_FIXED_QUOTA=1000000
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/readest-client:latest
+            ghcr.io/${{ github.repository_owner }}/readest-client:${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

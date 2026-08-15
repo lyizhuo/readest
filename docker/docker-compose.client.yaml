@@ -1,0 +1,47 @@
+# Thin deployment: ONE client container. Auth/database live on hosted
+# Supabase, object storage on Cloudflare R2 — nothing else runs on the server.
+#
+# Usage (on the arm64 server):
+#   cp docker/.env.client.example docker/.env.client
+#   # fill in secrets, then:
+#   docker compose -f docker/docker-compose.client.yaml up -d
+#
+# Update: docker compose -f docker/docker-compose.client.yaml pull && up -d
+
+name: readest-client
+
+services:
+  client:
+    image: ghcr.io/lyizhuo/readest-client:latest
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      # Auth (hosted Supabase)
+      SUPABASE_URL: https://fiwgjtjwpzpkuhxzvwmp.supabase.co
+      SUPABASE_PUBLIC_URL: https://fiwgjtjwpzpkuhxzvwmp.supabase.co
+      SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY}
+      SUPABASE_ADMIN_KEY: ${SUPABASE_ADMIN_KEY}
+      # Public origin of this deployment (browser-facing API base)
+      API_BASE_URL: ${API_BASE_URL:-https://read.620602.xyz}
+      # Object storage: Cloudflare R2 (S3-compatible), replaces in-stack MinIO
+      OBJECT_STORAGE_TYPE: s3
+      S3_ENDPOINT: ${S3_ENDPOINT:-https://0b01c93919a9dcaf28116415985d21c7.r2.cloudflarestorage.com}
+      S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:-https://0b01c93919a9dcaf28116415985d21c7.r2.cloudflarestorage.com}
+      S3_REGION: ${S3_REGION:-auto}
+      S3_BUCKET_NAME: ${S3_BUCKET_NAME:-readest}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY}
+      # Self-hosted quotas (our own backend, our own rules)
+      STORAGE_FIXED_QUOTA: ${STORAGE_FIXED_QUOTA:-10737418240}
+      TRANSLATION_FIXED_QUOTA: ${TRANSLATION_FIXED_QUOTA:-1000000}
+      # Mirror of Readest's CJK webfont bundles; leave empty to use the
+      # upstream CDN (only answers CORS for readest.com origins)
+      FONT_BASE_URL: ${FONT_BASE_URL:-}
+
+  # Wire this in once the domain is on Cloudflare. Token: Cloudflare dashboard
+  # -> Zero Trust -> Networks -> Tunnels. Zero inbound ports on the server.
+  # cloudflared:
+  #   image: cloudflare/cloudflared:latest
+  #   restart: unless-stopped
+  #   command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
