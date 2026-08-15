@@ -4,9 +4,16 @@
 # Usage (on the arm64 server):
 #   cp docker/.env.client.example docker/.env.client
 #   # fill in secrets, then:
-#   docker compose -f docker/docker-compose.client.yaml up -d
+#   docker compose --env-file docker/.env.client \
+#     -f docker/docker-compose.client.yaml up -d
 #
-# Update: docker compose -f docker/docker-compose.client.yaml pull && up -d
+# NOTE: compose only auto-loads a file literally named `.env` in the working
+# directory. The secrets file here is `.env.client`, so `--env-file` is
+# required — without it every variable without a `:-default` is empty
+# (e.g. SUPABASE_ANON_KEY), and auth breaks at runtime.
+#
+# Update: docker compose --env-file docker/.env.client \
+#   -f docker/docker-compose.client.yaml pull && up -d
 
 name: readest-client
 
