@@ -17,6 +17,7 @@ import {
   DEFAULT_MOBILE_READSETTINGS,
   DEFAULT_SCREEN_CONFIG,
   DEFAULT_TRANSLATOR_CONFIG,
+  DEFAULT_ARCHIVE_SETTINGS,
   SETTINGS_FILENAME,
   DEFAULT_MOBILE_SYSTEM_SETTINGS,
   DEFAULT_ANNOTATOR_CONFIG,
@@ -160,6 +161,11 @@ export async function loadSettings(ctx: Context): Promise<SystemSettings> {
   settings.aiSettings = {
     ...DEFAULT_AI_SETTINGS,
     ...settings.aiSettings,
+  };
+  // Fork feature: reading-archive settings group (PRD module gate).
+  settings.archive = {
+    ...DEFAULT_ARCHIVE_SETTINGS,
+    ...settings.archive,
   };
 
   settings.localBooksDir = await ctx.fs.getPrefix('Books');

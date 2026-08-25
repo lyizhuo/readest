@@ -5,6 +5,10 @@ import { MdManageSearch } from 'react-icons/md';
 import { PiPlus } from 'react-icons/pi';
 import { PiSelectionAll, PiSelectionAllFill } from 'react-icons/pi';
 import { PiDotsThreeCircle } from 'react-icons/pi';
+// Fork feature: reading-archive entry (see FORK_CHANGES.md).
+import { PiBooks } from 'react-icons/pi';
+import { useRouter } from 'next/navigation';
+import { useSettingsStore } from '@/store/settingsStore';
 import { MdOutlineMenu } from 'react-icons/md';
 import { IoMdCloseCircle } from 'react-icons/io';
 
@@ -68,6 +72,10 @@ const LibraryHeader: React.FC<LibraryHeaderProps> = ({
   const { appService } = useEnv();
   const { systemUIVisible, statusBarHeight } = useThemeStore();
   const { currentBookshelf } = useLibraryStore();
+  // Fork feature: reading-archive entry (see FORK_CHANGES.md).
+  const router = useRouter();
+  const { settings } = useSettingsStore();
+  const archiveEnabled = (settings.archive?.enabled ?? true) === true;
 
   const headerRef = useRef<HTMLDivElement>(null);
   const { isTrafficLightVisible } = useTrafficLight(headerRef);
@@ -259,6 +267,17 @@ const LibraryHeader: React.FC<LibraryHeaderProps> = ({
             >
               <ViewMenu />
             </Dropdown>
+            {archiveEnabled && (
+              <button
+                type='button'
+                aria-label={_('Reading Archive')}
+                title={_('Reading Archive')}
+                className='btn btn-ghost h-8 min-h-8 w-8 p-0'
+                onClick={() => router.push('/archive')}
+              >
+                <PiBooks role='none' size={iconSize18} />
+              </button>
+            )}
             <Dropdown
               label={_('Settings Menu')}
               className='exclude-title-bar-mousedown dropdown-bottom dropdown-end'

@@ -1,4 +1,5 @@
 import { MigrationEntry, SchemaType } from '../migrate';
+import { ARCHIVE_MIGRATIONS } from '@/features/archive/db/migrations';
 
 /**
  * Migration definitions for each schema type.
@@ -26,6 +27,9 @@ const migrations: Record<SchemaType, MigrationEntry[]> = {
       `,
     },
   ],
+  // Reading-archive fork feature: book profiles, statuses, tags, rounds.
+  // Schema lives in features/archive/db/migrations.ts.
+  archive: ARCHIVE_MIGRATIONS,
   'bookorbit-sync': [
     {
       name: '2026080401_bookorbit_sync',

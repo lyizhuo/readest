@@ -33,6 +33,9 @@ import LangPanel from './LangPanel';
 import MiscPanel from './MiscPanel';
 import AIPanel from './AIPanel';
 import TTSPanel from './TTSPanel';
+// Fork feature: reading-archive settings (see FORK_CHANGES.md).
+import ArchivePanel from './ArchivePanel';
+import { PiBooks } from 'react-icons/pi';
 
 export type SettingsPanelType =
   | 'Font'
@@ -43,6 +46,7 @@ export type SettingsPanelType =
   | 'Language'
   | 'AI'
   | 'Integrations'
+  | 'Archive'
   | 'Custom';
 export type SettingsPanelPanelProp = {
   bookKey: string;
@@ -110,6 +114,12 @@ const SettingsDialog: React.FC<{ bookKey: string }> = ({ bookKey }) => {
       tab: 'Integrations',
       icon: RiShareLine,
       label: _('Integrations'),
+    },
+    // Fork feature: reading-archive settings (see FORK_CHANGES.md).
+    {
+      tab: 'Archive',
+      icon: PiBooks,
+      label: _('Archive'),
     },
     {
       tab: 'AI',
@@ -180,6 +190,7 @@ const SettingsDialog: React.FC<{ bookKey: string }> = ({ bookKey }) => {
     Language: null,
     AI: null,
     Integrations: null,
+    Archive: null,
     Custom: null,
   });
 
@@ -214,6 +225,7 @@ const SettingsDialog: React.FC<{ bookKey: string }> = ({ bookKey }) => {
         language: 'Language',
         ai: 'AI',
         integrations: 'Integrations',
+        archive: 'Archive',
         custom: 'Custom',
       };
       const panelKey = parts[1]?.toLowerCase();
@@ -474,6 +486,7 @@ const SettingsDialog: React.FC<{ bookKey: string }> = ({ bookKey }) => {
         )}
         {activePanel === 'AI' && <AIPanel />}
         {activePanel === 'Integrations' && <IntegrationsPanel />}
+        {activePanel === 'Archive' && <ArchivePanel />}
         {activePanel === 'Custom' && (
           <MiscPanel
             bookKey={bookKey}

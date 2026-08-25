@@ -4,7 +4,7 @@ import { RiFontSize, RiDashboardLine, RiTranslate, RiShareLine } from 'react-ico
 import { VscSymbolColor } from 'react-icons/vsc';
 import { LiaHandPointerSolid } from 'react-icons/lia';
 import { IoAccessibilityOutline } from 'react-icons/io5';
-import { PiRobot, PiSpeakerHigh, PiSun, PiMoon } from 'react-icons/pi';
+import { PiRobot, PiSpeakerHigh, PiSun, PiMoon, PiBooks } from 'react-icons/pi';
 import { TbSunMoon } from 'react-icons/tb';
 import { MdRefresh } from 'react-icons/md';
 import { IconType } from 'react-icons';
@@ -155,6 +155,8 @@ const panelIcons: Record<SettingsPanelType, IconType> = {
   Language: RiTranslate,
   AI: PiRobot,
   Integrations: RiShareLine,
+  // Fork feature: reading-archive settings panel (see FORK_CHANGES.md).
+  Archive: PiBooks,
   Custom: IoAccessibilityOutline,
 };
 

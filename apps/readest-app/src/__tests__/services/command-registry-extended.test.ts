@@ -22,6 +22,7 @@ vi.mock('react-icons/pi', () => ({
   PiSpeakerHigh: () => null,
   PiSun: () => null,
   PiMoon: () => null,
+  PiBooks: () => null,
 }));
 vi.mock('react-icons/tb', () => ({
   TbSunMoon: () => null,

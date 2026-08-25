@@ -349,6 +349,17 @@ export interface HardwarePageTurnerSettings {
   };
 }
 
+/**
+ * Reading-archive fork feature (PRD module gate). When `enabled` is false
+ * every archive surface stays hidden and the app behaves exactly like
+ * upstream Readest.
+ */
+export interface ArchiveSettings {
+  enabled: boolean;
+  /** Daily reading goal in minutes (module C1). */
+  dailyGoalMinutes: number;
+}
+
 export interface SystemSettings {
   version: number;
   migrationVersion: number;
@@ -502,6 +513,9 @@ export interface SystemSettings {
    * replica sync. Future replica kinds add new SyncCategory members.
    */
   syncCategories?: Partial<Record<SyncCategory, boolean>>;
+
+  /** Reading-archive fork feature settings (see ArchiveSettings). */
+  archive: ArchiveSettings;
 
   // Global read settings that apply to the reader page
   globalReadSettings: ReadSettings;

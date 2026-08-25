@@ -36,6 +36,8 @@ import { isTauriAppPlatform, isWebAppPlatform } from '@/services/environment';
 import { checkForAppUpdates, checkAppReleaseNotes } from '@/helpers/updater';
 import { impactFeedback } from '@tauri-apps/plugin-haptics';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
+// Fork feature: reading-archive auto-profiling (see FORK_CHANGES.md).
+import { ensureArchiveEntries } from '@/features/archive/sync/profileSync';
 
 import { useEnv } from '@/context/EnvContext';
 import { useAuth } from '@/context/AuthContext';
@@ -755,6 +757,15 @@ const LibraryPageContent = ({ searchParams }: { searchParams: ReadonlyURLSearchP
       // do we commit it.
       if (!hasCachedLibrary || library !== libraryBooks) {
         setLibrary(library);
+      }
+      // Fork feature: auto-create archive profiles for new books
+      // (PRD A1; see FORK_CHANGES.md). Fire-and-forget — must never block
+      // or break the library surface.
+      if (settings.archive?.enabled !== false) {
+        void ensureArchiveEntries(
+          appService,
+          library.filter((book) => !book.deletedAt),
+        );
       }
       setLibraryLoaded(true);
       if (loadingTimeout) clearTimeout(loadingTimeout);

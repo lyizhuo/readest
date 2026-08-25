@@ -431,6 +431,16 @@ const SettingsMenu: React.FC<SettingsMenuProps> = ({ onPullLibrary, setIsDropdow
         }
         onClick={cycleThemeMode}
       />
+      {/* Fork feature: reading-archive entry (see FORK_CHANGES.md). */}
+      {(settings.archive?.enabled ?? true) && (
+        <MenuItem
+          label={_('Reading Archive')}
+          onClick={() => {
+            router.push('/archive');
+            setIsDropdownOpen?.(false);
+          }}
+        />
+      )}
       <MenuItem label={_('Settings')} Icon={PiGear} onClick={openSettingsDialog} />
       <hr aria-hidden='true' className='border-base-200 my-1' />
       <MenuItem label={_('Advanced Settings')}>

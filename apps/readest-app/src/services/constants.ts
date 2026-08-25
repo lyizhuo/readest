@@ -18,6 +18,7 @@ import {
   WordLensConfig,
 } from '@/types/book';
 import {
+  ArchiveSettings,
   HardcoverSettings,
   BookOrbitSettings,
   KOSyncSettings,
@@ -169,6 +170,11 @@ export const DEFAULT_ICLOUD_SETTINGS = {
   lastSyncedAt: 0,
 } as ICloudSettings;
 
+export const DEFAULT_ARCHIVE_SETTINGS = {
+  enabled: true,
+  dailyGoalMinutes: 60,
+} as ArchiveSettings;
+
 export const DEFAULT_SYSTEM_SETTINGS: Partial<SystemSettings> = {
   keepLogin: false,
   alwaysOnTop: false,
@@ -234,6 +240,7 @@ export const DEFAULT_SYSTEM_SETTINGS: Partial<SystemSettings> = {
   onedrive: DEFAULT_ONEDRIVE_SETTINGS,
   icloud: DEFAULT_ICLOUD_SETTINGS,
   aiSettings: DEFAULT_AI_SETTINGS,
+  archive: DEFAULT_ARCHIVE_SETTINGS,
 
   lastSyncedAtBooks: 0,
   lastSyncedAtConfigs: 0,
