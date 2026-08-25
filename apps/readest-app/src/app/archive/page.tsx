@@ -10,11 +10,11 @@ import { useTranslation } from '@/hooks/useTranslation';
 import { navigateToLibrary } from '@/utils/nav';
 
 import { ARCHIVE_STATUSES, ARCHIVE_STATUS_KEYS, ArchiveStatus } from '@/features/archive/types';
-import { ArchiveDb } from '@/features/archive/db/archiveDb';
 import StatusBadge from '@/features/archive/components/StatusBadge';
-import { buildLibraryCsv, CsvExportRow } from '@/features/archive/library/csvExport';
 import { useArchiveLibrary } from '@/features/archive/hooks/useArchiveLibrary';
+import { ArchiveDb } from '@/features/archive/db/archiveDb';
 import ReadingHome from '@/features/archive/components/ReadingHome';
+import ExportDialog from '@/features/archive/components/ExportDialog';
 
 const STATUS_ORDER: (ArchiveStatus | 'all')[] = ['all', ...ARCHIVE_STATUSES];
 
@@ -26,12 +26,12 @@ const ArchivePage: React.FC = () => {
   const _ = useTranslation();
   const router = useRouter();
   const { safeAreaInsets } = useThemeStore();
-  const { appService } = useEnv();
   const { enabled, loaded, books, tags, refresh, getCoverUrl } = useArchiveLibrary();
 
   const [statusFilter, setStatusFilter] = useState<ArchiveStatus | 'all'>('all');
   const [query, setQuery] = useState('');
   const [tagManagerOpen, setTagManagerOpen] = useState(false);
+  const [exportDialogOpen, setExportDialogOpen] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
 
   useEffect(() => {
@@ -63,32 +63,6 @@ const ArchivePage: React.FC = () => {
     window.setTimeout(() => setToast(null), 2000);
   };
 
-  const handleExportCsv = async () => {
-    if (!appService || books.length === 0) return;
-    const db = await ArchiveDb.open(appService);
-    const rows: CsvExportRow[] = [];
-    for (const book of books) {
-      const [tagNames, rounds] = await Promise.all([
-        db.listBookTagNames(book.id),
-        db.listRounds(book.id),
-      ]);
-      rows.push({
-        book,
-        tags: tagNames,
-        totalReadingMinutes: rounds.reduce((sum, round) => sum + round.totalSeconds, 0) / 60,
-        finishedRounds: rounds.filter((round) => round.status === 'finished').length,
-      });
-    }
-    const csv = buildLibraryCsv(rows);
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = `readest-library-${new Date().toISOString().slice(0, 10)}.csv`;
-    anchor.click();
-    URL.revokeObjectURL(url);
-  };
-
   if (!enabled) return null;
 
   return (
@@ -114,15 +88,18 @@ const ArchivePage: React.FC = () => {
           <button className='btn btn-ghost btn-sm' onClick={() => setTagManagerOpen(true)}>
             {_('Tags')}
           </button>
+          <button className='btn btn-ghost btn-sm' onClick={() => router.push('/archive/notes')}>
+            {_('Notes')}
+          </button>
           <button className='btn btn-ghost btn-sm' onClick={() => router.push('/archive/calendar')}>
             {_('Calendar')}
           </button>
           <button
             className='btn btn-ghost btn-sm'
             disabled={books.length === 0}
-            onClick={handleExportCsv}
+            onClick={() => setExportDialogOpen(true)}
           >
-            {_('Export CSV')}
+            {_('Export')}
           </button>
         </div>
       </header>
@@ -204,6 +181,10 @@ const ArchivePage: React.FC = () => {
             showToast(_('Tags updated'));
           }}
         />
+      )}
+
+      {exportDialogOpen && (
+        <ExportDialog books={books} onClose={() => setExportDialogOpen(false)} />
       )}
 
       {toast && (

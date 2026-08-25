@@ -3,6 +3,9 @@ import { MigrationEntry } from '@/services/database/migrate';
 /**
  * archive.db schema migrations. Append-only: never reorder or edit an
  * applied entry — add a new dated entry instead (see services/database/migrate.ts).
+ *
+ * NOTE: migrate() splits statements on ';' so comment text must not contain
+ * semicolons.
  */
 export const ARCHIVE_MIGRATIONS: MigrationEntry[] = [
   {
@@ -103,6 +106,37 @@ export const ARCHIVE_MIGRATIONS: MigrationEntry[] = [
       CREATE INDEX IF NOT EXISTS idx_sessions_start ON sessions(started_at);
 
       CREATE INDEX IF NOT EXISTS idx_sessions_open ON sessions(open);
+    `,
+  },
+  {
+    name: '2026082603_archive_notes_kv',
+    sql: `
+      -- Thoughts. Excerpts stay owned by upstream config.json and are read
+      -- on demand, so this table stores only archive-native notes.
+      CREATE TABLE IF NOT EXISTS notes (
+        id TEXT PRIMARY KEY,
+        book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+        round_no INTEGER NOT NULL DEFAULT 1,
+        parent_note_id TEXT,
+        cfi TEXT,
+        chapter_title TEXT,
+        page INTEGER,
+        progress REAL,
+        content TEXT NOT NULL DEFAULT '',
+        attachments TEXT NOT NULL DEFAULT '[]',
+        tags TEXT NOT NULL DEFAULT '[]',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        deleted_at INTEGER
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_notes_book ON notes(book_id, round_no);
+
+      -- Small settings store (e.g. export templates).
+      CREATE TABLE IF NOT EXISTS kv (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
     `,
   },
 ];

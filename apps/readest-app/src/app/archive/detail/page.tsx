@@ -17,6 +17,7 @@ import {
   ArchiveRound,
   ArchiveStatus,
 } from '@/features/archive/types';
+import NotesSection from '@/features/archive/components/NotesSection';
 import { ArchiveDb } from '@/features/archive/db/archiveDb';
 
 /**
@@ -451,6 +452,7 @@ const ArchiveDetailPageContent: React.FC = () => {
         </div>
       </section>
 
+      <NotesSection book={book} />
       <footer className='px-4 pb-8'>
         <button className='btn btn-ghost btn-sm text-error' onClick={handleDeleteProfile}>
           {_('Delete profile')}

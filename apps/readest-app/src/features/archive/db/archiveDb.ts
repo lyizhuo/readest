@@ -87,20 +87,62 @@ export interface SessionWithBook extends SessionRecord {
   bookHash: string | null;
 }
 
-function mapSession(row: SessionRow): SessionRecord {
+interface NoteRow extends DatabaseRow {
+  id: string;
+  book_id: string;
+  round_no: number;
+  parent_note_id: string | null;
+  cfi: string | null;
+  chapter_title: string | null;
+  page: number | null;
+  progress: number | null;
+  content: string;
+  attachments: string;
+  tags: string;
+  created_at: number;
+  updated_at: number;
+  deleted_at: number | null;
+}
+
+export interface ArchiveNote {
+  id: string;
+  bookId: string;
+  roundNo: number;
+  /** Upstream BookNote.id when this thought hangs off an excerpt. */
+  parentNoteId: string | null;
+  cfi: string | null;
+  chapterTitle: string | null;
+  page: number | null;
+  progress: number | null;
+  content: string;
+  attachments: string[];
+  tags: string[];
+  createdAt: number;
+  updatedAt: number;
+  deletedAt: number | null;
+}
+
+export interface ArchivedNoteWithBook extends ArchiveNote {
+  bookTitle: string;
+  bookHash: string | null;
+}
+
+function mapNote(row: NoteRow): ArchiveNote {
   return {
     id: row.id,
     bookId: row.book_id,
     roundNo: row.round_no,
-    device: row.device,
-    startedAt: row.started_at,
-    endedAt: row.ended_at,
-    durationSec: row.duration_sec,
-    progressStart: row.progress_start,
-    progressEnd: row.progress_end,
-    pagesRead: row.pages_read,
-    noteCountDelta: row.note_count_delta,
-    open: !!row.open,
+    parentNoteId: row.parent_note_id,
+    cfi: row.cfi,
+    chapterTitle: row.chapter_title,
+    page: row.page,
+    progress: row.progress,
+    content: row.content,
+    attachments: parseJsonArray(row.attachments),
+    tags: parseJsonArray(row.tags),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    deletedAt: row.deleted_at,
   };
 }
 
@@ -147,6 +189,22 @@ function mapBook(row: BookRow): ArchiveBook {
   };
 }
 
+function mapSession(row: SessionRow): SessionRecord {
+  return {
+    id: row.id,
+    bookId: row.book_id,
+    roundNo: row.round_no,
+    device: row.device,
+    startedAt: row.started_at,
+    endedAt: row.ended_at,
+    durationSec: row.duration_sec,
+    progressStart: row.progress_start,
+    progressEnd: row.progress_end,
+    pagesRead: row.pages_read,
+    noteCountDelta: row.note_count_delta,
+    open: !!row.open,
+  };
+}
 // Module-level singleton. OPFS (web build) permits only ONE access handle per
 // file per origin — a second concurrent connect() to archive.db throws
 // NoModificationAllowedError, so every caller must share one open promise
@@ -677,6 +735,196 @@ export class ArchiveDb {
       [startMs, endMs],
     );
     return rows[0]?.total ?? 0;
+  }
+
+  // ----------------------------------------------------------------- notes
+
+  /** Creates a thought note; returns its id. */
+  async createThought(input: {
+    bookId: string;
+    roundNo: number;
+    parentNoteId?: string | null;
+    cfi?: string | null;
+    chapterTitle?: string | null;
+    page?: number | null;
+    progress?: number | null;
+    content: string;
+    attachments?: string[];
+    tags?: string[];
+  }): Promise<string> {
+    const now = Date.now();
+    const id = uuidv4();
+    await this.db.execute(
+      `INSERT INTO notes (
+         id, book_id, round_no, parent_note_id, cfi, chapter_title, page,
+         progress, content, attachments, tags, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id,
+        input.bookId,
+        input.roundNo,
+        input.parentNoteId ?? null,
+        input.cfi ?? null,
+        input.chapterTitle ?? null,
+        input.page ?? null,
+        input.progress ?? null,
+        input.content,
+        JSON.stringify(input.attachments ?? []),
+        JSON.stringify(input.tags ?? []),
+        now,
+        now,
+      ],
+    );
+    return id;
+  }
+
+  async updateThought(
+    id: string,
+    patch: Partial<
+      Pick<ArchiveNote, 'content' | 'chapterTitle' | 'page' | 'progress' | 'attachments' | 'tags'>
+    >,
+  ): Promise<void> {
+    const sets: string[] = [];
+    const values: unknown[] = [];
+    if ('content' in patch) {
+      sets.push('content = ?');
+      values.push(patch.content ?? '');
+    }
+    if ('chapterTitle' in patch) {
+      sets.push('chapter_title = ?');
+      values.push(patch.chapterTitle ?? null);
+    }
+    if ('page' in patch) {
+      sets.push('page = ?');
+      values.push(patch.page ?? null);
+    }
+    if ('progress' in patch) {
+      sets.push('progress = ?');
+      values.push(patch.progress ?? null);
+    }
+    if ('attachments' in patch) {
+      sets.push('attachments = ?');
+      values.push(JSON.stringify(patch.attachments ?? []));
+    }
+    if ('tags' in patch) {
+      sets.push('tags = ?');
+      values.push(JSON.stringify(patch.tags ?? []));
+    }
+    if (sets.length === 0) return;
+    sets.push('updated_at = ?');
+    values.push(Date.now(), id);
+    await this.db.execute(`UPDATE notes SET ${sets.join(', ')} WHERE id = ?`, values);
+  }
+
+  /** Soft-deletes a thought (history preserved). */
+  async deleteThought(id: string): Promise<void> {
+    await this.db.execute(`UPDATE notes SET deleted_at = ? WHERE id = ?`, [Date.now(), id]);
+  }
+
+  async listThoughts(bookId: string): Promise<ArchiveNote[]> {
+    const rows = await this.db.select<NoteRow>(
+      `SELECT * FROM notes WHERE book_id = ? AND deleted_at IS NULL ORDER BY created_at ASC`,
+      [bookId],
+    );
+    return rows.map(mapNote);
+  }
+
+  /** Global note search across books (PRD D4). */
+  async searchThoughts(query: string): Promise<ArchivedNoteWithBook[]> {
+    // Escape LIKE metacharacters so user input matches literally.
+    const escaped = query.trim().replaceAll('%', String.raw`\%`).replaceAll('_', String.raw`\_`);
+    const like = `%${escaped}%`;
+    const rows = await this.db.select<NoteRow & { title: string; book_hash: string | null }>(
+      `SELECT n.*, b.title AS title, b.book_hash AS book_hash
+       FROM notes n JOIN books b ON b.id = n.book_id
+       WHERE n.deleted_at IS NULL AND n.content LIKE ? ESCAPE '\\'
+       ORDER BY n.created_at DESC
+       LIMIT 200`,
+      [like],
+    );
+    return rows.map((r) => ({ ...mapNote(r), bookTitle: r.title, bookHash: r.book_hash }));
+  }
+
+  /** Distinct chapter titles already used for this book (D2 suggestion source b). */
+  async listUsedChapters(bookId: string): Promise<string[]> {
+    const rows = await this.db.select<{ chapter_title: string }>(
+      `SELECT DISTINCT chapter_title FROM notes
+       WHERE book_id = ? AND chapter_title IS NOT NULL AND deleted_at IS NULL`,
+      [bookId],
+    );
+    return rows.map((r) => r.chapter_title);
+  }
+
+  /**
+   * Import-path upsert with LWW semantics: an incoming note never overwrites
+   * a newer local edit, and updating never resurrects a locally deleted row
+   * (deleted_at is only set on fresh inserts).
+   */
+  async upsertThoughtFromImport(note: ArchiveNote & { bookId: string }): Promise<boolean> {
+    const existing = await this.db.select<{ updated_at: number; deleted_at: number | null }>(
+      `SELECT updated_at, deleted_at FROM notes WHERE id = ?`,
+      [note.id],
+    );
+    if (existing[0] && existing[0].updated_at >= note.updatedAt) return false;
+
+    const deletedAt = existing[0]?.deleted_at ?? note.deletedAt ?? null;
+    await this.db.execute(
+      existing[0]
+        ? `UPDATE notes SET round_no = ?, cfi = ?, chapter_title = ?, page = ?, progress = ?,
+             content = ?, attachments = ?, tags = ?, updated_at = ?
+           WHERE id = ?`
+        : `INSERT INTO notes (
+             id, book_id, round_no, parent_note_id, cfi, chapter_title, page,
+             progress, content, attachments, tags, created_at, updated_at, deleted_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      existing[0]
+        ? [
+            note.roundNo,
+            note.cfi ?? null,
+            note.chapterTitle ?? null,
+            note.page ?? null,
+            note.progress ?? null,
+            note.content,
+            JSON.stringify(note.attachments),
+            JSON.stringify(note.tags),
+            note.updatedAt,
+            note.id,
+          ]
+        : [
+            note.id,
+            note.bookId,
+            note.roundNo,
+            note.parentNoteId ?? null,
+            note.cfi ?? null,
+            note.chapterTitle ?? null,
+            note.page ?? null,
+            note.progress ?? null,
+            note.content,
+            JSON.stringify(note.attachments),
+            JSON.stringify(note.tags),
+            note.createdAt,
+            note.updatedAt,
+            deletedAt,
+          ],
+    );
+    return true;
+  }
+
+  // -------------------------------------------------------------------- kv
+
+  async getKv(key: string): Promise<string | null> {
+    const rows = await this.db.select<{ value: string }>(`SELECT value FROM kv WHERE key = ?`, [
+      key,
+    ]);
+    return rows[0]?.value ?? null;
+  }
+
+  async setKv(key: string, value: string): Promise<void> {
+    await this.db.execute(
+      `INSERT INTO kv (key, value) VALUES (?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      [key, value],
+    );
   }
 
   // ----------------------------------------------------------------- tags
