@@ -224,6 +224,11 @@ export const getPosition = (
   rect: Rect,
   paddingPx: number,
   isVertical: boolean = false,
+  // Fork feature (module W, see FORK_CHANGES.md): on mobile WEB browsers the
+  // native text-selection toolbar floats ABOVE the selection and cannot be
+  // suppressed from JS — so Readest's own toolbar prefers the 'down' side to
+  // stack below it instead of overlapping.
+  preferDir?: 'up' | 'down',
 ) => {
   const { range: target, rect: targetRect } =
     targetElement && 'range' in targetElement
@@ -329,6 +334,10 @@ export const getPosition = (
   }
   if (!startInView) return end;
   if (!endInView) return start;
+  // Fork feature (module W): explicit placement preference wins over the
+  // free-space tie-break when both ends are on-screen.
+  if (preferDir === 'down') return end;
+  if (preferDir === 'up') return start;
   return start.point.y > window.innerHeight - end.point.y ? start : end;
 };
 

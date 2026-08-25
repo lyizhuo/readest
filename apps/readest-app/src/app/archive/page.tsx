@@ -14,6 +14,7 @@ import { ArchiveDb } from '@/features/archive/db/archiveDb';
 import StatusBadge from '@/features/archive/components/StatusBadge';
 import { buildLibraryCsv, CsvExportRow } from '@/features/archive/library/csvExport';
 import { useArchiveLibrary } from '@/features/archive/hooks/useArchiveLibrary';
+import ReadingHome from '@/features/archive/components/ReadingHome';
 
 const STATUS_ORDER: (ArchiveStatus | 'all')[] = ['all', ...ARCHIVE_STATUSES];
 
@@ -113,6 +114,9 @@ const ArchivePage: React.FC = () => {
           <button className='btn btn-ghost btn-sm' onClick={() => setTagManagerOpen(true)}>
             {_('Tags')}
           </button>
+          <button className='btn btn-ghost btn-sm' onClick={() => router.push('/archive/calendar')}>
+            {_('Calendar')}
+          </button>
           <button
             className='btn btn-ghost btn-sm'
             disabled={books.length === 0}
@@ -122,6 +126,8 @@ const ArchivePage: React.FC = () => {
           </button>
         </div>
       </header>
+
+      <ReadingHome books={books} getCoverUrl={getCoverUrl} />
 
       <div className='px-4 pt-3'>
         <input

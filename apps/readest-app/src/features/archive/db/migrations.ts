@@ -80,4 +80,29 @@ export const ARCHIVE_MIGRATIONS: MigrationEntry[] = [
       );
     `,
   },
+  {
+    name: '2026082602_archive_sessions',
+    sql: `
+      CREATE TABLE IF NOT EXISTS sessions (
+        id TEXT PRIMARY KEY,
+        book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+        round_no INTEGER NOT NULL DEFAULT 1,
+        device TEXT,
+        started_at INTEGER NOT NULL,
+        ended_at INTEGER,
+        duration_sec INTEGER NOT NULL DEFAULT 0,
+        progress_start REAL,
+        progress_end REAL,
+        pages_read INTEGER,
+        note_count_delta INTEGER NOT NULL DEFAULT 0,
+        open INTEGER NOT NULL DEFAULT 0
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_sessions_book_start ON sessions(book_id, started_at);
+
+      CREATE INDEX IF NOT EXISTS idx_sessions_start ON sessions(started_at);
+
+      CREATE INDEX IF NOT EXISTS idx_sessions_open ON sessions(open);
+    `,
+  },
 ];

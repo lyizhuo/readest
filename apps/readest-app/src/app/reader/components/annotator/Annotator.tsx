@@ -14,6 +14,8 @@ import {
 import { FoliateView, NOTE_PREFIX } from '@/types/view';
 import { NativeTouchEventType } from '@/types/system';
 import { getLocale, getOSPlatform, makeSafeFilename, uniqueId } from '@/utils/misc';
+// Fork feature (module W, see FORK_CHANGES.md).
+import { isWebAppPlatform } from '@/services/environment';
 import { useThemeStore } from '@/store/themeStore';
 import { useBookDataStore } from '@/store/bookDataStore';
 import { getBookProgress, useBookProgress } from '@/store/readerProgressStore';
@@ -242,7 +244,19 @@ const Annotator: React.FC<{ bookKey: string; contentInsets: Insets }> = ({
     const gridFrame = document.querySelector(`#gridcell-${bookKey}`);
     if (!gridFrame) return;
     const rect = gridFrame.getBoundingClientRect();
-    const triangPos = getPosition(selection, rect, trianglePadding, viewSettings.vertical);
+    // Fork feature (module W): keep placement consistent with the
+    // [selection] effect — see the comment there.
+    const nativeMenuAvoidDir =
+      isWebAppPlatform() && appService?.isMobile && !viewSettings.vertical
+        ? ('down' as const)
+        : undefined;
+    const triangPos = getPosition(
+      selection,
+      rect,
+      trianglePadding,
+      viewSettings.vertical,
+      nativeMenuAvoidDir,
+    );
     const annotPopupPos = getPopupPosition(
       triangPos,
       rect,
@@ -981,7 +995,20 @@ const Annotator: React.FC<{ bookKey: string; contentInsets: Insets }> = ({
       const gridFrame = document.querySelector(`#gridcell-${bookKey}`);
       if (!gridFrame) return;
       const rect = gridFrame.getBoundingClientRect();
-      const triangPos = getPosition(selection, rect, trianglePadding, viewSettings.vertical);
+      // Fork feature (module W, see FORK_CHANGES.md): mobile WEB browsers show
+      // an unsuppressible native selection toolbar above the selection — keep
+      // our toolbar below it. Native apps suppress the system menu instead.
+      const nativeMenuAvoidDir =
+        isWebAppPlatform() && appService?.isMobile && !viewSettings.vertical
+          ? ('down' as const)
+          : undefined;
+      const triangPos = getPosition(
+        selection,
+        rect,
+        trianglePadding,
+        viewSettings.vertical,
+        nativeMenuAvoidDir,
+      );
       const annotPopupPos = getPopupPosition(
         triangPos,
         rect,

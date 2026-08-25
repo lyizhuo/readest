@@ -40,6 +40,9 @@ import Notebook from './notebook/Notebook';
 import LocalSendManager from '@/components/localsend/LocalSendManager';
 import BooksGrid from './BooksGrid';
 import SettingsDialog from '@/components/settings/SettingsDialog';
+// Fork feature: reading-session tracking (see FORK_CHANGES.md).
+import SessionIndicator from '@/features/archive/components/SessionIndicator';
+import { useArchiveSession } from '@/features/archive/hooks/useArchiveSession';
 
 const ReaderContent: React.FC<{ ids?: string; settings: SystemSettings }> = ({ ids, settings }) => {
   const _ = useTranslation();
@@ -64,6 +67,8 @@ const ReaderContent: React.FC<{ ids?: string; settings: SystemSettings }> = ({ i
   const [errorLoading, setErrorLoading] = useState(false);
 
   useBookShortcuts({ sideBarBookKey, bookKeys });
+  // Fork feature: reading-session tracking (see FORK_CHANGES.md).
+  useArchiveSession(bookKeys[0] ?? '', bookKeys[0]?.split('-')[0]);
   const isAndroidApp = appService?.isAndroidApp === true;
   const androidGamepadConnected = useAndroidGamepadConnection(isAndroidApp);
   // Android's native bridge gates the Web Gamepad API so Chromium polls only
@@ -303,6 +308,7 @@ const ReaderContent: React.FC<{ ids?: string; settings: SystemSettings }> = ({ i
         onCloseBook={handleCloseBook}
         onGoToLibrary={handleCloseBooksToLibrary}
       />
+      <SessionIndicator />
       {isSettingsDialogOpen && <SettingsDialog bookKey={settingsDialogBookKey} />}
       <Notebook />
       <LocalSendManager />

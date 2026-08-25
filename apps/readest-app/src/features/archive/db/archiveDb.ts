@@ -51,6 +51,59 @@ interface RoundRow extends DatabaseRow {
   review: string | null;
 }
 
+interface SessionRow extends DatabaseRow {
+  id: string;
+  book_id: string;
+  round_no: number;
+  device: string | null;
+  started_at: number;
+  ended_at: number | null;
+  duration_sec: number;
+  progress_start: number | null;
+  progress_end: number | null;
+  pages_read: number | null;
+  note_count_delta: number;
+  open: number;
+}
+
+export interface SessionRecord {
+  id: string;
+  bookId: string;
+  roundNo: number;
+  device: string | null;
+  startedAt: number;
+  endedAt: number | null;
+  durationSec: number;
+  progressStart: number | null;
+  progressEnd: number | null;
+  pagesRead: number | null;
+  noteCountDelta: number;
+  open: boolean;
+}
+
+/** Session joined with its book's display fields (calendar/list views). */
+export interface SessionWithBook extends SessionRecord {
+  title: string;
+  bookHash: string | null;
+}
+
+function mapSession(row: SessionRow): SessionRecord {
+  return {
+    id: row.id,
+    bookId: row.book_id,
+    roundNo: row.round_no,
+    device: row.device,
+    startedAt: row.started_at,
+    endedAt: row.ended_at,
+    durationSec: row.duration_sec,
+    progressStart: row.progress_start,
+    progressEnd: row.progress_end,
+    pagesRead: row.pages_read,
+    noteCountDelta: row.note_count_delta,
+    open: !!row.open,
+  };
+}
+
 function parseJsonArray(value: string | null | undefined): string[] {
   if (!value) return [];
   try {
@@ -362,6 +415,8 @@ export class ArchiveDb {
       await this.db.execute('DELETE FROM book_tags WHERE book_id = ?', [id]);
       await this.db.execute('DELETE FROM reading_status WHERE book_id = ?', [id]);
       await this.db.execute('DELETE FROM reading_rounds WHERE book_id = ?', [id]);
+      // No FK cascade in this engine (see ReedyDb note) — clean explicitly.
+      await this.db.execute('DELETE FROM sessions WHERE book_id = ?', [id]);
       await this.db.execute('DELETE FROM book_files WHERE book_id = ?', [id]);
       await this.db.execute('DELETE FROM books WHERE id = ?', [id]);
     });
@@ -473,6 +528,155 @@ export class ArchiveDb {
         [patch.review ?? null, bookId, roundNo],
       );
     }
+  }
+
+  // -------------------------------------------------------------- sessions
+
+  /** Opens a new session row (open=1). Callers resolve stale opens first. */
+  async startSession(input: {
+    bookId: string;
+    roundNo: number;
+    device?: string | null;
+    startedAt: number;
+    progressStart?: number | null;
+  }): Promise<string> {
+    const id = uuidv4();
+    await this.db.execute(
+      `INSERT INTO sessions (id, book_id, round_no, device, started_at, duration_sec, progress_start, note_count_delta, open)
+       VALUES (?, ?, ?, ?, ?, 0, ?, 0, 1)`,
+      [
+        id,
+        input.bookId,
+        input.roundNo,
+        input.device ?? null,
+        input.startedAt,
+        input.progressStart ?? null,
+      ],
+    );
+    return id;
+  }
+
+  /** Periodic crash-safety checkpoint (PRD B1: ≥60s interval, ≤60s loss). */
+  async checkpointSession(
+    id: string,
+    data: { endedAt: number; durationSec: number; progressEnd?: number | null },
+  ): Promise<void> {
+    await this.db.execute(
+      `UPDATE sessions SET ended_at = ?, duration_sec = ?,
+        progress_end = COALESCE(?, progress_end)
+       WHERE id = ? AND open = 1`,
+      [data.endedAt, Math.max(0, Math.round(data.durationSec)), data.progressEnd ?? null, id],
+    );
+  }
+
+  /** Finalizes a session and re-computes the round's accumulated time. */
+  async finishSession(
+    id: string,
+    data: {
+      endedAt: number;
+      durationSec: number;
+      progressEnd?: number | null;
+      pagesRead?: number | null;
+      noteCountDelta?: number;
+    },
+  ): Promise<void> {
+    const duration = Math.max(0, Math.round(data.durationSec));
+    await this.db.execute(
+      `UPDATE sessions SET ended_at = ?, duration_sec = ?, progress_end = COALESCE(?, progress_end),
+        pages_read = COALESCE(?, pages_read), note_count_delta = ?, open = 0
+       WHERE id = ?`,
+      [
+        data.endedAt,
+        duration,
+        data.progressEnd ?? null,
+        data.pagesRead ?? null,
+        data.noteCountDelta ?? 0,
+        id,
+      ],
+    );
+    await this.refreshRoundTotalsForSession(id);
+  }
+
+  private async recomputeRoundTotal(bookId: string, roundNo: number): Promise<void> {
+    await this.db.execute(
+      `UPDATE reading_rounds SET total_seconds = (
+         SELECT COALESCE(SUM(duration_sec), 0) FROM sessions
+         WHERE book_id = ? AND round_no = ? AND open = 0
+       )
+       WHERE book_id = ? AND round_no = ?`,
+      [bookId, roundNo, bookId, roundNo],
+    );
+  }
+
+  private async refreshRoundTotalsForSession(sessionId: string): Promise<void> {
+    const rows = await this.db.select<{ book_id: string; round_no: number }>(
+      `SELECT book_id, round_no FROM sessions WHERE id = ?`,
+      [sessionId],
+    );
+    if (rows[0]) {
+      await this.recomputeRoundTotal(rows[0].book_id, rows[0].round_no);
+    }
+  }
+
+  /** Backfills progress_start once the first real position is known. */
+  async attachSessionProgress(id: string, fraction: number): Promise<void> {
+    await this.db.execute(
+      `UPDATE sessions SET progress_start = ? WHERE id = ? AND progress_start IS NULL`,
+      [fraction, id],
+    );
+  }
+
+  async listOpenSessions(bookId?: string): Promise<SessionRecord[]> {
+    const rows = await this.db.select<SessionRow>(
+      bookId
+        ? `SELECT * FROM sessions WHERE open = 1 AND book_id = ? ORDER BY started_at ASC`
+        : `SELECT * FROM sessions WHERE open = 1 ORDER BY started_at ASC`,
+      bookId ? [bookId] : [],
+    );
+    return rows.map(mapSession);
+  }
+
+  /** Manual correction (PRD B1): drop a junk session entirely. */
+  async deleteSession(id: string): Promise<void> {
+    const coords = await this.db.select<{ book_id: string; round_no: number }>(
+      `SELECT book_id, round_no FROM sessions WHERE id = ?`,
+      [id],
+    );
+    await this.db.execute(`DELETE FROM sessions WHERE id = ?`, [id]);
+    // The session row is gone now, so recompute from the captured coordinates.
+    if (coords[0]) {
+      await this.recomputeRoundTotal(coords[0].book_id, coords[0].round_no);
+    }
+  }
+
+  /** Manual correction (PRD B1): edit a wrong duration. */
+  async updateSessionDuration(id: string, durationSec: number): Promise<void> {
+    await this.db.execute(`UPDATE sessions SET duration_sec = ? WHERE id = ?`, [
+      Math.max(0, Math.round(durationSec)),
+      id,
+    ]);
+    await this.refreshRoundTotalsForSession(id);
+  }
+
+  async listSessionsInRange(startMs: number, endMs: number): Promise<SessionWithBook[]> {
+    const rows = await this.db.select<SessionRow & { title: string; book_hash: string | null }>(
+      `SELECT se.*, b.title AS title, b.book_hash AS book_hash
+       FROM sessions se JOIN books b ON b.id = se.book_id
+       WHERE se.started_at >= ? AND se.started_at < ? AND se.open = 0
+       ORDER BY se.started_at ASC`,
+      [startMs, endMs],
+    );
+    return rows.map((r) => ({ ...mapSession(r), title: r.title, bookHash: r.book_hash }));
+  }
+
+  /** Aggregated net seconds read within [startMs, endMs). */
+  async sumSecondsInRange(startMs: number, endMs: number): Promise<number> {
+    const rows = await this.db.select<{ total: number }>(
+      `SELECT COALESCE(SUM(duration_sec), 0) AS total FROM sessions
+       WHERE started_at >= ? AND started_at < ? AND open = 0`,
+      [startMs, endMs],
+    );
+    return rows[0]?.total ?? 0;
   }
 
   // ----------------------------------------------------------------- tags
