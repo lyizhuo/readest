@@ -173,6 +173,7 @@ export const DEFAULT_ICLOUD_SETTINGS = {
 export const DEFAULT_ARCHIVE_SETTINGS = {
   enabled: true,
   dailyGoalMinutes: 60,
+  autoSync: false,
 } as ArchiveSettings;
 
 export const DEFAULT_SYSTEM_SETTINGS: Partial<SystemSettings> = {

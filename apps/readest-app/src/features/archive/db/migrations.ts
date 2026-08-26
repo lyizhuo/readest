@@ -139,4 +139,40 @@ export const ARCHIVE_MIGRATIONS: MigrationEntry[] = [
       );
     `,
   },
+  {
+    name: '2026082604_archive_graph',
+    sql: `
+      -- Character graph (PRD J). Nodes/edges carry evidence quotes and a
+      -- first-appearance anchor for progressive (spoiler-safe) reveal.
+      CREATE TABLE IF NOT EXISTS graph_nodes (
+        id TEXT PRIMARY KEY,
+        book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        aliases TEXT NOT NULL DEFAULT '[]',
+        description TEXT,
+        first_chapter TEXT,
+        first_cfi TEXT,
+        confidence REAL NOT NULL DEFAULT 1,
+        pending INTEGER NOT NULL DEFAULT 0
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_graph_nodes_book ON graph_nodes(book_id);
+
+      CREATE TABLE IF NOT EXISTS graph_edges (
+        id TEXT PRIMARY KEY,
+        book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+        from_node TEXT NOT NULL,
+        to_node TEXT NOT NULL,
+        type TEXT NOT NULL,
+        evidence TEXT NOT NULL,
+        chapter TEXT,
+        first_cfi TEXT,
+        confidence REAL NOT NULL DEFAULT 1,
+        pending INTEGER NOT NULL DEFAULT 0,
+        UNIQUE (book_id, from_node, to_node, type)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_graph_edges_book ON graph_edges(book_id);
+    `,
+  },
 ];

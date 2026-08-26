@@ -7,6 +7,7 @@ import { useSettingsStore } from '@/store/settingsStore';
 import { useTranslation } from '@/hooks/useTranslation';
 import { saveSysSettings } from '@/helpers/settings';
 import { DEFAULT_EXPORT_TEMPLATE_MD } from '@/features/archive/export/template';
+import { syncNow } from '@/features/archive/sync/archiveFileSync';
 import { ArchiveDb } from '@/features/archive/db/archiveDb';
 import { SectionTitle, SettingsSwitchRow } from './primitives';
 
@@ -22,6 +23,12 @@ const ArchivePanel: React.FC = () => {
 
   const [enabled, setEnabled] = useState(archive.enabled);
   const [dailyGoalMinutes, setDailyGoalMinutes] = useState(archive.dailyGoalMinutes);
+  const [autoSync, setAutoSync] = useState(archive.autoSync ?? false);
+  // Sync status (PRD H): the kv timestamp of the last completed pass plus
+  // the transient busy/result display of a manual "Sync now" run.
+  const [lastSync, setLastSync] = useState<string | null>(null);
+  const [syncing, setSyncing] = useState(false);
+  const [syncMessage, setSyncMessage] = useState<string | null>(null);
   // Export template (PRD E3) — stored in archive.db kv, editable here.
   const [templateMd, setTemplateMd] = useState<string | null>(null);
 
@@ -31,6 +38,7 @@ const ArchivePanel: React.FC = () => {
       try {
         const db = await ArchiveDb.open(appService);
         setTemplateMd((await db.getKv('export_template_md')) ?? DEFAULT_EXPORT_TEMPLATE_MD);
+        setLastSync(await db.getKv('archive_sync_last'));
       } catch {
         setTemplateMd(DEFAULT_EXPORT_TEMPLATE_MD);
       }
@@ -69,6 +77,34 @@ const ArchivePanel: React.FC = () => {
     setDailyGoalMinutes(next);
     void saveSysSettings(envConfig, 'archive', { ...archive, dailyGoalMinutes: next });
     setSettings({ ...settings, archive: { ...archive, dailyGoalMinutes: next } });
+  };
+
+  const toggleAutoSync = () => {
+    const next = !autoSync;
+    setAutoSync(next);
+    void saveSysSettings(envConfig, 'archive', { ...archive, autoSync: next });
+    setSettings({ ...settings, archive: { ...archive, autoSync: next } });
+  };
+
+  const runSyncNow = async () => {
+    if (!appService || syncing) return;
+    setSyncing(true);
+    setSyncMessage(null);
+    try {
+      const resultKey = await syncNow(appService, settings);
+      setSyncMessage(_(resultKey));
+      try {
+        const db = await ArchiveDb.open(appService);
+        setLastSync(await db.getKv('archive_sync_last'));
+      } catch {
+        /* display-only refresh */
+      }
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      setSyncMessage(msg === 'archive.sync.noBackend' ? _('No file-sync backend enabled') : msg);
+    } finally {
+      setSyncing(false);
+    }
   };
 
   return (
@@ -122,6 +158,30 @@ const ArchivePanel: React.FC = () => {
           onChange={(e) => void saveTemplate(e.target.value)}
           spellCheck={false}
         />
+
+        <div className='my-2 rounded-box border border-base-200 bg-base-100 p-3'>
+          <p className='mb-1 text-sm'>{_('Sync')}</p>
+          <SettingsSwitchRow
+            label={_('Auto sync reading archive')}
+            description={_('Sync the archive database across devices via your file-sync backend.')}
+            checked={autoSync}
+            onChange={toggleAutoSync}
+          />
+          <div className='mt-2 flex items-center justify-between gap-2'>
+            <p className='text-xs text-base-content/50'>
+              {lastSync ? `${_('Last Synced')}: ${lastSync}` : _('Never synced')}
+            </p>
+            <button
+              className='btn btn-sm'
+              disabled={syncing || !appService}
+              onClick={() => void runSyncNow()}
+            >
+              {syncing && <span className='loading loading-spinner loading-xs' />}
+              {_('Sync now')}
+            </button>
+          </div>
+          {syncMessage && <p className='mt-1 text-xs text-base-content/70'>{syncMessage}</p>}
+        </div>
       </div>
     </div>
   );

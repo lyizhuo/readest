@@ -10,6 +10,8 @@ import { useSettingsStore } from '@/store/settingsStore';
 import { useLibraryStore } from '@/store/libraryStore';
 import { useTranslation } from '@/hooks/useTranslation';
 
+import { ArchiveDb } from '@/features/archive/db/archiveDb';
+
 import {
   ARCHIVE_STATUSES,
   ARCHIVE_STATUS_KEYS,
@@ -18,8 +20,12 @@ import {
   ArchiveStatus,
 } from '@/features/archive/types';
 import NotesSection from '@/features/archive/components/NotesSection';
-import { ArchiveDb } from '@/features/archive/db/archiveDb';
-
+import PreReadAssessment from '@/features/archive/ai/PreReadAssessment';
+import ChapterOutlinePanel from '@/features/archive/ai/ChapterOutlinePanel';
+// Fork feature: character relationship graph (PRD J).
+import CharacterGraph from '@/features/archive/graph/CharacterGraph';
+import type { GraphChapter } from '@/features/archive/graph/runner';
+import { readableChapterSet } from '@/features/archive/graph/merge';
 /**
  * Book detail / metadata editor (PRD A1–A4): manual completion of every
  * field, five-state switch, per-round display, tag editing, duplicate hint.
@@ -89,7 +95,7 @@ const ArchiveDetailPageContent: React.FC = () => {
       setBook(loadedBook);
       setRounds(loadedRounds);
       setTagNames(loadedTagNames);
-      setAllTags(allTagsRows.map((t) => t.name));
+      setAllTags(allTagsRows.map((t: { name: string }) => t.name));
       setDuplicates(dupes);
       setForm({
         title: loadedBook.title,
@@ -186,6 +192,70 @@ const ArchiveDetailPageContent: React.FC = () => {
     const finishedCount = rounds.filter((round) => round.status === 'finished').length;
     return { totalSeconds, finishedCount };
   }, [rounds]);
+
+  // Spoiler gate (PRD J2): derive the read-chapter label set from nav TOC +
+  // current CFI; finished books unlock everything. Lazy chapter text loader
+  // opens the full document only when the user explicitly generates a graph.
+  const [readableChapters, setReadableChapters] = useState<Set<string> | null>(null);
+  useEffect(() => {
+    if (!appService || !book?.bookHash) return;
+    void (async () => {
+      try {
+        const settingsNow = useSettingsStore.getState().settings;
+        const config = await appService.loadBookConfig(
+          {
+            hash: book.bookHash,
+            title: book.title,
+            format: 'EPUB',
+            author: '',
+            createdAt: 0,
+            updatedAt: 0,
+          } as never,
+          settingsNow,
+        );
+        const nav = await appService
+          .loadBookNav({
+            hash: book.bookHash,
+            title: book.title,
+            format: 'EPUB',
+            author: '',
+            createdAt: 0,
+            updatedAt: 0,
+          } as never)
+          .catch(() => null);
+        setReadableChapters(
+          readableChapterSet(nav?.toc ?? [], config.location ?? null, book.status === 'finished'),
+        );
+      } catch {
+        setReadableChapters(null);
+      }
+    })();
+  }, [appService, book?.bookHash, book?.title, book?.status]);
+
+  const loadChapters = useCallback(async (): Promise<GraphChapter[]> => {
+    if (!appService || !book?.bookHash) return [];
+    const { loadBookContent } = appService;
+    const { DocumentLoader } = await import('@/libs/document');
+    const content = await loadBookContent({
+      hash: book.bookHash,
+      title: book.title,
+      format: 'EPUB',
+      author: '',
+      createdAt: 0,
+      updatedAt: 0,
+    } as never);
+    const opened = await new DocumentLoader(content.file).open();
+    const bookDoc = opened.book;
+    const toc = bookDoc.toc ?? [];
+    const chapters: GraphChapter[] = [];
+    for (const item of toc) {
+      const idx = bookDoc.splitTOCHref(item.href)[0];
+      const section = typeof idx === 'number' ? bookDoc.sections[idx] : undefined;
+      const text = (await section?.loadText?.()) ?? '';
+      if (text.trim()) chapters.push({ label: item.label, text });
+    }
+    return chapters;
+  }, [appService, book]);
 
   if (missing) {
     return (
@@ -453,6 +523,13 @@ const ArchiveDetailPageContent: React.FC = () => {
       </section>
 
       <NotesSection book={book} />
+      <PreReadAssessment book={book} />
+      <ChapterOutlinePanel book={book} />
+      <CharacterGraph
+        bookId={book.id}
+        readableChapters={readableChapters ?? undefined}
+        loadChapters={loadChapters}
+      />
       <footer className='px-4 pb-8'>
         <button className='btn btn-ghost btn-sm text-error' onClick={handleDeleteProfile}>
           {_('Delete profile')}

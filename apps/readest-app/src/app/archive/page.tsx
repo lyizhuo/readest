@@ -6,6 +6,7 @@ import { useRouter } from 'next/navigation';
 
 import { useEnv } from '@/context/EnvContext';
 import { useThemeStore } from '@/store/themeStore';
+import { useSettingsStore } from '@/store/settingsStore';
 import { useTranslation } from '@/hooks/useTranslation';
 import { navigateToLibrary } from '@/utils/nav';
 
@@ -15,6 +16,8 @@ import { useArchiveLibrary } from '@/features/archive/hooks/useArchiveLibrary';
 import { ArchiveDb } from '@/features/archive/db/archiveDb';
 import ReadingHome from '@/features/archive/components/ReadingHome';
 import ExportDialog from '@/features/archive/components/ExportDialog';
+// Fork feature: archive cloud sync (PRD H).
+import { maybeAutoSync } from '@/features/archive/sync/archiveFileSync';
 
 const STATUS_ORDER: (ArchiveStatus | 'all')[] = ['all', ...ARCHIVE_STATUSES];
 
@@ -26,6 +29,8 @@ const ArchivePage: React.FC = () => {
   const _ = useTranslation();
   const router = useRouter();
   const { safeAreaInsets } = useThemeStore();
+  const { appService } = useEnv();
+  const { settings } = useSettingsStore();
   const { enabled, loaded, books, tags, refresh, getCoverUrl } = useArchiveLibrary();
 
   const [statusFilter, setStatusFilter] = useState<ArchiveStatus | 'all'>('all');
@@ -37,6 +42,13 @@ const ArchivePage: React.FC = () => {
   useEffect(() => {
     if (!enabled) router.replace('/library');
   }, [enabled, router]);
+
+  // Fork feature (PRD H): throttled auto sync when enabled.
+  useEffect(() => {
+    if (!appService || !settings.archive?.autoSync) return;
+    void maybeAutoSync(appService, settings);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [appService]);
 
   const counts = useMemo(() => {
     const byStatus: Record<string, number> = { all: books.length };
@@ -93,6 +105,9 @@ const ArchivePage: React.FC = () => {
           </button>
           <button className='btn btn-ghost btn-sm' onClick={() => router.push('/archive/calendar')}>
             {_('Calendar')}
+          </button>
+          <button className='btn btn-ghost btn-sm' onClick={() => router.push('/archive/stats')}>
+            {_('Stats')}
           </button>
           <button
             className='btn btn-ghost btn-sm'

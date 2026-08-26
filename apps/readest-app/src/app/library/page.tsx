@@ -129,6 +129,7 @@ import DropIndicator from '@/components/DropIndicator';
 import SettingsDialog from '@/components/settings/SettingsDialog';
 import ModalPortal from '@/components/ModalPortal';
 import TransferQueuePanel from './components/TransferQueuePanel';
+import DailyReviewHost from '@/features/archive/review/DailyReviewHost';
 
 /** Skip tiny non-book artifacts during folder auto-scan (matches the manual import dialog default). */
 const AUTO_IMPORT_MIN_SIZE_BYTES = 20 * 1024;
@@ -2192,9 +2193,13 @@ const LibraryPageContent = ({ searchParams }: { searchParams: ReadonlyURLSearchP
 
 const LibraryPage = () => {
   return (
-    <Suspense fallback={<div className='full-height' />}>
-      <LibraryPageWithSearchParams />
-    </Suspense>
+    <>
+      <Suspense fallback={<div className='full-height' />}>
+        <LibraryPageWithSearchParams />
+      </Suspense>
+      {/* Fork feature: daily note review (PRD F) — fails silently. */}
+      <DailyReviewHost />
+    </>
   );
 };
 

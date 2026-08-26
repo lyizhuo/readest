@@ -22,6 +22,7 @@
 | `apps/readest-app/src/app/reader/components/annotator/Annotator.tsx` | import `isWebAppPlatform`；[selection] effect 与 `repositionPopups` 两处调用 getPosition 时在「移动 Web + 横排文本」下传 `preferDir: 'down'` | 同上（划线工具栏改到选区下方，避开浏览器原生弹层） |
 | `apps/readest-app/src/app/reader/components/ReaderContent.tsx` | import SessionIndicator/useArchiveSession；hooks 区调用 `useArchiveSession(bookKeys[0], hash)`；渲染区挂 `<SessionIndicator />` | 模块 B/C1：阅读会话自动追踪 + 角落计时入口 |
 | `apps/readest-app/src/__tests__/services/command-registry-extended.test.ts` | `react-icons/pi` mock 增加 `PiBooks` | 适配 panelIcons 新增条目 |
+| `apps/readest-app/src/app/library/page.tsx`（M4/G） | 挂载 `<DailyReviewHost />` | 每日笔记回顾入口 |
 | `apps/readest-app/src/components/settings/ArchivePanel.tsx` | **新文件**（位于上游组件目录）：模块开关 + 每日目标步进器 + 导出模板编辑器（kv 持久化） | PRD 0.4 / C1 / E3 |
 
 

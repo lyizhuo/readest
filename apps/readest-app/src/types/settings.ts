@@ -358,6 +358,8 @@ export interface ArchiveSettings {
   enabled: boolean;
   /** Daily reading goal in minutes (module C1). */
   dailyGoalMinutes: number;
+  /** Auto-sync archive.db to the active third-party file-sync backend (PRD H). */
+  autoSync?: boolean;
 }
 
 export interface SystemSettings {

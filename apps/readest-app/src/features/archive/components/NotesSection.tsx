@@ -11,6 +11,7 @@ import { ArchiveBook } from '../types';
 import { ArchiveNote, ArchiveDb } from '../db/archiveDb';
 import { loadExcerpts } from '../notes/excerptAccess';
 import type { ExcerptWithChapter } from '../notes/excerptAccess';
+import ExcerptAsk from '../ai/ExcerptAsk';
 
 /**
  * Per-book notes view (PRD D): upstream excerpts grouped by chapter +
@@ -71,7 +72,9 @@ const NotesSection: React.FC<{ book: ArchiveBook }> = ({ book }) => {
         </button>
       </div>
 
-      {tab === 'excerpts' && <ExcerptList excerpts={excerpts} />}
+      {tab === 'excerpts' && (
+        <ExcerptList excerpts={excerpts} book={book} onSaved={() => void reloadThoughts()} />
+      )}
       {tab === 'thoughts' && (
         <ThoughtEditor
           book={book}
@@ -85,7 +88,11 @@ const NotesSection: React.FC<{ book: ArchiveBook }> = ({ book }) => {
 };
 
 /** Renders excerpts grouped by their TOC path (PRD D4 书详情页按章节分组). */
-const ExcerptList: React.FC<{ excerpts: ExcerptWithChapter[] | null }> = ({ excerpts }) => {
+const ExcerptList: React.FC<{
+  excerpts: ExcerptWithChapter[] | null;
+  book: ArchiveBook;
+  onSaved?: () => void;
+}> = ({ excerpts, book, onSaved }) => {
   const _ = useTranslation();
   if (excerpts === null) {
     return <p className='text-xs text-base-content/40'>{_('Loading…')}</p>;
@@ -118,6 +125,7 @@ const ExcerptList: React.FC<{ excerpts: ExcerptWithChapter[] | null }> = ({ exce
                   </blockquote>
                 )}
                 {item.note && <p className='mt-1 text-base-content/70'>✏️ {item.note}</p>}
+                <ExcerptAsk book={book} excerpt={item} onSaved={onSaved} />
               </li>
             ))}
           </ul>

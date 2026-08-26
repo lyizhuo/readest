@@ -87,6 +87,64 @@ export interface SessionWithBook extends SessionRecord {
   bookHash: string | null;
 }
 
+export interface SessionMetaRow extends SessionRecord {
+  title: string;
+  bookHash: string | null;
+  authors: string[];
+  publisher: string | null;
+  format: string;
+  fictionType: string | null;
+  rating: number | null;
+}
+
+export interface GraphNodeInput {
+  id: string;
+  name: string;
+  aliases?: string[];
+  description?: string | null;
+  firstChapter?: string | null;
+  firstCfi?: string | null;
+  confidence?: number;
+  pending?: boolean;
+}
+
+export interface GraphEdgeInput {
+  id: string;
+  fromNode: string;
+  toNode: string;
+  type: string;
+  evidence: string;
+  chapter?: string | null;
+  firstCfi?: string | null;
+  confidence?: number;
+  pending?: boolean;
+}
+
+export interface GraphNodeRecord {
+  id: string;
+  bookId: string;
+  name: string;
+  aliases: string[];
+  description: string | null;
+  firstChapter: string | null;
+  firstCfi: string | null;
+  confidence: number;
+  pending: boolean;
+}
+
+export interface GraphEdgeRecord {
+  id: string;
+  bookId: string;
+  fromNode: string;
+  toNode: string;
+  type: string;
+  evidence: string;
+  chapter: string | null;
+  firstCfi: string | null;
+  confidence: number;
+  pending: boolean;
+}
+
 interface NoteRow extends DatabaseRow {
   id: string;
   book_id: string;
@@ -154,6 +212,45 @@ function parseJsonArray(value: string | null | undefined): string[] {
   } catch {
     return [];
   }
+}
+
+interface GraphRow extends DatabaseRow {
+  id: string;
+  book_id: string;
+  name: string;
+  aliases: string;
+  description: string | null;
+  first_chapter: string | null;
+  first_cfi: string | null;
+  confidence: number;
+  pending: number;
+}
+
+interface GraphEdgeRow extends DatabaseRow {
+  id: string;
+  book_id: string;
+  from_node: string;
+  to_node: string;
+  type: string;
+  evidence: string;
+  chapter: string | null;
+  first_cfi: string | null;
+  confidence: number;
+  pending: number;
+}
+
+function mapGraphNode(row: GraphRow): GraphNodeRecord {
+  return {
+    id: row.id,
+    bookId: row.book_id,
+    name: row.name,
+    aliases: parseJsonArray(row.aliases),
+    description: row.description,
+    firstChapter: row.first_chapter,
+    firstCfi: row.first_cfi,
+    confidence: row.confidence,
+    pending: !!row.pending,
+  };
 }
 
 function mapBook(row: BookRow): ArchiveBook {
@@ -473,8 +570,9 @@ export class ArchiveDb {
       await this.db.execute('DELETE FROM book_tags WHERE book_id = ?', [id]);
       await this.db.execute('DELETE FROM reading_status WHERE book_id = ?', [id]);
       await this.db.execute('DELETE FROM reading_rounds WHERE book_id = ?', [id]);
-      // No FK cascade in this engine (see ReedyDb note) — clean explicitly.
       await this.db.execute('DELETE FROM sessions WHERE book_id = ?', [id]);
+      await this.db.execute('DELETE FROM graph_edges WHERE book_id = ?', [id]);
+      await this.db.execute('DELETE FROM graph_nodes WHERE book_id = ?', [id]);
       await this.db.execute('DELETE FROM book_files WHERE book_id = ?', [id]);
       await this.db.execute('DELETE FROM books WHERE id = ?', [id]);
     });
@@ -910,6 +1008,134 @@ export class ArchiveDb {
     return true;
   }
 
+  // ------------------------------------------------------------------ graph
+
+  /** Replaces the whole graph of one book (generation is full-refresh). */
+  async replaceGraph(
+    bookId: string,
+    nodes: GraphNodeInput[],
+    edges: GraphEdgeInput[],
+  ): Promise<void> {
+    await this.withWrite(async () => {
+      await this.db.execute('DELETE FROM graph_edges WHERE book_id = ?', [bookId]);
+      await this.db.execute('DELETE FROM graph_nodes WHERE book_id = ?', [bookId]);
+      for (const node of nodes) {
+        await this.db.execute(
+          `INSERT INTO graph_nodes (id, book_id, name, aliases, description, first_chapter, first_cfi, confidence, pending)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            node.id,
+            bookId,
+            node.name,
+            JSON.stringify(node.aliases ?? []),
+            node.description ?? null,
+            node.firstChapter ?? null,
+            node.firstCfi ?? null,
+            node.confidence ?? 1,
+            node.pending ? 1 : 0,
+          ],
+        );
+      }
+      for (const rawEdge of edges) {
+        // Relations are undirected for dedupe: normalize pair orientation so
+        // A→B and B→A of the same type collapse into one row.
+        const flip = rawEdge.toNode < rawEdge.fromNode;
+        const edge = flip
+          ? { ...rawEdge, fromNode: rawEdge.toNode, toNode: rawEdge.fromNode }
+          : rawEdge;
+        await this.db.execute(
+          `INSERT OR IGNORE INTO graph_edges (id, book_id, from_node, to_node, type, evidence, chapter, first_cfi, confidence, pending)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            edge.id,
+            bookId,
+            edge.fromNode,
+            edge.toNode,
+            edge.type,
+            edge.evidence,
+            edge.chapter ?? null,
+            edge.firstCfi ?? null,
+            edge.confidence ?? 1,
+            edge.pending ? 1 : 0,
+          ],
+        );
+      }
+    });
+  }
+
+  async listGraphNodes(bookId: string): Promise<GraphNodeRecord[]> {
+    const rows = await this.db.select<GraphRow>(
+      `SELECT * FROM graph_nodes WHERE book_id = ? ORDER BY rowid ASC`,
+      [bookId],
+    );
+    return rows.map(mapGraphNode);
+  }
+
+  async listGraphEdges(bookId: string): Promise<GraphEdgeRecord[]> {
+    const rows = await this.db.select<GraphEdgeRow>(`SELECT * FROM graph_edges WHERE book_id = ?`, [
+      bookId,
+    ]);
+    return rows.map((r) => ({
+      id: r.id,
+      bookId: r.book_id,
+      fromNode: r.from_node,
+      toNode: r.to_node,
+      type: r.type,
+      evidence: r.evidence,
+      chapter: r.chapter,
+      firstCfi: r.first_cfi,
+      confidence: r.confidence,
+      pending: !!r.pending,
+    }));
+  }
+
+  /** Confirms or flags a low-confidence node/edge (PRD J3 人工确认队列). */
+  async setGraphNodePending(id: string, pending: boolean): Promise<void> {
+    await this.db.execute(`UPDATE graph_nodes SET pending = ? WHERE id = ?`, [pending ? 1 : 0, id]);
+  }
+
+  async setGraphEdgePending(id: string, pending: boolean): Promise<void> {
+    await this.db.execute(`UPDATE graph_edges SET pending = ? WHERE id = ?`, [pending ? 1 : 0, id]);
+  }
+
+  // ----------------------------------------------------------------- stats
+
+  /**
+   * Sessions joined with book metadata for range aggregation. Aggregation
+   * happens in TS — personal-library scale makes SQL GROUP BY over JSON
+   * author columns pointless.
+   */
+  async listSessionsWithMeta(startMs: number, endMs: number): Promise<SessionMetaRow[]> {
+    const rows = await this.db.select<
+      SessionRow & {
+        title: string;
+        book_hash: string | null;
+        authors: string;
+        publisher: string | null;
+        format: string;
+        fiction_type: string | null;
+        rating: number | null;
+      }
+    >(
+      `SELECT se.*, b.title AS title, b.book_hash AS book_hash, b.authors AS authors,
+              b.publisher AS publisher, b.format AS format, b.fiction_type AS fiction_type,
+              b.rating AS rating
+       FROM sessions se JOIN books b ON b.id = se.book_id
+       WHERE se.started_at >= ? AND se.started_at < ? AND se.open = 0`,
+      [startMs, endMs],
+    );
+    return rows.map((r) => ({
+      ...mapSession(r),
+      title: r.title,
+      bookHash: r.book_hash,
+      authors: parseJsonArray(r.authors),
+      publisher: r.publisher,
+      format: r.format,
+      fictionType: r.fiction_type,
+      rating: r.rating,
+    }));
+  }
+
   // -------------------------------------------------------------------- kv
 
   async getKv(key: string): Promise<string | null> {
@@ -1027,7 +1253,10 @@ export class ArchiveDb {
   }
 }
 
-/** @internal Drops the memoized open promise. Test hook only. */
-export function resetArchiveDbForTests(): void {
+/** Drops the memoized open promise (test hook + post-byte-replace sync path). */
+export function resetArchiveDbSingleton(): void {
   sharedOpen = null;
 }
+
+/** @internal Legacy alias kept for existing tests. */
+export const resetArchiveDbForTests = resetArchiveDbSingleton;
