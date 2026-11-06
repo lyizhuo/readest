@@ -15,7 +15,12 @@ import { findFuzzyMatches, MAX_FUZZY_QUERY_LENGTH } from '@/utils/fuzzySearch';
 import type { LibrarySearchWorkerMatch } from '@/utils/librarySearchWorkerProtocol';
 import { findNearbyMatches } from '@/utils/nearbySearch';
 import { createRejectFilter } from '@/utils/node';
-import { compileSearchRegex, filterWholeWordMatches, findRegexMatches } from '@/utils/textSearch';
+import {
+  compileSearchRegex,
+  filterWholeWordMatches,
+  findRegexMatches,
+  stripSoftHyphens,
+} from '@/utils/textSearch';
 import { BookFileNotFoundError } from './errors';
 import {
   beginSearchIndex,
@@ -97,6 +102,10 @@ export interface LibrarySearchOptions {
   // Restrict matching to one section (reader "current chapter" scope). Index
   // population is never restricted: a live scan still writes every section.
   sectionIndex?: number;
+  // Per-book match budget. A library-wide sweep keeps the default cap so one
+  // book cannot flood the results list; reader in-book search passes Infinity
+  // because there the one book's matches are the entire result set.
+  maxResultsPerBook?: number;
 }
 
 const DEFAULT_CONFIG: LibrarySearchConfig = {
@@ -459,6 +468,7 @@ export async function* searchLibraryBooks(
 ): AsyncGenerator<LibrarySearchEvent> {
   const config: LibrarySearchConfig = { ...DEFAULT_CONFIG, ...options.config, scope: 'book' };
   const { signal } = options;
+  const maxResultsPerBook = options.maxResultsPerBook ?? MAX_BOOK_SEARCH_RESULTS;
   let searchedBooks = 0;
   let skippedBooks = 0;
   let erroredBooks = 0;
@@ -523,6 +533,18 @@ export async function* searchLibraryBooks(
     locale: string,
     limit: number,
   ): Promise<SectionMatchOutcome> => {
+    const softHyphens = stripSoftHyphens(text);
+    if (softHyphens) {
+      const outcome = await matchSectionText(book, sectionIndex, softHyphens.text, locale, limit);
+      return {
+        ...outcome,
+        matches: outcome.matches.map((match) => ({
+          ...match,
+          ...softHyphens.toSource(match),
+          runs: match.runs.map(softHyphens.toSource),
+        })),
+      };
+    }
     if (usesSearchWorker) {
       const payload = {
         sectionKey: `${book.hash}:${book.updatedAt}:${sectionIndex}`,
@@ -637,7 +659,7 @@ export async function* searchLibraryBooks(
         const totalSections = meta!.totalSections;
         for (const section of sections) {
           if (signal?.aborted) return;
-          const remaining = MAX_BOOK_SEARCH_RESULTS - bookMatches;
+          const remaining = maxResultsPerBook - bookMatches;
           if (remaining <= 0) {
             bookTruncated = true;
             break;
@@ -760,7 +782,7 @@ export async function* searchLibraryBooks(
                   },
                 );
               }
-              const remaining = MAX_BOOK_SEARCH_RESULTS - bookMatches;
+              const remaining = maxResultsPerBook - bookMatches;
               if (options.sectionIndex != null && options.sectionIndex !== sectionIndex) {
                 // Scoped search: this section is only extracted for the index.
               } else if (remaining <= 0) {

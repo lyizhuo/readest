@@ -3,13 +3,14 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { RiArrowDownLine } from 'react-icons/ri';
 
 import { useReaderStore } from '@/store/readerStore';
-import { useBookDataStore } from '@/store/bookDataStore';
 import { useThemeStore } from '@/store/themeStore';
 import { useTranslation } from '@/hooks/useTranslation';
 import { eventDispatcher } from '@/utils/event';
 import { setLayeredTurnTouchClaimed } from '@/app/reader/utils/iframeEventHandlers';
+import { hasVerticalPanning } from '@/app/reader/hooks/usePagination';
 import {
   BOOKMARK_PULL_ACTIVATION_PX,
+  BOOKMARK_PULL_TOP_EDGE_PX,
   canPullBookmark,
   computePullOffset,
   isPastPullThreshold,
@@ -20,7 +21,7 @@ import {
   shouldActivatePull,
   type BookmarkPullHandlers,
 } from '@/app/reader/utils/bookmarkPullGesture';
-import Ribbon from './Ribbon';
+import Ribbon, { RIBBON_WIDTH } from './Ribbon';
 
 const SPRING_MS = 250;
 const RIBBON_BODY_HEIGHT = 44; // matches Ribbon.tsx: safe-area top + header bar height
@@ -51,7 +52,7 @@ interface BookmarkPullDownProps {
  */
 const BookmarkPullDown: React.FC<BookmarkPullDownProps> = ({ bookKey, ribbonHidden, slideRef }) => {
   const _ = useTranslation();
-  const { safeAreaInsets } = useThemeStore();
+  const { safeAreaInsets, isIPhoneDuo } = useThemeStore();
   const ribbonVisible = useReaderStore((s) => !!s.viewStates[bookKey]?.ribbonVisible);
 
   const [pulling, setPulling] = useState(false);
@@ -63,13 +64,14 @@ const BookmarkPullDown: React.FC<BookmarkPullDownProps> = ({ bookKey, ribbonHidd
 
   const bandRef = useRef<HTMLDivElement | null>(null);
   const hintRef = useRef<HTMLDivElement | null>(null);
-  const ribbonBoxRef = useRef<HTMLDivElement | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
   const polygonRef = useRef<SVGPolygonElement | null>(null);
 
   // Per-gesture state.
   const armedRef = useRef(false);
   const activeRef = useRef(false);
+  // E-ink pulls toggle on release but draw nothing (ghosting, slow refresh).
+  const einkRef = useRef(false);
   const startXRef = useRef(0);
   const startYRef = useRef(0);
   const baseOffsetRef = useRef(0);
@@ -104,7 +106,7 @@ const BookmarkPullDown: React.FC<BookmarkPullDownProps> = ({ bookKey, ribbonHidd
       const polygon = polygonRef.current;
       if (svg && polygon) {
         const rest = restHeightRef.current;
-        const width = ribbonBoxRef.current?.clientWidth || 32;
+        const width = RIBBON_WIDTH;
         // The resting ribbon notches at 22% of its height; freeze that depth
         // in px so the notch doesn't stretch into a spike as the tail grows.
         const notch = Math.round(rest * 0.22);
@@ -200,6 +202,19 @@ const BookmarkPullDown: React.FC<BookmarkPullDownProps> = ({ bookKey, ribbonHidd
         }
         const t = e.touches[0];
         if (!t) return;
+        // Leave swipes from the top screen edge to the system, e.g. Android's
+        // notification shade (#6599). The frame's rect maps the touch into
+        // main-viewport coordinates, rescaled for any zoom on its ancestors.
+        const frame = doc.defaultView?.frameElement;
+        const frameRect = frame?.getBoundingClientRect();
+        const clientHeight = doc.documentElement.clientHeight;
+        const viewportY = frameRect
+          ? frameRect.top + t.clientY * (clientHeight ? frameRect.height / clientHeight : 1)
+          : t.clientY;
+        if (viewportY < BOOKMARK_PULL_TOP_EDGE_PX) {
+          resetGesture();
+          return;
+        }
         if (springRafIdRef.current !== null) {
           // Re-grab mid-spring: keep the pull engaged from the current offset.
           cancelSpring();
@@ -214,19 +229,19 @@ const BookmarkPullDown: React.FC<BookmarkPullDownProps> = ({ bookKey, ribbonHidd
         resetGesture();
         const selection = doc.getSelection?.();
         if (selection && !selection.isCollapsed) return; // don't hijack selection
-        const viewSettings = useReaderStore.getState().getViewSettings(bookKey);
-        const bookData = useBookDataStore.getState().getBookData(bookKey);
-        if (!viewSettings) return;
+        const store = useReaderStore.getState();
+        const viewSettings = store.getViewSettings(bookKey);
+        if (!viewSettings || viewSettings.disablePullDownToBookmark) return;
         if (
           !canPullBookmark({
             scrolled: !!viewSettings.scrolled,
             vertical: !!viewSettings.vertical,
-            isEink: !!viewSettings.isEink,
-            isFixedLayout: !!bookData?.isFixedLayout,
+            verticalPanning: hasVerticalPanning(store.getView(bookKey), viewSettings),
           })
         ) {
           return;
         }
+        einkRef.current = !!viewSettings.isEink;
         // screenX/screenY, not clientX/clientY: in paginated mode the iframe
         // document is many screens wide, so client coordinates are document
         // coordinates; screen coordinates match the app viewport.
@@ -234,7 +249,7 @@ const BookmarkPullDown: React.FC<BookmarkPullDownProps> = ({ bookKey, ribbonHidd
         startYRef.current = t.screenY;
         armedRef.current = true;
       },
-      onTouchMove: (_doc, e) => {
+      onTouchMove: (doc, e) => {
         if (!armedRef.current) return;
         if (e.touches.length !== 1) {
           if (activeRef.current) springBack();
@@ -246,6 +261,16 @@ const BookmarkPullDown: React.FC<BookmarkPullDownProps> = ({ bookKey, ribbonHidd
         const dx = t.screenX - startXRef.current;
         const dy = t.screenY - startYRef.current + baseOffsetRef.current;
         if (!activeRef.current) {
+          // A text-selection gesture that only began after touchstart owns the
+          // sequence: the OS long-press selected a word and the finger is now
+          // extending it (#5757), or the instant-highlight quick action engaged
+          // and locked the renderer. Yield permanently — one-way, as below.
+          const selection = doc.getSelection?.();
+          const view = useReaderStore.getState().getView(bookKey);
+          if ((selection && !selection.isCollapsed) || view?.renderer.scrollLocked) {
+            resetGesture();
+            return;
+          }
           if (!shouldActivatePull(dx, dy)) {
             // One-way ownership: once the sequence is clearly horizontal (a
             // page turn) or upward, this gesture may not claim it later.
@@ -269,12 +294,12 @@ const BookmarkPullDown: React.FC<BookmarkPullDownProps> = ({ bookKey, ribbonHidd
           pastRef.current = false;
           setPastThreshold(false);
           setRemoveMode(!!store.viewStates[bookKey]?.ribbonVisible);
-          setPulling(true);
+          if (!einkRef.current) setPulling(true);
         }
         e.preventDefault();
         e.stopImmediatePropagation();
         const offset = computePullOffset(dy);
-        scheduleOffset(offset);
+        if (!einkRef.current) scheduleOffset(offset);
         const past = isPastPullThreshold(offset);
         if (past !== pastRef.current) {
           pastRef.current = past;
@@ -349,8 +374,13 @@ const BookmarkPullDown: React.FC<BookmarkPullDownProps> = ({ bookKey, ribbonHidd
             </div>
           </div>
           <div
-            ref={ribbonBoxRef}
-            className='bookmark-pull-ribbon absolute right-0 top-0 flex w-8 justify-center sm:w-6'
+            className='bookmark-pull-ribbon absolute right-0 top-0 flex justify-center'
+            style={{
+              width: `${RIBBON_WIDTH}px`,
+              // Mirrors the resting Ribbon: keep clear of the Duo cover
+              // display's top-trailing camera cutout (#6307).
+              ...(isIPhoneDuo ? { right: `${safeAreaInsets?.right || 0}px` } : {}),
+            }}
           >
             <svg
               ref={svgRef}

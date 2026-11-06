@@ -9,8 +9,8 @@
 | **kong**        | `kong:2.8.1`                | api gateway routing requests to supabase services |
 | **auth**        | `supabase/gotrue:v2.185.0`  | auth service (email, JWT)                         |
 | **rest**        | `postgrest/postgrest:v14.3` | psql rest api                                     |
-| **minio**       | `minio/minio`               | s3 storage                                        |
-| **minio-setup** | `minio/mc`                  | helper container to create s3 buckets             |
+| **minio**       | `quay.io/minio/minio`       | s3 storage                                        |
+| **minio-setup** | `quay.io/minio/mc`          | helper container to create s3 buckets             |
 
 ### Exposed ports
 
@@ -50,8 +50,15 @@ docker compose up -d
 ```
 
 this pulls `${READEST_IMAGE}` (default: `ghcr.io/readest/readest:latest`) instead of building the client locally.
-the web client now reads `SUPABASE_PUBLIC_URL`, `SUPABASE_ANON_KEY`, `API_BASE_URL`, `OBJECT_STORAGE_TYPE`, `STORAGE_FIXED_QUOTA`, and `TRANSLATION_FIXED_QUOTA` from runtime
+the web client now reads `SUPABASE_PUBLIC_URL`, `SUPABASE_ANON_KEY`, `API_BASE_URL`, `OBJECT_STORAGE_TYPE`, `SELF_HOSTED`, `STORAGE_FIXED_QUOTA`, and `TRANSLATION_FIXED_QUOTA` from runtime
 container env, so custom self-hosted values work with pulled images.
+
+`SELF_HOSTED` unlocks every premium feature — third-party cloud sync (WebDAV,
+Google Drive, S3, OneDrive), offline Read Aloud downloads, Send to Readest —
+with or without a signed-in user. the image defaults it to `true`, so a pulled
+image is unlocked even if your `compose.yaml` predates the variable. set
+`SELF_HOSTED=false` in `docker/.env` only if you run a hosted service that sells
+the plans.
 
 if you prefer Docker Hub, set `READEST_IMAGE` in `docker/.env`, for example:
 
@@ -67,6 +74,36 @@ published tags:
 - `<release-tag>` (for example `v1.2.3`): published from release events
 - `main`: rolling image from the default branch
 - `sha-<commit>`: immutable commit tag
+
+### OPDS catalogs on a private network
+
+The web OPDS proxy blocks private, loopback and link-local addresses by default,
+including public hostnames that resolve to them. To reach trusted LAN catalogs,
+set an exact, comma-separated allowlist in `docker/.env`:
+
+```env
+READEST_TRUSTED_PRIVATE_HOSTS=books.home.arpa,calibre.lan,192.168.1.20
+```
+
+Recreate the client with `docker compose up -d client` after changing it. With
+`docker run`, pass `-e READEST_TRUSTED_PRIVATE_HOSTS=books.home.arpa` instead.
+This setting is read by the server at request time and works with prebuilt
+images; no rebuild or `NODE_ENV` change is needed.
+
+Entries are hostnames or IP addresses only, without schemes, ports, paths,
+wildcards or CIDR ranges. Matching ignores case and trailing DNS dots. An entry
+allows any port on that host, so only list hosts whose services you trust.
+For IPv6 literals, include brackets, for example `[fd00::20]`.
+
+Each redirect destination must pass the same checks. List any additional private
+hosts used for feeds, covers or downloads. Unlisted hosts keep the private-address
+and DNS checks, and credentials are still removed on cross-origin redirects.
+The allowlist applies only to OPDS, not KOSync or Send to Readest.
+
+Anyone who can reach your Readest instance can use its OPDS proxy to reach the
+listed hosts. Keep the instance behind your LAN/VPN or access controls when
+allowing private services. `SELF_HOSTED=true` lets the catalog form submit LAN
+URLs, but does not grant server access by itself.
 
 ### Build locally instead of pulling
 

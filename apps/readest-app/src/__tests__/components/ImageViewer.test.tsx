@@ -1,7 +1,25 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { render, cleanup, fireEvent, act } from '@testing-library/react';
+import { render, cleanup, fireEvent, act, waitFor } from '@testing-library/react';
 
 import ImageViewer from '@/app/reader/components/ImageViewer';
+
+// jsdom has no canvas, so the ink probe (which reads the bitmap) is stubbed;
+// each test says what the image's pixels are.
+const { probeImageInkMock } = vi.hoisted(() => {
+  const probe = vi.fn();
+  probe.mockResolvedValue(null);
+  return { probeImageInkMock: probe };
+});
+vi.mock('@/app/reader/utils/imageRenderStyle', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/app/reader/utils/imageRenderStyle')>();
+  return { ...actual, probeImageInk: probeImageInkMock };
+});
+
+afterEach(() => {
+  cleanup();
+  probeImageInkMock.mockReset();
+  probeImageInkMock.mockResolvedValue(null);
+});
 
 vi.mock('@/hooks/useTranslation', () => ({
   useTranslation: () => (s: string) => s,
@@ -20,7 +38,7 @@ vi.mock('@/context/EnvContext', () => ({
 // ZoomControls reaches into the theme store and Tauri window APIs; stub it out.
 vi.mock('@/app/reader/components/ZoomControls', () => ({
   __esModule: true,
-  default: () => null,
+  default: () => <div data-testid='zoom-controls' />,
 }));
 
 afterEach(cleanup);
@@ -258,6 +276,65 @@ describe('ImageViewer', () => {
     });
   });
 
+  // #6154: the close/save/zoom buttons sit over the top-right corner of the
+  // artwork, where they can cover the image itself. They are chrome, so the
+  // tap that already clears the caption and the arrows clears them too.
+  describe('top-right controls', () => {
+    const zoomControls = (container: HTMLElement) =>
+      container.querySelector('[data-testid="zoom-controls"]');
+
+    it('toggles the controls when the image is tapped', () => {
+      const { container } = render(
+        <ImageViewer src='blob:test-image' onClose={vi.fn()} gridInsets={gridInsets} />,
+      );
+      const img = container.querySelector('img')!;
+      expect(zoomControls(container)).toBeTruthy();
+
+      fireEvent.click(img);
+      expect(zoomControls(container)).toBeNull();
+
+      fireEvent.click(img);
+      expect(zoomControls(container)).toBeTruthy();
+    });
+
+    // The zoom badge and the arrows hide themselves 2s after a zoom, so their
+    // state no longer matches the chrome's. A single tap must still hide
+    // everything rather than bring the auto-hidden pieces back.
+    it('hides every chrome element with one tap after the zoom badge timed out', () => {
+      vi.useFakeTimers();
+      try {
+        const { container } = render(
+          <ImageViewer
+            src='blob:test-image'
+            caption='A caption'
+            onClose={vi.fn()}
+            onNext={vi.fn()}
+            gridInsets={gridInsets}
+          />,
+        );
+        const img = container.querySelector('img')!;
+
+        act(() => {
+          fireEvent.doubleClick(img);
+        });
+        act(() => {
+          vi.advanceTimersByTime(2000);
+        });
+        expect(container.querySelector('[aria-label="Zoom level"]')).toBeNull();
+
+        act(() => {
+          fireEvent.click(img);
+        });
+        expect(zoomControls(container)).toBeNull();
+        expect(container.querySelector('.image-caption')).toBeNull();
+        expect(container.querySelector('[aria-label="Next Image"]')).toBeNull();
+        expect(container.querySelector('[aria-label="Zoom level"]')).toBeNull();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
   // #5232: EPUBs often keep the caption or table description of an
   // illustration in the image's `alt` attribute, which was invisible once the
   // image was opened full screen.
@@ -354,5 +431,114 @@ describe('ImageViewer', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // A drawing whose white background is transparency is propped up by the page
+  // (a plate, a filter); the bare bitmap on the dimmed backdrop is not the same
+  // picture. See ImageRenderStyle.
+  describe('reproducing the page rendering', () => {
+    it('paints the plate and filter the page used', () => {
+      const { container } = render(
+        <ImageViewer
+          src='blob:test-image'
+          renderStyle={{ filter: 'invert(100%)', plate: 'rgb(255, 255, 255)' }}
+          onClose={vi.fn()}
+          gridInsets={gridInsets}
+        />,
+      );
+      const img = container.querySelector('img')!;
+      expect(img.style.backgroundColor).toBe('rgb(255, 255, 255)');
+      expect(img.style.filter).toBe('invert(100%)');
+    });
+
+    it('adds no plate of its own when the page named one and the image is opaque', () => {
+      // With a page plate there is nothing to decide; without one and without
+      // any ink reading, the image is left alone.
+      const { container } = render(
+        <ImageViewer
+          src='blob:test-image'
+          renderStyle={{ filter: 'none', plate: null }}
+          onClose={vi.fn()}
+          gridInsets={gridInsets}
+        />,
+      );
+      expect(container.querySelector('img')!.style.backgroundColor).toBe('');
+    });
+
+    // The report that started this: the page's plate comes from the book's
+    // night CSS, which a section loaded under the previous theme never gets —
+    // so the page hands over nothing, and the viewer used to show dark ink on
+    // the app's dark background.
+    it('reads the bitmap and pads a transparent drawing when the page gave no plate', async () => {
+      probeImageInkMock.mockResolvedValue({ transparentRatio: 0.7, darkInkRatio: 0.95 });
+      const { container } = render(
+        <ImageViewer
+          src='data:image/png;base64,AA=='
+          renderStyle={{ filter: 'none', plate: null }}
+          onClose={vi.fn()}
+          gridInsets={gridInsets}
+        />,
+      );
+      await waitFor(() =>
+        expect(container.querySelector('img')!.style.backgroundColor).toBe('rgb(255, 255, 255)'),
+      );
+    });
+
+    it('leaves an inverted drawing unpadded, where white would erase it', async () => {
+      probeImageInkMock.mockResolvedValue({ transparentRatio: 0.7, darkInkRatio: 0.95 });
+      const { container } = render(
+        <ImageViewer
+          src='data:image/png;base64,AA=='
+          renderStyle={{ filter: 'invert(1)', plate: null }}
+          onClose={vi.fn()}
+          gridInsets={gridInsets}
+        />,
+      );
+      await waitFor(() => expect(probeImageInkMock).toHaveBeenCalled());
+      expect(container.querySelector('img')!.style.backgroundColor).toBe('');
+    });
+
+    // A book cover or a dictionary illustration passes no render style: there is
+    // no page to match, so even a transparent dark-ink image is left as it is.
+    it('leaves an image the reader did not lay out untouched', async () => {
+      probeImageInkMock.mockResolvedValue({ transparentRatio: 0.7, darkInkRatio: 0.95 });
+      const { container } = render(
+        <ImageViewer src='data:image/png;base64,AA==' onClose={vi.fn()} gridInsets={gridInsets} />,
+      );
+      await act(async () => {});
+      expect(probeImageInkMock).not.toHaveBeenCalled();
+      const img = container.querySelector('img')!;
+      expect(img.style.backgroundColor).toBe('');
+      expect(img.style.filter).toBe('');
+    });
+  });
+});
+
+// #6558: the viewer offers the same right-click menu as an image in the book.
+describe('ImageViewer image context menu', () => {
+  it('right-clicking the image opens Copy Image / Save Image', () => {
+    const { container, getAllByRole } = render(
+      <ImageViewer src='data:image/png;base64,AA==' onClose={vi.fn()} gridInsets={gridInsets} />,
+    );
+    const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
+    act(() => {
+      container.querySelector('img')!.dispatchEvent(event);
+    });
+    expect(event.defaultPrevented).toBe(true);
+    expect(getAllByRole('menuitem').map((item) => item.textContent)).toEqual([
+      'Copy Image',
+      'Save Image',
+    ]);
+  });
+
+  it('dismissing the menu keeps the viewer open', () => {
+    const onClose = vi.fn();
+    const { container, queryByRole } = render(
+      <ImageViewer src='data:image/png;base64,AA==' onClose={onClose} gridInsets={gridInsets} />,
+    );
+    fireEvent.contextMenu(container.querySelector('img')!);
+    fireEvent.click(document.querySelector('.overlay')!);
+    expect(queryByRole('menuitem')).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
   });
 });

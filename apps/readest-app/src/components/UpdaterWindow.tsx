@@ -19,7 +19,7 @@ import { tauriDownload } from '@/utils/transfer';
 import { installPackage, verifyUpdateSignature, installNightlyUpdate } from '@/utils/bridge';
 import { join } from '@tauri-apps/api/path';
 import { getLocale } from '@/utils/misc';
-import { setLastShownReleaseNotesVersion } from '@/helpers/updater';
+import { getAndroidPlatformKey, setLastShownReleaseNotesVersion } from '@/helpers/updater';
 import type { ResolvedNightlyUpdate } from '@/helpers/updater';
 import {
   READEST_UPDATER_FILE,
@@ -134,9 +134,8 @@ export const UpdaterContent = ({
       const response = await fetch(READEST_UPDATER_FILE);
       const data = await response.json();
       if (semver.gt(data.version, currentVersion)) {
-        const OS_ARCH = osArch();
-        const platformKey = OS_ARCH === 'aarch64' ? 'android-arm64' : 'android-universal';
-        const arch = OS_ARCH === 'aarch64' ? 'arm64' : 'universal';
+        const platformKey = getAndroidPlatformKey(osArch());
+        const arch = platformKey.replace('android-', '');
         const downloadUrl = data.platforms[platformKey]?.url as string;
         const apkFilePath = await appService.resolveFilePath(
           `Readest_${data.version}_${arch}.apk`,
@@ -546,7 +545,7 @@ export const UpdaterContent = ({
           </div>
 
           {checkUpdate ? (
-            <div className='text-base-content flex-grow text-sm'>
+            <div className='text-base-content grow text-sm'>
               <h2 className='mb-4 text-center font-bold sm:text-start'>
                 {_('A new version of Readest is available!')}
               </h2>
@@ -560,7 +559,7 @@ export const UpdaterContent = ({
 
               <div className='flex w-full flex-row items-center justify-end gap-4'>
                 {progress !== null && (
-                  <div className='flex flex-grow flex-col'>
+                  <div className='flex grow flex-col'>
                     <progress
                       className='progress my-1 h-4 w-full'
                       value={progress}
@@ -595,7 +594,7 @@ export const UpdaterContent = ({
               </div>
             </div>
           ) : (
-            <div className='text-base-content flex h-full flex-grow flex-col text-sm sm:flex-row'>
+            <div className='text-base-content flex h-full grow flex-col text-sm sm:flex-row'>
               <div className='flex flex-col items-center justify-center gap-4 p-1 sm:items-start sm:gap-2'>
                 <h2 className='text-center font-bold sm:text-start'>
                   {_('Version {{version}}', { version: currentVersion })}
@@ -732,7 +731,7 @@ export const UpdaterWindow = () => {
       isOpen={isOpen}
       title={checkUpdate ? _('Software Update') : _("What's New in Readest")}
       onClose={() => setIsOpen(false)}
-      boxClassName='sm:!w-[75%] sm:h-auto sm:!max-h-[85vh] sm:!max-w-2xl'
+      boxClassName='sm:w-[75%]! sm:h-auto sm:max-h-[85vh]! sm:max-w-2xl!'
     >
       {isOpen && (
         <UpdaterContent

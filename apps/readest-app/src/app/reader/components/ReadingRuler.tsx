@@ -217,13 +217,14 @@ const ReadingRuler: React.FC<ReadingRulerProps> = ({
   bookKey,
   isVertical,
   rtl,
-  lines,
+  lines: configuredLines,
   position,
   opacity,
   color,
   bookFormat,
   viewSettings,
 }) => {
+  const lines = viewSettings.readingRulerStyle === 'line' ? 1 : configuredLines;
   const { envConfig } = useEnv();
   const { getProgress, getView } = useReaderStore();
   const progress = getProgress(bookKey);
@@ -280,8 +281,18 @@ const ReadingRuler: React.FC<ReadingRulerProps> = ({
   const fallbackRulerSize = baseRulerSize + 2 * padding;
   // Cap the dynamic band at (lines + 1) line heights so a tall element (e.g. a
   // full-page image) inside the block doesn't expand the band to cover all of it.
-  const maxBandSize = calculateReadingRulerSize(lines + 1, viewSettings, bookFormat);
-  const baseColor = READING_RULER_COLORS[color] || READING_RULER_COLORS['yellow'];
+  const maxBandSize =
+    viewSettings.readingRulerStyle === 'line'
+      ? Infinity
+      : calculateReadingRulerSize(lines + 1, viewSettings, bookFormat);
+
+  // A style change must discard the previous size, including fixed-layout
+  // fallbacks, and remeasure even when scrolled mode keeps the ruler fixed.
+  useEffect(() => {
+    bandSizeRef.current = 0;
+    setBandSize(0);
+    scrolledPlacedRef.current = false;
+  }, [viewSettings.readingRulerStyle]);
 
   const clampPosition = useCallback(
     (pos: number, dimension: number) =>
@@ -1092,6 +1103,21 @@ const ReadingRuler: React.FC<ReadingRulerProps> = ({
     WebkitBackdropFilter: cssFilter,
   };
 
+  // Black-and-white e-ink renders every hue as the same gray, so the band's
+  // backdrop tint buys no color there and only costs contrast on the very text
+  // being read. Fall back to the colorless band on those panels; color e-ink
+  // can still show the tint the reader picked.
+  const isEink = !!viewSettings.isEink;
+  const tintBand = color !== 'transparent' && !(isEink && !viewSettings.isColorEink);
+  const bandStyle = tintBand ? backdropFilterStyle : { backgroundColor: 'transparent' };
+  // E-ink has no hover or shadow cues, so the band always needs a crisp 1px
+  // boundary; the translucent outline used on color displays washes out there.
+  const bandOutlineClass = isEink
+    ? 'border-base-content border'
+    : tintBand
+      ? ''
+      : 'border-base-content/55 border';
+
   // Animation transition for smooth auto-positioning
   const getTransitionStyle = (property: 'left' | 'top' | 'width' | 'height') =>
     shouldAnimate ? `${property} 0.6s cubic-bezier(0.25, 0.46, 0.45, 0.94)` : 'none';
@@ -1102,6 +1128,88 @@ const ReadingRuler: React.FC<ReadingRulerProps> = ({
     onPointerUp: handlePointerUp,
     onPointerCancel: handlePointerUp,
   };
+
+  if (viewSettings.readingRulerStyle === 'line') {
+    const thickness = viewSettings.readingRulerLineThickness ?? 2;
+    // Keep the existing text block for snapping and touch dragging, but draw
+    // only its trailing edge, just past the text rather than through it.
+    const lineOffset = effectiveBandSize / 2 - padding;
+    const bandStart = rulerCenterPx - effectiveBandSize / 2;
+    const desiredLineStart =
+      rulerCenterPx + (isVertical && rtl ? -lineOffset - thickness : lineOffset);
+    const lineStart = Math.max(0, Math.min(containerDimension - thickness, desiredLineStart));
+    const linePosition = lineStart - bandStart;
+    const columnLeft = activeColumnRect ? Math.max(0, activeColumnRect.left - padding) : 8;
+    const columnRight = activeColumnRect
+      ? Math.max(0, containerSize.width - activeColumnRect.right - padding)
+      : 8;
+    return (
+      <div
+        ref={containerRef}
+        className={clsx(
+          'pointer-events-none absolute inset-0 z-[5] transition-opacity duration-150 ease-out',
+          isVisible ? 'opacity-100' : 'opacity-0',
+        )}
+      >
+        <div
+          className='ruler pointer-events-none absolute'
+          style={
+            isVertical
+              ? {
+                  left: `${renderPosPct}%`,
+                  top: 8,
+                  bottom: 8,
+                  width: effectiveBandSize,
+                  transform: 'translateX(-50%)',
+                  transition: getTransitionStyle('left'),
+                }
+              : {
+                  top: `${currentPosition}%`,
+                  left: columnLeft,
+                  width: Math.max(0, containerSize.width - columnLeft - columnRight),
+                  height: effectiveBandSize,
+                  transform: 'translateY(-50%)',
+                  transition: getTransitionStyle('top'),
+                }
+          }
+        >
+          <div
+            className='ruler-line pointer-events-none absolute'
+            style={{
+              backgroundColor:
+                isEink && !viewSettings.isColorEink
+                  ? 'var(--color-base-content)'
+                  : (viewSettings.readingRulerLineColor ?? '#808080'),
+              opacity: isEink ? 1 : opacity,
+              ...(isVertical
+                ? {
+                    top: 0,
+                    bottom: 0,
+                    left: `${linePosition}px`,
+                    width: `${thickness}px`,
+                  }
+                : {
+                    left: 0,
+                    right: 0,
+                    top: `${linePosition}px`,
+                    height: `${thickness}px`,
+                  }),
+            }}
+          >
+            <div
+              className={clsx(
+                'pointer-events-auto absolute touch-none',
+                isVertical
+                  ? 'inset-y-0 -start-2 w-4 cursor-col-resize'
+                  : 'inset-x-0 -top-2 h-4 cursor-row-resize',
+              )}
+              {...dragHandleProps}
+            />
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   if (isVertical) {
     // Vertical ruler (for vertical writing mode - moves left/right)
@@ -1137,18 +1245,14 @@ const ReadingRuler: React.FC<ReadingRulerProps> = ({
         <div
           className={clsx(
             'ruler pointer-events-none absolute bottom-0 top-0 my-2 rounded-2xl',
-            color === 'transparent' ? 'border-base-content/55 border' : '',
+            bandOutlineClass,
           )}
           style={{
             left: `${renderPosPct}%`,
             width: `${effectiveBandSize}px`,
             transform: 'translateX(-50%)',
             transition: getTransitionStyle('left'),
-            ...(color === 'transparent'
-              ? {
-                  backgroundColor: baseColor,
-                }
-              : backdropFilterStyle),
+            ...bandStyle,
           }}
         >
           {/* Keep the ruler body pass-through so text inside stays selectable. */}
@@ -1227,17 +1331,14 @@ const ReadingRuler: React.FC<ReadingRulerProps> = ({
 
         {/* Column band */}
         <div
-          className={clsx(
-            'ruler pointer-events-none absolute rounded-2xl',
-            color === 'transparent' ? 'border-base-content/55 border' : '',
-          )}
+          className={clsx('ruler pointer-events-none absolute rounded-2xl', bandOutlineClass)}
           style={{
             left: `${bandLeft}px`,
             top: `${bandTop}px`,
             width: `${bandWidth}px`,
             height: `${bandHeight}px`,
             transition: bandTransition,
-            ...(color === 'transparent' ? { backgroundColor: baseColor } : backdropFilterStyle),
+            ...bandStyle,
           }}
         >
           <div
@@ -1286,18 +1387,14 @@ const ReadingRuler: React.FC<ReadingRulerProps> = ({
       <div
         className={clsx(
           'ruler pointer-events-none absolute left-0 right-0 mx-2 rounded-2xl',
-          color === 'transparent' ? 'border-base-content/55 border' : '',
+          bandOutlineClass,
         )}
         style={{
           top: `${currentPosition}%`,
           height: `${effectiveBandSize}px`,
           transform: 'translateY(-50%)',
           transition: getTransitionStyle('top'),
-          ...(color === 'transparent'
-            ? {
-                backgroundColor: baseColor,
-              }
-            : backdropFilterStyle),
+          ...bandStyle,
         }}
       >
         <div

@@ -10,6 +10,7 @@ import {
   endLayeredTurnTouch,
 } from '@/app/reader/utils/iframeEventHandlers';
 import { NATIVE_CAPTURED_TURN_ATTRIBUTE } from '@/app/reader/utils/turnGestureArena';
+import { getCapturedTurnStyle } from '@/app/reader/hooks/useCapturedTurn';
 import {
   dispatchTouchInterceptors,
   isLayeredTurnGestureActive,
@@ -52,6 +53,11 @@ export const useMouseEvent = (
             } else if (msg.data.deltaY < 0) {
               eventDispatcher.dispatch('zoom-in', { factor: Math.abs(msg.data.deltaY) / 100 });
             }
+          } else if (msg.data.nativeScrollY) {
+            // The page scrolls within itself (fit-width or zoomed PDF): this
+            // gesture belongs to the scroll, and only a fresh one at the edge
+            // turns the page.
+            wheelDetectorRef.current!.suppress(Date.now());
           } else {
             const flip = wheelDetectorRef.current!.feed({
               deltaX: msg.data.deltaX ?? 0,
@@ -99,6 +105,9 @@ export const useOpenMediaEvent = (
   handleTablePress: (html: string) => void,
 ) => {
   const handleOpenMedia = (msg: MessageEvent) => {
+    // The producers post from the app window itself; the table viewer renders
+    // the markup it is handed, so a message from any other window is ignored.
+    if (msg.source !== window) return;
     if (msg.data && msg.data.bookKey === bookKey && msg.data.type === 'iframe-open-media') {
       if (msg.data.elementType === 'image') {
         handleImagePress(msg.data.src);
@@ -163,13 +172,19 @@ export const useTouchEvent = (bookKey: string) => {
   const isLifecycleManagedLayeredTurn = () => isLayeredTurnGestureActive(bookKey);
   const isLayeredTurnCandidate = () => {
     const viewSettings = getViewSettings(bookKey);
-    if (!viewSettings || getBookData(bookKey)?.isFixedLayout) return false;
+    if (!viewSettings) return false;
+    // `fixed-layout.js` animates nothing of its own and ignores `turn-style`,
+    // so a fixed-layout book is only a candidate where the Tauri captured
+    // pipeline drives its turn — and not while it pans (readest#6239).
+    if (getBookData(bookKey)?.isFixedLayout && !getCapturedTurnStyle(viewSettings, true)) {
+      return false;
+    }
     const renderer = getView(bookKey)?.renderer;
     const turnStyle =
       renderer?.getAttribute?.('turn-style') ??
       renderer?.getAttribute?.(NATIVE_CAPTURED_TURN_ATTRIBUTE);
     return (
-      (turnStyle === 'slide' || turnStyle === 'curl') &&
+      (turnStyle === 'slide' || turnStyle === 'curl' || turnStyle === 'push') &&
       viewSettings.animated &&
       !viewSettings.scrolled &&
       !viewSettings.isEink &&
@@ -224,6 +239,23 @@ export const useTouchEvent = (bookKey: string) => {
     if ('preventDefault' in e) e.preventDefault();
   };
 
+  // A native captured turn has already claimed only when its move was consumed.
+  // Cancel it exactly once before a second finger discards the single-finger
+  // baseline; unclaimed starts need no synthetic lifecycle event.
+  const cancelClaimedSingleTouch = (
+    e: IframeTouchEvent | React.TouchEvent<HTMLDivElement>,
+    fallbackTouch: IframeTouch,
+  ) => {
+    const touchStart = touchStartRef.current;
+    if (!touchConsumedRef.current || !touchStart) return;
+    const touch = touchEndRef.current ?? fallbackTouch;
+    const endTime = 'timeStamp' in e ? e.timeStamp : Date.now();
+    dispatchTouchInterceptors(
+      bookKey,
+      buildTouchDetail('cancel', touch, touchStart, touchStartTimeRef.current, endTime),
+    );
+  };
+
   const latchReflowableMultiTouch = (
     e: IframeTouchEvent | React.TouchEvent<HTMLDivElement>,
     t0: IframeTouch | undefined,
@@ -233,19 +265,30 @@ export const useTouchEvent = (bookKey: string) => {
     cancelLayeredTurnTouch(bookKey);
     if (!reflowableMultiTouchRef.current) {
       reflowableMultiTouchRef.current = true;
-      const touchStart = touchStartRef.current;
-      // A native captured turn has already claimed only when its move was
-      // consumed. Cancel it exactly once before discarding the single-finger
-      // baseline; unclaimed starts need no synthetic lifecycle event.
-      if (touchConsumedRef.current && touchStart) {
-        const touch = touchEndRef.current ?? t0;
-        const endTime = 'timeStamp' in e ? e.timeStamp : Date.now();
-        dispatchTouchInterceptors(
-          bookKey,
-          buildTouchDetail('cancel', touch, touchStart, touchStartTimeRef.current, endTime),
-        );
-      }
+      cancelClaimedSingleTouch(e, t0);
     }
+    clearSingleTouchState();
+    return true;
+  };
+
+  const startFixedLayoutPinch = (
+    e: IframeTouchEvent | React.TouchEvent<HTMLDivElement>,
+    t0: IframeTouch,
+    t1: IframeTouch,
+  ) => {
+    if (!getBookData(bookKey)?.isFixedLayout) return false;
+    cancelLayeredTurnTouch(bookKey);
+    // The pinch branch owns the gesture from here. A captured curl the
+    // first finger already claimed would otherwise sit frozen over the
+    // page until the next touchstart (readest#6239).
+    cancelClaimedSingleTouch(e, t0);
+    pinchPendingRef.current = true;
+    isPinchingRef.current = false;
+    initialTouch0Ref.current = t0;
+    initialTouch1Ref.current = t1;
+    initialPinchDistRef.current = getTouchDistance(t0, t1);
+    initialZoomRef.current = getViewSettings(bookKey)?.zoomLevel ?? 100;
+    lastPinchRatioRef.current = 1;
     clearSingleTouchState();
     return true;
   };
@@ -264,21 +307,7 @@ export const useTouchEvent = (bookKey: string) => {
     // a raw move that arrived while the start message was still queued.
     if ('preventDefault' in e) beginLayeredTurnTouch(bookKey);
     if (t0 && t1) {
-      const bookData = getBookData(bookKey);
-      if (bookData?.isFixedLayout) {
-        cancelLayeredTurnTouch(bookKey);
-        pinchPendingRef.current = true;
-        isPinchingRef.current = false;
-        initialTouch0Ref.current = t0;
-        initialTouch1Ref.current = t1;
-        initialPinchDistRef.current = getTouchDistance(t0, t1);
-        initialZoomRef.current = getViewSettings(bookKey)?.zoomLevel ?? 100;
-        lastPinchRatioRef.current = 1;
-        touchStartRef.current = null;
-        touchEndRef.current = null;
-        return;
-      }
-      latchReflowableMultiTouch(e, t0, t1);
+      if (!startFixedLayoutPinch(e, t0, t1)) latchReflowableMultiTouch(e, t0, t1);
       return;
     }
     if (!t0) {
@@ -333,13 +362,24 @@ export const useTouchEvent = (bookKey: string) => {
       }
       const currentDist = getTouchDistance(t0, t1);
       if (initialPinchDistRef.current > 0) {
-        const ratio = currentDist / initialPinchDistRef.current;
+        const rawRatio = currentDist / initialPinchDistRef.current;
+        // Clamp the live preview to the same bounds the release commits, so the
+        // page never previews past the zoom limit.
+        const committed = Math.max(
+          MIN_ZOOM_LEVEL,
+          Math.min(MAX_ZOOM_LEVEL, Math.round(initialZoomRef.current * rawRatio)),
+        );
+        const ratio = committed / initialZoomRef.current;
         lastPinchRatioRef.current = ratio;
         const renderer = getView(bookKey)?.renderer;
         renderer?.pinchZoom?.(ratio);
       }
       return;
     }
+    // Each page of a spread is its own iframe, and the browser sends a touch
+    // sequence only to its first finger's frame: a second finger on the other
+    // page gets no touchstart and first shows up here.
+    if (t0 && t1 && touchStartRef.current && startFixedLayoutPinch(e, t0, t1)) return;
     if (!touchStartRef.current) return;
     const touch = t0;
     if (touch) {
@@ -380,7 +420,10 @@ export const useTouchEvent = (bookKey: string) => {
       const deltaY = touchEnd.screenY - touchStart.screenY;
       const deltaX = touchEnd.screenX - touchStart.screenX;
       if (Math.hypot(deltaX, deltaY) < TOUCH_TAP_SLOP_PX) return;
-      if (!viewSettings!.scrolled && !viewSettings!.vertical) {
+      // Paginated books turn pages with horizontal swipes in every writing mode
+      // (vertical ones included, readest#624), so only that hides the bars; a
+      // vertical swipe is left to the swipe-up toggle on touchend.
+      if (!viewSettings!.scrolled) {
         if (Math.abs(deltaX) > Math.abs(deltaY) && Math.abs(deltaX) >= TOUCH_SWIPE_THRESHOLD_PX) {
           setHoveredBookKey(null);
         }
@@ -515,7 +558,6 @@ export const useTouchEvent = (bookKey: string) => {
         // is a pan, not a toggle-the-bars gesture (#5142).
         if (
           !viewSettings!.scrolled &&
-          !viewSettings!.vertical &&
           (!bookData.isFixedLayout || !hasVerticalPanning(getView(bookKey), viewSettings))
         ) {
           setHoveredBookKey(hoveredBookKey ? null : bookKey);

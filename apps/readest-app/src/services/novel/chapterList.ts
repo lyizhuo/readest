@@ -45,7 +45,8 @@ const MIN_CHAPTER_LINKS = 5;
 const CONTAINER_COVERAGE = 0.8;
 
 const CHAPTER_TEXT_PATTERNS = [
-  /第\s*[0-9０-９零〇一二三四五六七八九十百千万两]+\s*[章节回卷集部篇话]/,
+  // Traditional forms too (節, 話, 萬, 兩); some sites number chapters as 页/頁.
+  /第\s*[0-9０-９零〇一二三四五六七八九十百千万萬两兩]+\s*[章节節回卷集部篇话話页頁]/,
   /\bchapter\s*[0-9]+/i,
   /\bch\.?\s*[0-9]+\b/i,
   /\bepisode\s*[0-9]+/i,
@@ -127,12 +128,55 @@ const findChapterContainer = (candidates: LinkEntry[]): Element | null => {
   return container;
 };
 
-/** First arabic chapter number in the title, else the last digit run in the
- *  URL path — used only to detect newest-first ordering. */
+const CN_DIGITS: Record<string, number> = {
+  零: 0,
+  〇: 0,
+  一: 1,
+  二: 2,
+  两: 2,
+  兩: 2,
+  三: 3,
+  四: 4,
+  五: 5,
+  六: 6,
+  七: 7,
+  八: 8,
+  九: 9,
+};
+const CN_UNITS: Record<string, number> = { 十: 10, 百: 100, 千: 1000 };
+
+/** 第一百零一 → 101, 第一萬零二 → 10002. */
+const parseChineseNumber = (numeral: string): number => {
+  let total = 0;
+  let section = 0;
+  let digit = 0;
+  for (const ch of numeral) {
+    if (ch in CN_DIGITS) digit = CN_DIGITS[ch]!;
+    else if (ch in CN_UNITS) {
+      section += (digit || 1) * CN_UNITS[ch]!;
+      digit = 0;
+    } else if (ch === '万' || ch === '萬') {
+      total += (section + digit) * 10000;
+      section = 0;
+      digit = 0;
+    }
+  }
+  return total + section + digit;
+};
+
+/** Chapter number in the title (the last 第N, arabic or Chinese, so 第一卷
+ *  第六章 reads 6), else the last digit run in the URL path — used only to
+ *  detect newest-first ordering. */
 const chapterNumber = (entry: LinkEntry): number | null => {
+  // Full-width digits (第１２頁) read as ASCII.
+  const text = entry.text.replace(/[０-９]/g, (d) => String.fromCharCode(d.charCodeAt(0) - 0xfee0));
+  const numeral = [
+    ...text.matchAll(/第\s*([0-9]+|[零〇一二三四五六七八九十百千万萬两兩]+)/g),
+  ].pop()?.[1];
+  if (numeral) return /^[0-9]/.test(numeral) ? parseInt(numeral, 10) : parseChineseNumber(numeral);
   const numbered =
-    entry.text.match(/(?:第|\bchapter|\bch\.?|\bepisode)\s*([0-9]+)/i) ||
-    entry.text.match(/^([0-9]+)\s*[、.．:：\-]/);
+    text.match(/(?:\bchapter|\bch\.?|\bepisode)\s*([0-9]+)/i) ||
+    text.match(/^([0-9]+)\s*[、.．:：\-]/);
   if (numbered?.[1]) return parseInt(numbered[1], 10);
   const pathDigits = entry.url.pathname.match(/([0-9]+)(?=[^0-9]*$)/);
   return pathDigits?.[1] ? parseInt(pathDigits[1], 10) : null;
@@ -176,6 +220,55 @@ const WORK_TITLE_META = [
 ];
 const WORK_AUTHOR_META = ['meta[property="og:novel:author"]', 'meta[property="books:author"]'];
 
+/** Labels a novel site uses to introduce the writer's name. */
+const AUTHOR_LABEL = /(?:作者|著者)\s*[:：]\s*/;
+/**
+ * Field labels that sit right after the byline on the same line. The flattened
+ * text runs them into the name with no separator at all — "作者：五月不行"
+ * immediately followed by "日期：2026-08-24" — and no generic rule can tell
+ * where such a name ends, so the labels worth cutting at are named here.
+ */
+const NEXT_FIELD_LABEL = /(?:日期|时间|更新|状态|字数|分类|类别|类型|标签|来源|最新)\s*[:：]/;
+/** Trim a byline candidate down to the name. A byline name runs up to the
+ *  first separator — whitespace included, since the rest of the line is other
+ *  fields, not more name. */
+const cleanAuthorName = (raw: string): string => {
+  const field = raw.trim().split(/[\s，,。；;、|/]/)[0] ?? '';
+  return (field.split(NEXT_FIELD_LABEL)[0] ?? '').slice(0, 32);
+};
+
+/**
+ * The writer's name from an on-page byline. Walks text nodes instead of
+ * matching the flattened `body.textContent`, so the name can be read out of the
+ * link that usually wraps it (`作者：<a>NAME</a></span>日期：…`) without the
+ * neighbouring field bleeding into it.
+ */
+const bylineAuthor = (doc: Document): string | null => {
+  const body = doc.body;
+  if (!body) return null;
+  const walker = doc.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    const text = node.textContent || '';
+    const label = text.match(AUTHOR_LABEL);
+    if (label?.index === undefined) continue;
+    let name = cleanAuthorName(text.slice(label.index + label[0].length));
+    if (!name) {
+      // The label can end its own node, with the name in a following one, and
+      // markup indentation often puts whitespace nodes in between. Only the
+      // first non-blank node can be the name: anything past it is the next
+      // field, so an empty byline must not reach for the date or a chapter.
+      for (let ahead = walker.nextNode(); ahead; ahead = walker.nextNode()) {
+        const candidate = (ahead.textContent || '').trim();
+        if (!candidate) continue;
+        name = cleanAuthorName(candidate);
+        break;
+      }
+    }
+    if (name) return name;
+  }
+  return null;
+};
+
 const extractMetadata = (
   doc: Document,
   pageUrl: string,
@@ -189,11 +282,7 @@ const extractMetadata = (
   // `meta[name=author]` is routinely set site-wide (to the operator, not the
   // writer), so it counts as a guess rather than work metadata.
   const workAuthor = metaContent(doc, WORK_AUTHOR_META);
-  const author =
-    workAuthor ||
-    metaContent(doc, ['meta[name="author"]']) ||
-    doc.body?.textContent?.match(/作者[:：]\s*([^\s，,。；;、]{1,32})/)?.[1] ||
-    '';
+  const author = workAuthor || metaContent(doc, ['meta[name="author"]']) || bylineAuthor(doc) || '';
 
   const rawCover = metaContent(doc, ['meta[property="og:image"]']);
   let coverUrl: string | null = null;

@@ -9,15 +9,23 @@
 // (multi-window desktop keeps its current per-window behavior).
 
 import env from '@/services/environment';
-import { TtsStatsRecorder } from '@/services/statistics/ttsStatsRecorder';
+import { TtsStatsRecorder, type TtsStatsSession } from '@/services/statistics/ttsStatsRecorder';
 import { stubTranslation as _ } from '@/utils/misc';
 import { useBookDataStore } from '@/store/bookDataStore';
 import { useSettingsStore } from '@/store/settingsStore';
 import { eventDispatcher } from '@/utils/event';
 import { releaseUnblockAudio, ttsMediaBridge, TTSMediaBridgeMeta } from './ttsMediaBridge';
+import type { PlaybackSource } from '@/services/playback/playbackSource';
 import type { TTSController } from './TTSController';
 
 export type TTSSessionMeta = TTSMediaBridgeMeta;
+
+// The manager owns any PlaybackSource; the TTS-only consumers (voice picker,
+// downloader, reader hooks) narrow back through this. Kind is the only
+// discriminator - never `instanceof`, which would drag the whole controller
+// module into every consumer's bundle.
+export const asTTSController = (source: PlaybackSource | null | undefined): TTSController | null =>
+  source && source.kind === 'tts' ? (source as TTSController) : null;
 
 // Sentinel passed to setSleepTimer()'s call sites / used as the TTSPlayerSheet
 // timeout option value to mean "stop when the current chapter ends" instead
@@ -29,7 +37,7 @@ export const TTS_STOP_AT_CHAPTER_END = -1;
 export interface TTSSession {
   bookHash: string;
   bookKey: string;
-  controller: TTSController;
+  controller: PlaybackSource;
 }
 
 export type TTSSessionStopReason =
@@ -58,6 +66,10 @@ export class TTSSessionManager extends EventTarget {
   #sleepTimer: ReturnType<typeof setTimeout> | null = null;
   #sleepTimeoutSec = 0;
   #sleepFiresAt = 0;
+  // The duration last chosen in the picker. Unlike the armed timer above it
+  // outlives a stop, so the next session in this app launch starts with the
+  // same timer; it is never persisted, so a new launch starts with none.
+  #chosenSleepSec = 0;
   // "Stop at end of chapter" mode - mutually exclusive with the numeric
   // sleep timer above. A STANDING preference (unlike the numeric timer,
   // which self-clears once it fires): it keeps stopping at every chapter
@@ -70,9 +82,10 @@ export class TTSSessionManager extends EventTarget {
   #stopAtChapterEnd = false;
   #lastPersistAt = 0;
   #pendingLocation: string | null = null;
-  #stopping = false;
+  #controllerTeardowns = new WeakMap<PlaybackSource, Promise<void>>();
+  #bookTeardowns = new Map<string, Set<Promise<void>>>();
 
-  claim(bookKey: string, controller: TTSController, meta: TTSSessionMeta): void {
+  claim(bookKey: string, controller: PlaybackSource, meta: TTSSessionMeta): void {
     const bookHash = getBookHashFromKey(bookKey);
     const existing = this.#session;
     if (existing && existing.bookHash !== bookHash) {
@@ -83,12 +96,13 @@ export class TTSSessionManager extends EventTarget {
       // manager owns the replaced controller's teardown — and must
       // unsubscribe first so the old controller's async tail can't relay.
       this.#unsubscribe(existing.controller);
-      existing.controller.shutdown().catch(() => {});
+      void this.#shutdownController(existing.bookHash, existing.controller);
     }
     this.#session = { bookHash, bookKey, controller };
     this.#meta = meta;
     this.#lastRelayedState = null;
     controller.stopAtChapterEnd = this.#stopAtChapterEnd;
+    if (!this.#sleepTimer && this.#chosenSleepSec > 0) this.#armSleepTimer(this.#chosenSleepSec);
     this.#subscribe(controller);
     void ttsMediaBridge.bind(controller, meta);
     this.#emitSessionChanged('claimed');
@@ -148,10 +162,12 @@ export class TTSSessionManager extends EventTarget {
 
   async stopActive(reason: TTSSessionStopReason = 'user'): Promise<void> {
     const session = this.#session;
-    if (!session || this.#stopping) return;
-    this.#stopping = true;
+    if (!session) return;
     const meta = this.#meta;
     const wasDetached = !session.controller.isViewAttached;
+    // Register before dispatching synchronous events so deletion can join the
+    // teardown even after the live slot is cleared below.
+    const teardown = this.#shutdownController(session.bookHash, session.controller);
     this.#session = null;
     this.#meta = null;
     this.#clearSleepTimer();
@@ -160,8 +176,11 @@ export class TTSSessionManager extends EventTarget {
 
     // UI reconciliation first; teardown is best-effort and must not gate it
     // (native shutdown can stall — see #4676).
-    eventDispatcher.dispatch('tts-playback-state', { bookKey: session.bookKey, state: 'stopped' });
-    this.#emitSessionChanged('stopped');
+    eventDispatcher.dispatch('tts-playback-state', {
+      bookKey: session.bookKey,
+      state: 'stopped',
+    });
+    this.#emitSessionChanged('stopped', session);
     if (reason === 'replaced' || reason === 'deleted') {
       eventDispatcher.dispatch('toast', {
         message: `${_('Stopped reading aloud')}: ${meta?.title ?? ''}`,
@@ -180,8 +199,56 @@ export class TTSSessionManager extends EventTarget {
     releaseUnblockAudio();
     // No use_background_audio(false) here: bridge.unbind() deactivates the
     // native media session, which releases the iOS audio session itself.
-    await session.controller.shutdown().catch((err) => console.warn('TTS shutdown failed:', err));
-    this.#stopping = false;
+    await teardown;
+  }
+
+  // Stop this book if it owns the live slot, or join its teardown if another
+  // caller already cleared the slot but is still closing the controller/DB.
+  async stopBook(bookHash: string, reason: TTSSessionStopReason = 'user'): Promise<void> {
+    for (;;) {
+      if (this.getSessionByHash(bookHash)) {
+        await this.stopActive(reason);
+        continue;
+      }
+      const teardowns = [...(this.#bookTeardowns.get(bookHash) ?? [])];
+      if (!teardowns.length) return;
+      await Promise.all(teardowns);
+    }
+  }
+
+  async stopController(
+    bookHash: string,
+    controller: PlaybackSource,
+    reason: TTSSessionStopReason = 'user',
+  ): Promise<void> {
+    if (this.getSessionByHash(bookHash)?.controller === controller) {
+      await this.stopActive(reason);
+    } else {
+      await this.#shutdownController(bookHash, controller);
+    }
+  }
+
+  #shutdownController(bookHash: string, controller: PlaybackSource): Promise<void> {
+    const existing = this.#controllerTeardowns.get(controller);
+    if (existing) return existing;
+
+    let teardown: Promise<void>;
+    teardown = Promise.resolve()
+      .then(() => controller.shutdown())
+      .catch((err) => console.warn('TTS shutdown failed:', err))
+      .finally(() => {
+        if (this.#controllerTeardowns.get(controller) === teardown) {
+          this.#controllerTeardowns.delete(controller);
+        }
+        const bookTeardowns = this.#bookTeardowns.get(bookHash);
+        bookTeardowns?.delete(teardown);
+        if (bookTeardowns?.size === 0) this.#bookTeardowns.delete(bookHash);
+      });
+    this.#controllerTeardowns.set(controller, teardown);
+    const bookTeardowns = this.#bookTeardowns.get(bookHash) ?? new Set();
+    bookTeardowns.add(teardown);
+    this.#bookTeardowns.set(bookHash, bookTeardowns);
+    return teardown;
   }
 
   // Clear the slot without tearing the controller down (the caller already
@@ -193,7 +260,7 @@ export class TTSSessionManager extends EventTarget {
     this.#clearSleepTimer();
     this.#session = null;
     this.#meta = null;
-    this.#emitSessionChanged('released');
+    this.#emitSessionChanged('released', session);
   }
 
   // Sleep timer lives here so a timer armed in the reader survives unmount
@@ -201,15 +268,20 @@ export class TTSSessionManager extends EventTarget {
   // fire into a dead closure and orphan the audio).
   setSleepTimer(seconds: number): void {
     this.#clearSleepTimer();
+    this.#chosenSleepSec = Math.max(seconds, 0);
     if (seconds > 0) {
       this.#setStopAtChapterEnd(false);
-      this.#sleepTimeoutSec = seconds;
-      this.#sleepFiresAt = Date.now() + seconds * 1000;
-      this.#sleepTimer = setTimeout(() => {
-        this.#sleepTimer = null;
-        void this.stopActive('timeout');
-      }, seconds * 1000);
+      this.#armSleepTimer(seconds);
     }
+  }
+
+  #armSleepTimer(seconds: number): void {
+    this.#sleepTimeoutSec = seconds;
+    this.#sleepFiresAt = Date.now() + seconds * 1000;
+    this.#sleepTimer = setTimeout(() => {
+      this.#sleepTimer = null;
+      void this.stopActive('timeout');
+    }, seconds * 1000);
   }
 
   getSleepTimer(): { timeoutSec: number; firesAt: number } | null {
@@ -224,7 +296,10 @@ export class TTSSessionManager extends EventTarget {
   // triggered by a chapter boundary instead of a clock. Mutually exclusive
   // with the numeric timer (enabling one clears the other).
   setStopAtChapterEnd(enabled: boolean): void {
-    if (enabled) this.#clearSleepTimer();
+    if (enabled) {
+      this.#clearSleepTimer();
+      this.#chosenSleepSec = 0;
+    }
     this.#setStopAtChapterEnd(enabled);
   }
 
@@ -257,12 +332,21 @@ export class TTSSessionManager extends EventTarget {
     void recorder.stop().catch((err) => console.warn('[stats] TTS stats flush failed:', err));
   }
 
-  #subscribe(controller: TTSController): void {
+  #subscribe(controller: PlaybackSource): void {
     // Listening is reading, so it feeds the same page_stat_data table. The
     // recorder lives here rather than in the reader because a headless session
     // (library mini player, lock screen, CarPlay) has no React tree left.
+    // TTS only: the recorder reads the controller's foliate view to locate the
+    // spoken page, which a non-TTS source has no equivalent of. It takes the
+    // LIVE session object, never a copy - adopt() rebinds bookKey IN PLACE when
+    // the reader reattaches to a background session, and a frozen key would
+    // send every later progress/config lookup to the closed pane's entry.
     this.#releaseStatsRecorder();
-    this.#statsRecorder = this.#session ? new TtsStatsRecorder(this.#session) : null;
+    const session = this.#session;
+    this.#statsRecorder =
+      session && asTTSController(session.controller)
+        ? new TtsStatsRecorder(session as TtsStatsSession)
+        : null;
     this.#onStateChange = (e: Event) => {
       const { state } = (e as CustomEvent<{ state: string }>).detail;
       const session = this.#session;
@@ -294,7 +378,7 @@ export class TTSSessionManager extends EventTarget {
     controller.addEventListener('tts-highlight-mark', this.#onHighlightMark);
   }
 
-  #unsubscribe(controller: TTSController): void {
+  #unsubscribe(controller: PlaybackSource): void {
     // Flush against the session the recorder was built for — every unbind path
     // (stop, release, same-book controller swap) runs through here, and
     // stopActive has already cleared #session by this point.
@@ -352,10 +436,11 @@ export class TTSSessionManager extends EventTarget {
     }
   }
 
-  #emitSessionChanged(reason: 'claimed' | 'detached' | 'stopped' | 'released'): void {
-    this.dispatchEvent(
-      new CustomEvent('session-changed', { detail: { session: this.#session, reason } }),
-    );
+  #emitSessionChanged(
+    reason: 'claimed' | 'detached' | 'stopped' | 'released',
+    session: TTSSession | null = this.#session,
+  ): void {
+    this.dispatchEvent(new CustomEvent('session-changed', { detail: { session, reason } }));
   }
 }
 

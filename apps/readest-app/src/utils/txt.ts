@@ -121,6 +121,20 @@ const escapeXml = (str: string) => {
     .replace(/'/g, '&apos;');
 };
 
+// Characters that can spell a chapter number after 第. Beyond the plain
+// 一二三…, 两/兩 is the colloquial "two" web novels use for hundreds
+// (第两百一十八章) and 壹贰叁… are the uppercase numerals of classical and formal
+// editions. A numeral style left out here does not merely lose its own
+// headings: its chapters glue into one oversized part that isGoodMatches
+// rejects, dropping the TOC for the entire book. See issue #6172.
+const CJK_NUMBER_DIGITS = '零〇一二两兩三四五六七八九十壹贰貳叁叄參肆伍陆陸柒捌玖拾0-9';
+const CJK_NUMBER_UNITS = '百千万萬佰仟';
+const CJK_NUMBER_CHARS = `${CJK_NUMBER_DIGITS}${CJK_NUMBER_UNITS}`;
+// Spaces as the heading split allows them (第一 卷), around a required numeral.
+const CJK_VOLUME_HEADING = new RegExp(
+  `第[ 　]*[${CJK_NUMBER_CHARS}][ 　${CJK_NUMBER_CHARS}]*(卷|本|册|冊|部)`,
+);
+
 export class TxtToEpubConverter {
   public async convert(options: Txt2EpubOptions): Promise<ConversionResult> {
     if (options.file.size <= LARGE_TXT_THRESHOLD_BYTES) {
@@ -606,7 +620,7 @@ export class TxtToEpubConverter {
 
       let isVolume = false;
       if (language === 'zh') {
-        isVolume = /第[零〇一二三四五六七八九十百千万0-9]+(卷|本|册|部)/.test(title);
+        isVolume = CJK_VOLUME_HEADING.test(title);
       } else {
         isVolume = /\b(Part|Volume|Book)\b/i.test(title);
       }
@@ -728,15 +742,15 @@ export class TxtToEpubConverter {
       // volume wraps chapters), and the regexps array is a fallback chain — the
       // first regex that splits "well enough" wins — so separate entries would
       // recognize one tier and silently drop the other.
-      const cjkNumber = '第[ 　零〇一二三四五六七八九十0-9][ 　零〇一二三四五六七八九十百千万0-9]*';
+      const cjkNumber = `第[ 　${CJK_NUMBER_DIGITS}][ 　${CJK_NUMBER_CHARS}]*`;
       // Tier 1 — chapter units. Real headings; a title may attach directly
       // (第一章天地初开) or after a separator.
-      const chapterUnit = String.raw`[章节回讲篇话](?:[：:、 　\(\)0-9]*[^\n-]{0,36})`;
+      const chapterUnit = String.raw`[章节節回讲講篇话話](?:[：:、 　\(\)0-9]*[^\n-]{0,36})`;
       // Tier 2 — volume/measure-word units. These double as 量词 in prose
       // (第一封信 "the first letter", 第四本书 "the fourth book"), so a title only
       // counts when introduced by a separator (：:、, space, parens) or the line
       // ends — never a bare noun directly after the unit. See issue #4658.
-      const volumeUnit = String.raw`[卷本册部封](?:[：:、 　\(\)][：:、 　\(\)0-9]*[^\n-]{0,36})?`;
+      const volumeUnit = String.raw`[卷本册冊部封](?:[：:、 　\(\)][：:、 　\(\)0-9]*[^\n-]{0,36})?`;
       const numberedHeading = String.raw`${cjkNumber}(?:${chapterUnit}|${volumeUnit})(?!\S)`;
       const prefaceHeading = String.raw`(?:楔子|前言|简介|引言|序言|序章|总论|概论|后记|番外篇|番外|外传)(?:[：: 　][^\n-]{0,36})?(?!\S)`;
       const englishHeading = String.raw`chapter[\s.]*[0-9]+(?:[：:. 　]+[^\n-]{0,50})?(?!\S)`;
@@ -1095,3 +1109,20 @@ export class TxtToEpubConverter {
     return 'utf-8';
   }
 }
+
+// First non-empty line of pasted or shared text, as a book title.
+export const getTextTitle = (text: string): string =>
+  (text.split('\n').find((line) => line.trim()) ?? '').trim().slice(0, 80);
+
+// Wrap pasted or shared text as a .txt file for the normal import path. The
+// TXT importer titles the book after the file name, so a blank title falls
+// back to the text's first line, then to `fallbackTitle`.
+export const createTextBookFile = (text: string, title: string, fallbackTitle: string): File => {
+  // "Briefing: today" -> "Briefing - today"; trailing dots and spaces are
+  // not allowed in Windows file names.
+  const name = (title.trim() || getTextTitle(text))
+    .replace(/\s*[<>:"/\\|?*\x00-\x1f]+\s*/g, ' - ')
+    .slice(0, 80)
+    .replace(/^[\s-]+|[\s.-]+$/g, '');
+  return new File([text], `${name || fallbackTitle}.txt`, { type: 'text/plain' });
+};

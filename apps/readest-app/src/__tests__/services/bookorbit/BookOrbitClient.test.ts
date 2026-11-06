@@ -68,6 +68,40 @@ describe('BookOrbitClient', () => {
     expect(body['books']).toEqual(books);
   });
 
+  it('match-check clamps title and authors to the server limits and keeps the rest', async () => {
+    const fetchMock = setFetch(async () =>
+      jsonResponse(200, { matches: [], libraryVersion: 'v1' }),
+    );
+    const client = new BookOrbitClient(makeConfig());
+    const hash = 'c'.repeat(32);
+    await client.matchCheck([
+      {
+        hash,
+        title: 't'.repeat(600),
+        authors: 'a'.repeat(1200),
+        lastOpen: 1787000000,
+        source: 'current_file',
+      },
+    ]);
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('http://192.168.1.50:3000/api/v1/koreader/plugin/match-check');
+    const body = JSON.parse(init.body as string) as {
+      hashes: string[];
+      books: Record<string, unknown>[];
+    };
+    expect(body.hashes).toEqual([hash]);
+    expect(body.books).toEqual([
+      {
+        hash,
+        title: 't'.repeat(500),
+        authors: 'a'.repeat(1000),
+        lastOpen: 1787000000,
+        source: 'current_file',
+      },
+    ]);
+  });
+
   it('throws BookOrbitRequestError with the response status on failure', async () => {
     setFetch(async () => jsonResponse(500, { message: 'boom' }));
     const client = new BookOrbitClient(makeConfig());
@@ -129,5 +163,20 @@ describe('BookOrbitClient', () => {
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     const headers = init.headers as Record<string, string>;
     expect(headers['X-Auth-Key']).toBe('a'.repeat(32));
+  });
+});
+
+describe('BookOrbitClient – TLS certificate checks', () => {
+  it('relaxes certificate checks only when the server allows self-signed certs', async () => {
+    const fetchMock = setFetch(async () => jsonResponse(200, { results: [], unmatched: [] }));
+    const books = [{ hash: 'a'.repeat(32), keys: [], keysComplete: true, changes: [] }];
+
+    await new BookOrbitClient(makeConfig({ allowSelfSignedCert: false })).exchangeAnnotations(
+      books,
+    );
+    await new BookOrbitClient(makeConfig({ allowSelfSignedCert: true })).exchangeAnnotations(books);
+
+    expect(fetchMock.mock.calls[0]![1]).not.toHaveProperty('danger');
+    expect(fetchMock.mock.calls[1]![1]).toHaveProperty('danger');
   });
 });

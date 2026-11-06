@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Book } from '@/types/book';
 
 const mockOpen = vi.hoisted(() => vi.fn());
+const mockTryNativeParsePdf = vi.hoisted(() => vi.fn());
 const mockPartialMD5 = vi.hoisted(() => vi.fn());
 
 vi.mock('@/utils/md5', async () => {
@@ -18,6 +19,8 @@ vi.mock('@/libs/document', async () => {
   }
   return { ...actual, DocumentLoader: MockDocumentLoader };
 });
+
+vi.mock('@/utils/tauriPdfBridge', () => ({ tryNativeParsePdf: mockTryNativeParsePdf }));
 
 vi.mock('@/utils/txt', () => ({ TxtToEpubConverter: vi.fn() }));
 vi.mock('@/utils/svg', () => ({ svg2png: vi.fn() }));
@@ -137,6 +140,60 @@ describe('importBook BookDoc lifecycle', () => {
     expect(mockDestroy).toHaveBeenCalledTimes(1);
   });
 
+  it('uses the native metadata and cover path for an Android PDF file path', async () => {
+    const bookDoc = setupMockBookDoc();
+    mockTryNativeParsePdf.mockResolvedValue({
+      partialMd5: 'native-pdf-hash',
+      bookDoc,
+    });
+    service.osPlatform = 'android';
+    service
+      .getFs()
+      .openFile.mockResolvedValue(
+        new File(['pdf content'], 'test.pdf', { type: 'application/pdf' }),
+      );
+
+    const result = await service.importBook('/sdcard/Books/test.pdf', []);
+
+    expect(result?.hash).toBe('native-pdf-hash');
+    expect(mockTryNativeParsePdf).toHaveBeenCalledWith(
+      '/sdcard/Books/test.pdf',
+      expect.any(File),
+      'android',
+    );
+    expect(mockOpen).not.toHaveBeenCalled();
+    expect(mockPartialMD5).not.toHaveBeenCalled();
+    expect(mockDestroy).toHaveBeenCalledOnce();
+  });
+
+  it('reuses the opened cache file when persisting an Android content URI', async () => {
+    const bookDoc = setupMockBookDoc();
+    mockTryNativeParsePdf.mockResolvedValue({
+      partialMd5: 'native-pdf-hash',
+      bookDoc,
+    });
+    service.osPlatform = 'android';
+    const openedFile = Object.assign(
+      new File(['pdf content'], 'test.pdf', { type: 'application/pdf' }),
+      {
+        getNativeLocation: () => ({
+          path: '/data/user/0/com.bilingify.readest/cache/import-test.pdf',
+        }),
+      },
+    );
+    const fs = service.getFs();
+    fs.openFile.mockResolvedValue(openedFile);
+
+    await service.importBook('content://com.example.documents/document/42', []);
+
+    expect(
+      fs.writeFile.mock.calls.some(
+        ([, baseDir, contents]) => baseDir === 'Books' && contents === openedFile,
+      ),
+    ).toBe(true);
+    expect(fs.copyFile).not.toHaveBeenCalled();
+  });
+
   it('destroys the loaded BookDoc when the import fails after opening', async () => {
     setupMockBookDoc();
     service.getFs().createDir.mockRejectedValue(new Error('disk full'));
@@ -183,5 +240,24 @@ describe('importBook BookDoc lifecycle', () => {
 
     expect(refreshed).toBe(true);
     expect(bookDoc.destroy).toHaveBeenCalledTimes(1);
+  });
+
+  it('fills in the page count of a book imported before it was recorded (#6662)', async () => {
+    const bookDoc = setupMockBookDoc();
+    Object.assign(bookDoc, { sections: [{ size: 1 }, { size: 1 }, { size: 1 }] });
+    const fs = service.getFs();
+    fs.exists.mockResolvedValue(true);
+    fs.openFile.mockResolvedValue(new File(['pdf content'], 'test.pdf'));
+    const book: Book = {
+      hash: 'hash-abc',
+      format: 'PDF',
+      title: 'Test Book',
+      author: 'Test Author',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+
+    expect(await refreshBookMetadata(service.getFs() as never, book)).toBe(true);
+    expect(book.pageCount).toBe(3);
   });
 });

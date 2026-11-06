@@ -1,12 +1,29 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 
 import type { BookDoc } from '@/libs/document';
+import type { AppService } from '@/types/system';
 import type { TTSController } from '@/services/tts/TTSController';
 import {
   loadMediaOverlaySection,
   type MediaOverlaySection,
 } from '@/services/tts/mediaOverlay/MediaOverlaySection';
 import { MediaOverlayClient } from '@/services/tts/mediaOverlay/MediaOverlayClient';
+
+const { mediaFileUrl, nativeInvoke, writeFile } = vi.hoisted(() => ({
+  mediaFileUrl: vi.fn(async (..._args: unknown[]): Promise<string | null> => null),
+  nativeInvoke: vi.fn(async (..._args: unknown[]) => ({ session: 7 })),
+  writeFile: vi.fn(),
+}));
+vi.mock('@tauri-apps/api/core', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@tauri-apps/api/core')>()),
+  invoke: nativeInvoke,
+  addPluginListener: async () => ({ unregister: () => {} }),
+}));
+vi.mock('@tauri-apps/plugin-fs', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@tauri-apps/plugin-fs')>()),
+  writeFile,
+}));
+vi.mock('@/services/audiobook/mediaProxy', () => ({ getMediaFileUrl: mediaFileUrl }));
 
 // Minimal HTMLAudioElement stand-in: jsdom has no media pipeline, so the test
 // drives the clock itself and emits the events a real element would.
@@ -49,6 +66,10 @@ class FakeAudio {
   pause(): void {
     this.paused = true;
   }
+  // HtmlAudioClock (the per-track player behind a multi-track source) calls
+  // these on the element; a plain narration element never does.
+  load(): void {}
+  removeAttribute(): void {}
 
   #emit(type: string): void {
     for (const fn of [...(this.#listeners.get(type) ?? [])]) fn();
@@ -144,7 +165,18 @@ describe('MediaOverlayClient capabilities', () => {
       gapControl: false,
       liveRateChange: true,
       continuousTimeline: true,
+      textHighlight: true,
     });
+  });
+
+  test('disables text highlighting for a source without fine text timing', async () => {
+    await setup();
+    client.attachSource({
+      loadBlob: async () => new Blob([new Uint8Array(8)]),
+      textHighlight: false,
+    });
+
+    expect(client.getCapabilities().textHighlight).toBe(false);
   });
 
   test('offers the narrator as its only voice', async () => {
@@ -163,6 +195,291 @@ describe('MediaOverlayClient capabilities', () => {
     client.setSection(section);
     const groups = await client.getVoices('en');
     expect(groups[0]!.voices[0]!.name).toBe('Book narration');
+  });
+
+  test('can load clips and a narrator name from an external narration source', async () => {
+    [section] = await makeSection(WORD_SMIL);
+    const loadBlob = vi.fn(async () => new Blob([new Uint8Array(8)], { type: 'audio/mpeg' }));
+    client = new MediaOverlayClient({ dispatchSpeakMark: vi.fn() } as unknown as TTSController);
+    await client.init();
+    client.attachSource({ narrator: 'External Narrator', loadBlob });
+    client.setSection(section);
+
+    expect((await client.getVoices('en'))[0]!.voices[0]!.name).toBe('External Narrator');
+    const iter = client.speak(section.ssmlForBlock(0)!, new AbortController().signal);
+    await iter.next();
+
+    expect(loadBlob).toHaveBeenCalledWith('OEBPS/ch1.mp3');
+  });
+
+  test('streams an external narration URL without loading it into a blob', async () => {
+    [section] = await makeSection(WORD_SMIL);
+    const loadBlob = vi.fn(async () => new Blob([new Uint8Array(8)]));
+    client = new MediaOverlayClient({ dispatchSpeakMark: vi.fn() } as unknown as TTSController);
+    await client.init();
+    client.attachSource({
+      loadBlob,
+      resolveUrl: vi.fn(async () => 'http://asset.localhost/books/ch1.mp3'),
+    });
+    client.setSection(section);
+
+    const iter = client.speak(section.ssmlForBlock(0)!, new AbortController().signal);
+    await iter.next();
+
+    expect(audio().src).toBe('http://asset.localhost/books/ch1.mp3');
+    expect(loadBlob).not.toHaveBeenCalled();
+    expect(createObjectURL).not.toHaveBeenCalled();
+  });
+
+  // A book's single shared track can be most of the book (900 MB, #6989):
+  // a stored entry plays from the book file itself, never copied out whole.
+  test('plays a stored audio entry from a slice of the book file', async () => {
+    await setup();
+    const slice = new Blob([new Uint8Array(8)], { type: 'audio/mpeg' });
+    const getMediaSource = vi.fn(async () => ({ blob: slice }));
+    (book as { getMediaSource?: unknown }).getMediaSource = getMediaSource;
+    client.attachBook(book);
+
+    const iter = client.speak(section.ssmlForBlock(0)!, new AbortController().signal);
+    await iter.next();
+
+    expect(book.loadBlob).not.toHaveBeenCalled();
+    expect(getMediaSource).toHaveBeenCalledWith('OEBPS/ch1.mp3', 'audio/mpeg');
+    expect(createObjectURL).toHaveBeenCalledExactlyOnceWith(slice);
+  });
+
+  test('plays a stored audio entry of a native book through the media proxy', async () => {
+    await setup();
+    (book as { getMediaSource?: unknown }).getMediaSource = vi.fn(async () => ({
+      path: '/books/narrated.epub',
+      start: 120,
+      end: 4216,
+    }));
+    client.attachBook(book);
+    mediaFileUrl.mockResolvedValueOnce('http://127.0.0.1:9/s/file/f1');
+
+    const iter = client.speak(section.ssmlForBlock(0)!, new AbortController().signal);
+    await iter.next();
+
+    expect(book.loadBlob).not.toHaveBeenCalled();
+    expect(mediaFileUrl).toHaveBeenCalledWith('/books/narrated.epub', 120, 4216, 'audio/mpeg');
+    expect(audio().src).toBe('http://127.0.0.1:9/s/file/f1');
+    expect(createObjectURL).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    'opus',
+    'webm',
+    'ogg',
+    'oga',
+    'mp3',
+  ])('plays a compressed Linux %s entry through an HTML blob without staging on disk', async (extension) => {
+    [section, book] = await makeSection(par('p1', 0, 3, `chapter.${extension}`));
+    nativeInvoke.mockClear();
+    writeFile.mockClear();
+    client = new MediaOverlayClient(undefined, { isLinuxApp: true } as AppService);
+    await client.init();
+    const href = `OEBPS/chapter.${extension}`;
+    const loadBlob = vi.fn(async () => new Blob([new Uint8Array(8)]));
+    client.attachSource({
+      loadBlob,
+      getMediaSource: async () => ({ path: '/books/narrated.epub', entry: href }),
+    });
+    client.setSection(section);
+    const iter = client.speak(section.ssmlForBlock(0)!, new AbortController().signal);
+
+    expect((await iter.next()).value?.code).toBe('boundary');
+    expect(audio()?.src).toBe('blob:audio');
+    expect(createObjectURL.mock.lastCall?.[0].type).toBe(
+      extension === 'mp3' ? 'audio/mpeg' : extension === 'webm' ? 'audio/webm' : 'audio/ogg',
+    );
+    expect(loadBlob).toHaveBeenCalledWith(href);
+    expect(
+      nativeInvoke.mock.calls.some((call) => call[0] === 'plugin:native-tts|playout_control'),
+    ).toBe(false);
+    expect(writeFile).not.toHaveBeenCalled();
+    await client.shutdown();
+  });
+
+  test.each([
+    'opus',
+    'webm',
+    'ogg',
+    'oga',
+    'mp3',
+  ])('keeps a paired local Linux %s file on its HTML streaming URL', async (extension) => {
+    [section] = await makeSection(par('p1', 0, 3, `chapter.${extension}`));
+    nativeInvoke.mockClear();
+    writeFile.mockClear();
+    client = new MediaOverlayClient(undefined, { isLinuxApp: true } as AppService);
+    await client.init();
+    const loadBlob = vi.fn(async () => new Blob([new Uint8Array(8)]));
+    client.attachSource({
+      loadBlob,
+      resolvePath: async () => `/books/chapter.${extension}`,
+      resolveUrl: async () => `http://127.0.0.1:9/audio.${extension}`,
+    });
+    client.setSection(section);
+    const iter = client.speak(section.ssmlForBlock(0)!, new AbortController().signal);
+
+    expect((await iter.next()).value?.code).toBe('boundary');
+    expect(audio()?.src).toBe(`http://127.0.0.1:9/audio.${extension}`);
+    expect(loadBlob).not.toHaveBeenCalled();
+    expect(createObjectURL).not.toHaveBeenCalled();
+    expect(
+      nativeInvoke.mock.calls.some((call) => call[0] === 'plugin:native-tts|playout_control'),
+    ).toBe(false);
+    expect(writeFile).not.toHaveBeenCalled();
+    await client.shutdown();
+  });
+
+  test('keeps Linux remote paired tracks on their HTML audio clock', async () => {
+    await setup();
+    await client.shutdown();
+    client = new MediaOverlayClient(
+      controller as unknown as TTSController,
+      { isLinuxApp: true } as AppService,
+    );
+    await client.init();
+    client.attachSource({
+      loadBlob: async () => {
+        throw new Error('No local audio');
+      },
+      resolveTracks: async () => [{ url: 'https://abs/audio.mp3', startOffset: 0, duration: 6 }],
+    });
+    client.setSection(section);
+    const iter = client.speak(section.ssmlForBlock(0)!, new AbortController().signal);
+
+    expect((await iter.next()).value?.code).toBe('boundary');
+    expect(audio().src).toBe('https://abs/audio.mp3');
+    await client.shutdown();
+  });
+
+  test('keeps a remote Linux single-file source on HTMLAudio', async () => {
+    await setup();
+    await client.shutdown();
+    client = new MediaOverlayClient(
+      controller as unknown as TTSController,
+      { isLinuxApp: true } as AppService,
+    );
+    await client.init();
+    client.attachSource({
+      loadBlob: async () => {
+        throw new Error('No local audio');
+      },
+      resolvePath: async () => 'https://server/audio.mp3',
+      resolveUrl: async () => 'https://server/audio.mp3',
+    });
+    client.setSection(section);
+    const iter = client.speak(section.ssmlForBlock(0)!, new AbortController().signal);
+
+    expect((await iter.next()).value?.code).toBe('boundary');
+    expect(audio().src).toBe('https://server/audio.mp3');
+    await client.shutdown();
+  });
+
+  test('falls back to the blob when the media proxy cannot serve the book', async () => {
+    await setup();
+    (book as { getMediaSource?: unknown }).getMediaSource = vi.fn(async () => ({
+      path: '/books/narrated.epub',
+      start: 120,
+      end: 4216,
+    }));
+    client.attachBook(book);
+    mediaFileUrl.mockResolvedValueOnce(null);
+
+    const iter = client.speak(section.ssmlForBlock(0)!, new AbortController().signal);
+    await iter.next();
+
+    expect(book.loadBlob).toHaveBeenCalledWith('OEBPS/ch1.mp3');
+    expect(audio().src).toBe('blob:audio');
+  });
+
+  // A recording split across files (an Audiobookshelf item) is one timeline
+  // to the client: the clip's global time picks the file and in-file offset.
+  test('plays a multi-track source from the file holding the clip', async () => {
+    [section] = await makeSection(WORD_SMIL);
+    const loadBlob = vi.fn(async () => new Blob([new Uint8Array(8)]));
+    client = new MediaOverlayClient({ dispatchSpeakMark: vi.fn() } as unknown as TTSController);
+    await client.init();
+    client.attachSource({
+      loadBlob,
+      resolveTracks: vi.fn(async () => [
+        { url: 'http://abs/t1', startOffset: 0, duration: 2 },
+        { url: 'http://abs/t2', startOffset: 2, duration: 10 },
+      ]),
+    });
+    client.setSection(section);
+
+    // Block 1 is the whole-paragraph par at 3s..6s: 1s into the second file.
+    const iter = client.speak(section.ssmlForBlock(1)!, new AbortController().signal);
+    const first = await iter.next();
+
+    expect(first.value).toMatchObject({ code: 'boundary' });
+    expect(audio().src).toBe('http://abs/t2');
+    expect(audio().seeks).toEqual([1]);
+    expect(audio().playCalls).toBe(1);
+    expect(loadBlob).not.toHaveBeenCalled();
+
+    // The clock the client watches is global: 4s into t2 is 6s, the clip end.
+    const pending = iter.next();
+    audio().advanceTo(4);
+    expect((await pending).value).toMatchObject({ code: 'end' });
+  });
+
+  // BookOrbit's audio cannot be given to a media element as a URL at all
+  // (`Cross-Origin-Resource-Policy: same-origin`), so its track list carries
+  // server paths and the bytes arrive as blobs -- only the track being played,
+  // and seekable, which resuming inside a chapter needs.
+  test('plays a multi-track source whose tracks load as blobs', async () => {
+    [section] = await makeSection(WORD_SMIL);
+    const loadTrack = vi.fn(async () => new Blob([new Uint8Array(8)]));
+    client = new MediaOverlayClient({ dispatchSpeakMark: vi.fn() } as unknown as TTSController);
+    await client.init();
+    client.attachSource({
+      loadBlob: vi.fn(async () => new Blob([new Uint8Array(8)])),
+      loadTrack,
+      resolveTracks: vi.fn(async () => [
+        { url: '/api/v1/audiobooks/8/assets/a1/content', startOffset: 0, duration: 2 },
+        { url: '/api/v1/audiobooks/8/assets/a2/content', startOffset: 2, duration: 10 },
+      ]),
+    });
+    client.setSection(section);
+
+    const iter = client.speak(section.ssmlForBlock(1)!, new AbortController().signal);
+    expect((await iter.next()).value).toMatchObject({ code: 'boundary' });
+
+    // Only the track holding the clip is fetched, and the element plays the
+    // blob rather than the path.
+    expect(loadTrack).toHaveBeenCalledExactlyOnceWith('/api/v1/audiobooks/8/assets/a2/content');
+    expect(audio().src).toBe('blob:audio');
+    expect(audio().seeks).toEqual([1]);
+  });
+
+  // The same source resolves real URLs once the loopback media proxy is up.
+  // Those stream and seek, so they must go to the element directly rather than
+  // being downloaded whole through the blob loader.
+  test('plays a blob-capable source from URLs when it resolves them', async () => {
+    [section] = await makeSection(WORD_SMIL);
+    const loadTrack = vi.fn(async () => new Blob([new Uint8Array(8)]));
+    client = new MediaOverlayClient({ dispatchSpeakMark: vi.fn() } as unknown as TTSController);
+    await client.init();
+    client.attachSource({
+      loadBlob: vi.fn(async () => new Blob([new Uint8Array(8)])),
+      loadTrack,
+      resolveTracks: vi.fn(async () => [
+        { url: 'http://127.0.0.1:9/s/media?u=a1', startOffset: 0, duration: 2 },
+        { url: 'http://127.0.0.1:9/s/media?u=a2', startOffset: 2, duration: 10 },
+      ]),
+    });
+    client.setSection(section);
+
+    const iter = client.speak(section.ssmlForBlock(1)!, new AbortController().signal);
+    expect((await iter.next()).value).toMatchObject({ code: 'boundary' });
+
+    expect(loadTrack).not.toHaveBeenCalled();
+    expect(audio().src).toBe('http://127.0.0.1:9/s/media?u=a2');
+    expect(audio().seeks).toEqual([1]);
   });
 });
 
@@ -292,6 +609,16 @@ describe('MediaOverlayClient playback', () => {
 
     expect(audio().seeks).toEqual([3]);
     expect(audio().currentTime).toBe(3);
+  });
+
+  test('starts at a requested position inside the first narration clip', async () => {
+    await setup();
+    client.setNextChunkPosition(1.5);
+    const iter = client.speak(section.ssmlForBlock(1)!, new AbortController().signal);
+    await iter.next();
+
+    expect(audio().seeks).toEqual([4.5]);
+    expect(audio().currentTime).toBe(4.5);
   });
 
   test('resumes mid-block from the requested mark', async () => {
@@ -433,14 +760,71 @@ describe('MediaOverlayClient playback', () => {
       await pending;
     }
     const el = audio();
-    // The reader scrubs somewhere unrelated before the next block plays.
-    el.advanceTo(120);
+    // The reader scrubs back before the start of the block about to play.
+    el.advanceTo(0.2);
 
     const second = client.speak(section.ssmlForBlock(1)!, signal);
     await second.next();
 
     expect(el.seeks.at(-1)).toBe(3);
     expect(el.currentTime).toBe(3);
+  });
+
+  // A backward navigation (scrub back, previous-paragraph) targets a clip the
+  // recording has already passed, and there the seek IS the point: without it
+  // the button does nothing audible.
+  test('seeks back when the block itself is behind the playhead', async () => {
+    await setup();
+    const signal = new AbortController().signal;
+
+    const first = client.speak(section.ssmlForBlock(0)!, signal);
+    await first.next();
+    for (const t of [1, 2, 3.04]) {
+      const pending = first.next();
+      audio().advanceTo(t);
+      await pending;
+    }
+    const el = audio();
+    el.advanceTo(4.5);
+
+    // Back to block 0, whose clips (0s-3s) are all behind the playhead.
+    const again = client.speak(section.ssmlForBlock(0)!, signal);
+    await again.next();
+
+    expect(el.seeks.at(-1)).toBe(0);
+    expect(el.currentTime).toBe(0);
+  });
+
+  // The native mobile player runs in-process, not in the WebView, so it keeps
+  // playing while the WebView's main thread is stalled or its timers throttled
+  // (a page-turn relayout, a section preload, the screen off). The block cursor
+  // — advanced by a JS poll of the clock — then falls behind the recording, and
+  // the next block's clip is already in the past. Seeking back to its clipBegin
+  // replays paragraphs the listener has already heard, which is what a reader
+  // hears as the narration jumping back every few paragraphs. The recording is
+  // the master clock: let the marks catch up to it instead.
+  test('does not rewind when the recording ran past the block during a stall', async () => {
+    await setup();
+    const signal = new AbortController().signal;
+
+    const first = client.speak(section.ssmlForBlock(0)!, signal);
+    await first.next();
+    for (const t of [1, 2, 3.04]) {
+      const pending = first.next();
+      audio().advanceTo(t);
+      await pending;
+    }
+    const el = audio();
+    const seeksAfterBlock0 = [...el.seeks];
+    // The stall: the recording rolled through block 1 (3s-6s) and beyond before
+    // the client was asked to speak it.
+    el.advanceTo(7.5);
+
+    const second = client.speak(section.ssmlForBlock(1)!, signal);
+    await second.next();
+
+    expect(el.seeks).toEqual(seeksAfterBlock0);
+    expect(el.currentTime).toBeCloseTo(7.5, 5);
   });
 
   test('preloading warms the audio file without starting playback', async () => {

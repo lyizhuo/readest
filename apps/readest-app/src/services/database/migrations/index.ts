@@ -47,6 +47,33 @@ const migrations: Record<SchemaType, MigrationEntry[]> = {
       `,
     },
   ],
+  'grimmory-sync': [
+    {
+      name: '2026110501_grimmory_sync',
+      sql: `
+        CREATE TABLE IF NOT EXISTS grimmory_books (
+          account TEXT NOT NULL,
+          book_hash TEXT NOT NULL,
+          book_id INTEGER NOT NULL,
+          book_file_id INTEGER NOT NULL,
+          book_type TEXT,
+          is_primary INTEGER NOT NULL,
+          status_pushed_at INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY (account, book_hash)
+        );
+
+        CREATE TABLE IF NOT EXISTS grimmory_note_links (
+          account TEXT NOT NULL,
+          book_hash TEXT NOT NULL,
+          note_id TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          server_id INTEGER NOT NULL,
+          local_updated_at INTEGER NOT NULL,
+          PRIMARY KEY (account, book_hash, kind, note_id)
+        );
+      `,
+    },
+  ],
   'hardcover-sync': [
     {
       name: '2026032901_hardcover_note_mappings',
@@ -62,6 +89,31 @@ const migrations: Record<SchemaType, MigrationEntry[]> = {
 
         CREATE INDEX IF NOT EXISTS idx_hardcover_note_mappings_synced_at
         ON hardcover_note_mappings (synced_at);
+      `,
+    },
+  ],
+  'notion-sync': [
+    {
+      name: '2026083001_notion_sync_mappings',
+      sql: `
+        CREATE TABLE IF NOT EXISTS notion_book_pages (
+          target_id TEXT NOT NULL,
+          book_hash TEXT NOT NULL,
+          page_id TEXT NOT NULL,
+          title TEXT NOT NULL,
+          PRIMARY KEY (target_id, book_hash)
+        );
+
+        CREATE TABLE IF NOT EXISTS notion_note_mappings (
+          target_id TEXT NOT NULL,
+          book_hash TEXT NOT NULL,
+          note_id TEXT NOT NULL,
+          payload_hash TEXT NOT NULL,
+          block_ids TEXT NOT NULL,
+          stale_block_ids TEXT NOT NULL,
+          synced_at INTEGER NOT NULL,
+          PRIMARY KEY (target_id, book_hash, note_id)
+        );
       `,
     },
   ],

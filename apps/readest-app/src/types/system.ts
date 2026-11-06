@@ -20,6 +20,14 @@ export type DeleteAction = 'cloud' | 'local' | 'both' | 'purge';
 export type SelectDirectoryMode = 'read' | 'write';
 export type DistChannel = 'readest' | 'playstore' | 'appstore' | 'unknown';
 
+export interface DictionaryImportProgress {
+  stage: string;
+  completed: number;
+  total?: number;
+}
+
+export type DictionaryImportProgressHandler = (progress: DictionaryImportProgress) => void;
+
 export type ResolvedPath = {
   baseDir: number;
   basePrefix: () => Promise<string>;
@@ -56,7 +64,8 @@ export interface FileSystem {
   getURL(path: string): string;
   getBlobURL(path: string, base: BaseDir): Promise<string>;
   getImageURL(path: string): Promise<string>;
-  openFile(path: string, base: BaseDir, filename?: string): Promise<File>;
+  /** Returns a File whose name is the resolved basename, not the input path or URI. */
+  openFile(path: string, base: BaseDir, filename?: string, fetcher?: typeof fetch): Promise<File>;
   copyFile(srcPath: string, srcBase: BaseDir, dstPath: string, dstBase: BaseDir): Promise<void>;
   readFile(path: string, base: BaseDir, mode: 'text' | 'binary'): Promise<string | ArrayBuffer>;
   writeFile(path: string, base: BaseDir, content: string | ArrayBuffer | File): Promise<void>;
@@ -109,6 +118,7 @@ export interface AppService {
   isEink: boolean;
   canCustomizeRootDir: boolean;
   canReadExternalDir: boolean;
+  supportsCoverThumbnailOptimization: boolean;
   supportsCanvasContext2DFilter: boolean;
   supportsViewTransitionsAPI: boolean;
   supportsViewTransitionGroup: boolean;
@@ -116,7 +126,18 @@ export interface AppService {
   storefrontRegionCode: string | null;
   isOnlineCatalogsAccessible: boolean;
 
+  /**
+   * The configured library root when it turned out to be unreachable this
+   * session (deleted, unplugged, or sandbox-denied); null when the root is
+   * fine. Set during `init` so the UI can name the folder in an error instead
+   * of failing silently. The setting itself is left untouched, so a drive that
+   * comes back is picked up on the next launch.
+   */
+  unavailableRootDir: string | null;
+
   init(): Promise<void>;
+  /** Probe the configured library root. Resolves false instead of throwing. */
+  isRootDirUsable(): Promise<boolean>;
   openFile(path: string, base: BaseDir): Promise<File>;
   copyFile(srcPath: string, srcBase: BaseDir, dstPath: string, dstBase: BaseDir): Promise<void>;
   readFile(path: string, base: BaseDir, mode: 'text' | 'binary'): Promise<string | ArrayBuffer>;
@@ -126,6 +147,7 @@ export interface AppService {
   deleteDir(path: string, base: BaseDir, recursive?: boolean): Promise<void>;
   exists(path: string, base: BaseDir): Promise<boolean>;
   isDirectory(path: string, base: BaseDir): Promise<boolean>;
+  stats(path: string, base: BaseDir): Promise<FileInfo>;
   getImageURL(path: string): Promise<string>;
 
   setCustomRootDir(customRootDir: string): Promise<void>;
@@ -174,6 +196,7 @@ export interface AppService {
   importDictionaries(
     files: SelectedFile[],
     existingDictionaries?: ImportedDictionary[],
+    onProgress?: DictionaryImportProgressHandler,
   ): Promise<ImportDictionariesResult>;
   deleteDictionary(dict: ImportedDictionary): Promise<void>;
   importBook(file: string | File, books: Book[], options?: ImportBookOptions): Promise<Book | null>;
@@ -227,6 +250,7 @@ export interface AppService {
   loadFeeds(): Promise<RssFeed[]>;
   saveFeeds(feeds: RssFeed[]): Promise<void>;
   loadLibraryBooks(): Promise<Book[]>;
+  requestCoverThumbnail(book: Book): void;
   saveLibraryBooks(books: Book[], options?: SaveLibraryBooksOptions): Promise<void>;
   getCoverImageUrl(book: Book): string;
   getCoverImageBlobUrl(book: Book): Promise<string>;
@@ -240,6 +264,7 @@ export interface AppService {
     base: BaseDir,
     opts?: DatabaseOpts,
   ): Promise<DatabaseService>;
+  installDatabase(path: string, base: BaseDir, source: File): Promise<void>;
   databaseExists(path: string, base: BaseDir): Promise<boolean>;
   deleteDatabase(path: string, base: BaseDir): Promise<void>;
 }

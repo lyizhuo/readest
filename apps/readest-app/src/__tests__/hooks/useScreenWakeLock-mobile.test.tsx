@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => {
   const request = vi.fn().mockResolvedValue({ addEventListener: vi.fn(), release });
   const onFocusChanged = vi.fn().mockResolvedValue(unlisten);
   return {
+    setScreenWakeLock: vi.fn().mockResolvedValue(undefined),
     unlisten,
     release,
     request,
@@ -14,6 +15,8 @@ const mocks = vi.hoisted(() => {
     getCurrentWindow: vi.fn(() => ({ onFocusChanged })),
   };
 });
+
+vi.mock('@/utils/bridge', () => ({ setScreenWakeLock: mocks.setScreenWakeLock }));
 
 vi.mock('@tauri-apps/api/window', () => ({ getCurrentWindow: mocks.getCurrentWindow }));
 vi.mock('@/services/environment', () => ({
@@ -57,7 +60,7 @@ describe('useScreenWakeLock on mobile', () => {
       payload: boolean;
     }) => void;
     handleFocusChanged({ payload: false });
-    expect(mocks.release).toHaveBeenCalledOnce();
+    await waitFor(() => expect(mocks.release).toHaveBeenCalledOnce());
 
     handleFocusChanged({ payload: true });
     await waitFor(() => expect(mocks.request).toHaveBeenCalledTimes(2));
@@ -68,6 +71,39 @@ describe('useScreenWakeLock on mobile', () => {
     });
 
     expect(mocks.unlisten).toHaveBeenCalledOnce();
+  });
+
+  it('keeps the wake lock when the page gets focus just after a window blur', async () => {
+    // Linux CEF: refocusing the window reports focus, then blur as the browser
+    // view takes keyboard focus from the toplevel; the page gets focus ms later (#7085).
+    const hasFocus = vi.spyOn(document, 'hasFocus').mockReturnValue(false);
+    renderHook(() => useScreenWakeLock(true, true));
+    await waitFor(() => expect(mocks.request).toHaveBeenCalledOnce());
+
+    const handleFocusChanged = mocks.onFocusChanged.mock.calls[0]![0] as (event: {
+      payload: boolean;
+    }) => void;
+    handleFocusChanged({ payload: true });
+    handleFocusChanged({ payload: false });
+    setTimeout(() => hasFocus.mockReturnValue(true), 5);
+    await act(() => new Promise((resolve) => setTimeout(resolve, 200)));
+
+    expect(mocks.release).not.toHaveBeenCalled();
+  });
+
+  it('reacquires the wake lock when the page gets focus after a released blur', async () => {
+    vi.spyOn(document, 'hasFocus').mockReturnValue(false);
+    renderHook(() => useScreenWakeLock(true, true));
+    await waitFor(() => expect(mocks.request).toHaveBeenCalledOnce());
+
+    const handleFocusChanged = mocks.onFocusChanged.mock.calls[0]![0] as (event: {
+      payload: boolean;
+    }) => void;
+    handleFocusChanged({ payload: false });
+    await waitFor(() => expect(mocks.release).toHaveBeenCalledOnce());
+
+    window.dispatchEvent(new Event('focus'));
+    await waitFor(() => expect(mocks.request).toHaveBeenCalledTimes(2));
   });
 
   it('releases and reacquires the wake lock as document visibility changes', async () => {
@@ -194,5 +230,86 @@ describe('useScreenWakeLock on mobile', () => {
       expect(info).toHaveBeenCalledWith('Failed to register window focus listener:', error);
     });
     unmount();
+  });
+});
+
+describe('native iOS screen wake lock', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.spyOn(document, 'hidden', 'get').mockReturnValue(false);
+  });
+
+  afterEach(async () => {
+    cleanup();
+    await act(async () => {});
+    vi.restoreAllMocks();
+  });
+
+  it('uses native idle-timer control even when the browser API is unavailable', async () => {
+    Object.defineProperty(navigator, 'wakeLock', { configurable: true, value: undefined });
+    const { unmount } = renderHook(() => useScreenWakeLock(true, false, true));
+    await waitFor(() => expect(mocks.setScreenWakeLock).toHaveBeenCalledWith(true));
+    expect(mocks.request).not.toHaveBeenCalled();
+    unmount();
+    await waitFor(() => expect(mocks.setScreenWakeLock).toHaveBeenLastCalledWith(false));
+  });
+
+  it('bypasses a browser wake lock that would reject in Low Power Mode', async () => {
+    const request = vi.fn().mockRejectedValue(new DOMException('Not allowed', 'NotAllowedError'));
+    Object.defineProperty(navigator, 'wakeLock', { configurable: true, value: { request } });
+    renderHook(() => useScreenWakeLock(true, false, true));
+    await waitFor(() => expect(mocks.setScreenWakeLock).toHaveBeenCalledWith(true));
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('releases on hide and reacquires on return, then releases when disabled', async () => {
+    const hidden = vi.spyOn(document, 'hidden', 'get');
+    const { rerender } = renderHook(({ lock }) => useScreenWakeLock(lock, false, true), {
+      initialProps: { lock: true },
+    });
+    await waitFor(() => expect(mocks.setScreenWakeLock).toHaveBeenLastCalledWith(true));
+    hidden.mockReturnValue(true);
+    document.dispatchEvent(new Event('visibilitychange'));
+    await waitFor(() => expect(mocks.setScreenWakeLock).toHaveBeenLastCalledWith(false));
+    hidden.mockReturnValue(false);
+    document.dispatchEvent(new Event('visibilitychange'));
+    await waitFor(() => expect(mocks.setScreenWakeLock).toHaveBeenLastCalledWith(true));
+    rerender({ lock: false });
+    await waitFor(() => expect(mocks.setScreenWakeLock).toHaveBeenLastCalledWith(false));
+    mocks.setScreenWakeLock.mockClear();
+    document.dispatchEvent(new Event('visibilitychange'));
+    await act(async () => {});
+    expect(mocks.setScreenWakeLock).not.toHaveBeenCalled();
+  });
+
+  it('does not acquire while the document is hidden', async () => {
+    vi.spyOn(document, 'hidden', 'get').mockReturnValue(true);
+    renderHook(() => useScreenWakeLock(true, false, true));
+    await act(async () => {});
+    expect(mocks.setScreenWakeLock).not.toHaveBeenCalledWith(true);
+  });
+
+  it('orders a pending acquisition before cleanup and a new reader acquisition', async () => {
+    let resolve!: () => void;
+    mocks.setScreenWakeLock.mockReturnValueOnce(new Promise<void>((done) => (resolve = done)));
+    const { unmount } = renderHook(() => useScreenWakeLock(true, false, true));
+    await waitFor(() => expect(mocks.setScreenWakeLock).toHaveBeenCalledOnce());
+    unmount();
+    renderHook(() => useScreenWakeLock(true, false, true));
+    await act(async () => {
+      resolve();
+    });
+    await waitFor(() =>
+      expect(mocks.setScreenWakeLock.mock.calls).toEqual([[true], [false], [true]]),
+    );
+  });
+
+  it('can release after a failed native request', async () => {
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    mocks.setScreenWakeLock.mockRejectedValueOnce(new Error('native failure'));
+    const { unmount } = renderHook(() => useScreenWakeLock(true, false, true));
+    await waitFor(() => expect(mocks.setScreenWakeLock).toHaveBeenCalledWith(true));
+    unmount();
+    await waitFor(() => expect(mocks.setScreenWakeLock).toHaveBeenLastCalledWith(false));
   });
 });

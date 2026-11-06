@@ -104,13 +104,15 @@ describe('bookmarkPullGesture pure helpers', () => {
   });
 
   describe('canPullBookmark', () => {
-    const eligible = { scrolled: false, vertical: false, isEink: false, isFixedLayout: false };
-    it('allows only paginated reflowable horizontal-writing non-eink books', () => {
+    const eligible = { scrolled: false, vertical: false, verticalPanning: false };
+    it('allows paginated horizontal-writing books, e-ink included', () => {
       expect(canPullBookmark(eligible)).toBe(true);
       expect(canPullBookmark({ ...eligible, scrolled: true })).toBe(false);
       expect(canPullBookmark({ ...eligible, vertical: true })).toBe(false);
-      expect(canPullBookmark({ ...eligible, isEink: true })).toBe(false);
-      expect(canPullBookmark({ ...eligible, isFixedLayout: true })).toBe(false);
+    });
+
+    it('yields to a fixed-layout page that pans vertically (the drag scrolls it)', () => {
+      expect(canPullBookmark({ ...eligible, verticalPanning: true })).toBe(false);
     });
   });
 });
