@@ -2,7 +2,11 @@ import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import DailyReviewHost from '@/features/archive/review/DailyReviewHost';
-import { loadDailyCandidates, loadReviewState, shouldShowForToday } from '@/features/archive/review/db';
+import {
+  loadDailyCandidates,
+  loadReviewState,
+  shouldShowForToday,
+} from '@/features/archive/review/db';
 import { selectDailyNotes } from '@/features/archive/review/select';
 
 vi.mock('@/context/EnvContext', () => ({ useEnv: () => ({ appService: {} }) }));
