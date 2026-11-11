@@ -19,7 +19,9 @@ name: readest-client
 
 services:
   client:
-    image: ghcr.io/lyizhuo/readest-client:latest
+    # `archive` is built from feature/archive by .github/workflows/build.yml.
+    # Switch to `latest` once the archive feature is merged into main.
+    image: ghcr.io/lyizhuo/readest-client:archive
     restart: unless-stopped
     ports:
       - "3000:3000"

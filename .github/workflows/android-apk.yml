@@ -1,0 +1,171 @@
+# Fork-owned Android packaging.
+#
+# Builds an installable APK for the selected ref and uploads it as a workflow
+# artifact. Pushing an `apk-v*` tag also attaches the APK (and its sha256) to a
+# GitHub release.
+#
+# Signing: set the repository secrets ANDROID_KEY_BASE64 (base64 of a .jks),
+# ANDROID_KEY_ALIAS and ANDROID_KEY_PASSWORD to get a signed release build.
+# Without them the workflow falls back to a debug build signed with the debug
+# keystore: installable, but slower and not meant for distribution.
+#
+# Usage:
+#   Actions -> Android APK -> Run workflow -> pick the branch (e.g. feature/archive)
+#   git tag apk-v0.12.1 && git push origin apk-v0.12.1
+
+name: Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['apk-v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+
+      - name: setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+
+      - name: setup node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: setup Java
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: setup Android SDK
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4
+        with:
+          # The action's default `tools` package no longer exists upstream and
+          # makes sdkmanager fail.
+          packages: 'platform-tools'
+
+      - name: install NDK
+        run: sdkmanager "ndk;28.2.13676358"
+
+      - name: install dependencies
+        run: pnpm install --frozen-lockfile --prefer-offline
+
+      - name: copy pdfjs-dist and simplecc-dist to public directory
+        run: pnpm --filter @readest/readest-app setup-vendors
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
+        with:
+          workspaces: apps/readest-app/src-tauri
+
+      # Public-by-design values (same ones the browser receives). Without them
+      # the app falls back to the upstream defaults baked into apps/readest-app/.env
+      # and would talk to readest.com instead of our own deployment.
+      - name: create .env.local for the Next.js build
+        run: |
+          cat > .env.local <<'EOF'
+          NEXT_PUBLIC_APP_PLATFORM=tauri
+          NEXT_PUBLIC_SUPABASE_URL=https://fiwgjtjwpzpkuhxzvwmp.supabase.co
+          NEXT_PUBLIC_SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZpd2dqdGp3cHpwa3VoeHp2d21wIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODY3Njc4MTAsImV4cCI6MjEwMjM0MzgxMH0.pM4OK8-mgtlM3ag7wiTdfCrCAD6X76Cbom_-l4Ko6zU
+          NEXT_PUBLIC_API_BASE_URL=https://read.620602.xyz
+          EOF
+          cp .env.local apps/readest-app/.env.local
+
+      - name: build APK
+        env:
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
+          ANDROID_KEY_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          cd apps/readest-app
+
+          # Only the customized files of gen/android are tracked — regenerate
+          # the gradle scaffolding, then restore the tracked customizations
+          # (same flow as release.yml / android-e2e.yml).
+          rm -rf src-tauri/gen/android
+          pnpm tauri android init
+          pnpm tauri icon ../../data/icons/readest-book.png
+          git checkout .
+
+          if [ -n "${ANDROID_KEY_BASE64:-}" ]; then
+            echo "::notice::Building a signed release APK"
+            printf '%s' "$ANDROID_KEY_BASE64" | base64 -d > "$RUNNER_TEMP/readest.jks"
+            {
+              echo "keyAlias=$ANDROID_KEY_ALIAS"
+              echo "password=$ANDROID_KEY_PASSWORD"
+              echo "storeFile=$RUNNER_TEMP/readest.jks"
+            } > src-tauri/gen/android/keystore.properties
+            pnpm tauri android build --apk --target aarch64
+            mode=release
+          else
+            echo "::warning::ANDROID_KEY_BASE64 is unset — building a debug APK signed with the debug keystore"
+            pnpm tauri android build --debug --apk --target aarch64
+            mode=debug
+          fi
+
+          version=$(node -p "require('./package.json').version")
+          apk=$(find src-tauri/gen/android/app/build/outputs/apk -type f -name '*.apk' -path "*/${mode}/*" -print -quit)
+          test -n "$apk"
+          out="../../Readest-${version}-arm64-${mode}.apk"
+          cp "$apk" "$out"
+          ( cd ../.. && sha256sum "$(basename "$out")" > "$(basename "$out").sha256" )
+
+          echo "APK_VERSION=$version" >> "$GITHUB_ENV"
+          echo "APK_MODE=$mode" >> "$GITHUB_ENV"
+          echo "APK_FILE=$(basename "$out")" >> "$GITHUB_ENV"
+
+      - name: upload APK artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: readest-apk-${{ env.APK_VERSION }}-${{ env.APK_MODE }}
+          path: |
+            Readest-*.apk
+            Readest-*.apk.sha256
+          retention-days: 30
+
+      - name: attach APK to the release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" Readest-*.apk Readest-*.apk.sha256 --clobber
+          else
+            gh release create "$tag" Readest-*.apk Readest-*.apk.sha256 \
+              --title "Readest $tag" --generate-notes
+          fi
+
+      - name: summary
+        run: |
+          {
+            echo "### Android APK"
+            echo ""
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| version | $APK_VERSION |"
+            echo "| build | $APK_MODE |"
+            echo "| file | $APK_FILE |"
+            echo "| sha256 | $(awk '{print $1}' "Readest-${APK_VERSION}-arm64-${APK_MODE}.apk.sha256") |"
+          } >> "$GITHUB_STEP_SUMMARY"
