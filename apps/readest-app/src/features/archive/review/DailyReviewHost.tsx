@@ -56,7 +56,11 @@ const DailyReviewHost: React.FC = () => {
     };
   }, [appService, settings.archive?.enabled]);
 
-  return <DailyReviewModal notes={notes ?? []} onClose={() => setNotes(null)} />;
+  // Never mount the modal empty: an always-open <dialog> would cover the
+  // library and swallow every tap.
+  return notes && notes.length > 0 ? (
+    <DailyReviewModal notes={notes} onClose={() => setNotes(null)} />
+  ) : null;
 };
 
 export default DailyReviewHost;
