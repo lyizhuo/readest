@@ -16,14 +16,12 @@
 | `apps/readest-app/src/components/settings/SettingsDialog.tsx` | import ArchivePanel/PiBooks；`SettingsPanelType` 增加 `'Archive'`；tabConfig/panelMap/resetFunctions 各加一项；渲染分支加 `<ArchivePanel />` | 设置面板入口 `Settings > Archive` |
 | `apps/readest-app/src/services/commandRegistry.ts` | import 加 `PiBooks`；`panelIcons` 增加 `Archive: PiBooks` 条目 | 设置面板图标（类型要求全集覆盖） |
 | `apps/readest-app/src/app/library/page.tsx` | 顶部 import `ensureArchiveEntries`；`initLibrary` 在 setLibrary 后 fire-and-forget 调用 | PRD A1 导入即自动建档 |
-| `apps/readest-app/src/app/library/components/LibraryHeader.tsx` | import PiBooks/useRouter/useSettingsStore；hooks 区加 router/archiveEnabled；头部按钮区条件渲染一个入口图标按钮 | 书库页 → 档案页导航入口 |
 | `apps/readest-app/src/app/library/components/SettingsMenu.tsx` | 「Settings」菜单项前插入条件渲染的「Reading Archive」MenuItem | 菜单入口 |
 | `apps/readest-app/src/app/reader/components/annotator/Annotator.tsx` | import `isWebAppPlatform`；`getToolbarPosition` 在「移动 Web + 横排文本」下把 `avoidDir` 兜底为 `'up'`（复用上游 `placeToolbar`/`getPosition` 的避让参数，不再新增 `sel.ts` 参数） | 模块 W：划线工具栏改到选区下方，避开浏览器原生选择弹层 |
 | `apps/readest-app/src/app/reader/components/ReaderContent.tsx` | import SessionIndicator/useArchiveSession；hooks 区调用 `useArchiveSession(bookKeys[0], hash)`；渲染区挂 `<SessionIndicator />` | 模块 B/C1：阅读会话自动追踪 + 角落计时入口 |
 | `apps/readest-app/src/__tests__/services/command-registry-extended.test.ts` | `react-icons/pi` mock 增加 `PiBooks` | 适配 panelIcons 新增条目 |
 | `apps/readest-app/src/app/library/page.tsx`（M4/G） | 挂载 `<DailyReviewHost />` | 每日笔记回顾入口 |
 | `apps/readest-app/src/components/settings/ArchivePanel.tsx` | **新文件**（位于上游组件目录）：模块开关 + 每日目标步进器 + 导出模板编辑器（kv 持久化）；设置持久化直接调用 `useSettingsStore().saveSettings`，不 import `helpers/settings`（避免把 reader/TTS 依赖图带进 SettingsDialog 测试） | PRD 0.4 / C1 / E3 |
-| `apps/readest-app/src/__tests__/app/library/{LibraryHeader-windowDrag,library-search-history-dropdown}.test.tsx` | 增加 `next/navigation` 的 `useRouter` mock | 适配书库头部的档案入口 |
 
 
 - `apps/readest-app/src/features/archive/` — 数据层（db/）、业务（library/、sync/）、UI 组件、hook
