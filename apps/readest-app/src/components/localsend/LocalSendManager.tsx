@@ -1,16 +1,32 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { impactFeedback } from '@tauri-apps/plugin-haptics';
 import { useEnv } from '@/context/EnvContext';
 import { useAuth } from '@/context/AuthContext';
 import { useTranslation } from '@/hooks/useTranslation';
+import { useQuotaStats } from '@/hooks/useQuotaStats';
 import { useSettingsStore } from '@/store/settingsStore';
 import { useLibraryStore } from '@/store/libraryStore';
 import { useLocalSendStore } from '@/store/localsendStore';
 import { isTauriAppPlatform } from '@/services/environment';
+import { recordFlow } from '@/services/sync/dataFlow/log';
 import { ingestFile } from '@/services/ingestService';
-import { getLocalSendAlias, isLocalSendEnabled } from '@/services/localsend/devicePrefs';
+import { isNearbyPairingAllowed } from '@/utils/access';
+import {
+  DEFAULT_ALIAS_NAMED_KEY,
+  getLocalSendAlias,
+  isLocalSendEnabled,
+} from '@/services/localsend/devicePrefs';
+import {
+  addPairedDevice,
+  canAutoAccept,
+  refreshPairedDevice,
+} from '@/services/localsend/pairedDevices';
+import { playTransferDoneCue } from '@/services/localsend/sounds';
 import {
   cancelLocalSendReceive,
+  isLocalSendAlive,
   respondLocalSend,
+  setLocalSendDiscoverable,
   startLocalSend,
   stopLocalSend,
 } from '@/services/localsend/service';
@@ -30,6 +46,13 @@ import {
 import { eventDispatcher } from '@/utils/event';
 import { setMulticastLock } from '@/utils/bridge';
 import { resolveBookSendFile } from '@/services/localsend/bookFile';
+import {
+  createCollectionPack,
+  extractCollectionPack,
+  isReadestPackFile,
+  READEST_PACK_MIME,
+  resolveImportGroup,
+} from '@/services/pack/packService';
 import type { Book } from '@/types/book';
 import DevicePickerDialog from './DevicePickerDialog';
 import ReceiveRequestDialog from './ReceiveRequestDialog';
@@ -39,6 +62,11 @@ interface ServerStatePayload {
   port: number;
   error: string | null;
 }
+
+const BOOK_RECEIVED = { connector: 'localsend', direction: 'pull', kind: 'books' } as const;
+const BOOK_SENT = { connector: 'localsend', direction: 'push', kind: 'books' } as const;
+
+const errorText = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
 /**
  * Background controller for the LocalSend integration. Mounted in the library
@@ -56,9 +84,26 @@ const LocalSendManager: React.FC = () => {
   const { user } = useAuth();
   const userRef = useRef(user);
   userRef.current = user;
+  // Read the translator at call time so the default alias localizes without
+  // rebuilding `defaultAlias` (and restarting the service) on every render.
+  const translateRef = useRef(_);
+  translateRef.current = _;
 
   const pendingRequest = useLocalSendStore((state) => state.pendingRequest);
   const [sendFiles, setSendFiles] = useState<SendFileInput[] | null>(null);
+  const pendingTempSendFileRef = useRef<string | null>(null);
+
+  const cleanupTempSendFile = useCallback(async () => {
+    if (pendingTempSendFileRef.current && appService) {
+      await appService.deleteFile(pendingTempSendFileRef.current, 'Temp').catch(() => {});
+      pendingTempSendFileRef.current = null;
+    }
+  }, [appService]);
+
+  // Pairing entitlement, checked at receive time so a lapsed plan brings the
+  // confirmation dialogs back while the pairing records stay intact.
+  const { userProfilePlan, customizationPurchased } = useQuotaStats();
+  const pairingEntitled = isNearbyPairingAllowed(userProfilePlan ?? 'free', customizationPurchased);
 
   const toast = useCallback(
     (message: string, type: 'info' | 'error' | 'success' | 'warning' = 'info') =>
@@ -66,7 +111,28 @@ const LocalSendManager: React.FC = () => {
     [],
   );
 
+  const cueOpts = useCallback(
+    () => ({ eink: !!useSettingsStore.getState().settings?.globalViewSettings?.isEink }),
+    [],
+  );
+
+  const haptic = useCallback(() => {
+    if (!appService?.hasHaptics) return;
+    try {
+      void impactFeedback('medium').catch(() => {});
+    } catch {
+      /* haptics are best-effort */
+    }
+  }, [appService]);
+
   const defaultAlias = useCallback(async (): Promise<string> => {
+    // Prefer the signed-in user's name, AirDrop style: "<name>'s Readest".
+    // Match the library main menu ("Logged in as {{name}}"): first name only.
+    const fullName: unknown = userRef.current?.user_metadata?.['full_name'];
+    if (typeof fullName === 'string' && fullName.trim()) {
+      const name = fullName.trim().split(' ')[0];
+      return translateRef.current(DEFAULT_ALIAS_NAMED_KEY, { name });
+    }
     try {
       const { hostname } = await import('@tauri-apps/plugin-os');
       const name = await hostname();
@@ -110,6 +176,40 @@ const LocalSendManager: React.FC = () => {
     return () => eventDispatcher.off('localsend-prefs-changed', onPrefsChanged);
   }, [syncServiceState]);
 
+  // AirDrop-style presence: this device is discoverable only while its screen
+  // is on and Readest is in the foreground. Locking the screen or backgrounding
+  // the app fires `visibilitychange` -> hidden (on both mobile and desktop),
+  // so we stop answering announcements and peers drop us from their pickers
+  // within a few seconds; returning to the foreground re-announces us at once.
+  // This is presence only - the service keeps running, nothing disconnects.
+  useEffect(() => {
+    if (!isTauriAppPlatform()) return;
+    const sync = async () => {
+      if (!isLocalSendEnabled()) return;
+      const visible = document.visibilityState === 'visible';
+      if (!visible) {
+        void setLocalSendDiscoverable(false).catch(() => {});
+        return;
+      }
+      // The OS can reclaim a backgrounded app's listening socket (iOS). When
+      // the core notices, it tears the dead service down and reports
+      // running:false - but iOS never wakes the accept loop to notice, so the
+      // status stays running:true on a service no peer can reach (the picker
+      // showed nothing until the user toggled the setting off and on). Trust a
+      // liveness probe, not the stored flag, and rebuild the service when it
+      // fails: `stop` first, or `start` would hand back the dead one.
+      if (!(await isLocalSendAlive().catch(() => false))) {
+        await stopLocalSend().catch(() => {});
+        void syncServiceState();
+        return;
+      }
+      void setLocalSendDiscoverable(true).catch(() => {});
+    };
+    const onVisibilityChange = () => void sync();
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', onVisibilityChange);
+  }, [syncServiceState]);
+
   // The alias change flow restarts the service (stop, then start with the new
   // alias). The settings form dispatches 'localsend-alias-changed' for this.
   useEffect(() => {
@@ -131,8 +231,47 @@ const LocalSendManager: React.FC = () => {
   useEffect(() => {
     const onSendBooks = async (event: CustomEvent) => {
       if (!appService) return;
-      const { books } = event.detail as { books: Book[] };
+      const { books, asPack, collectionName } = event.detail as {
+        books: Book[];
+        asPack?: boolean;
+        collectionName?: string;
+      };
       if (!books?.length) return;
+
+      if (asPack) {
+        try {
+          const result = await createCollectionPack(appService, books, collectionName);
+          if (!result) {
+            toast(_('No local files available to pack'), 'warning');
+            return;
+          }
+          if (result.count < books.length) {
+            toast(
+              _('{{count}} book(s) omitted (file not available locally)', {
+                count: books.length - result.count,
+              }),
+              'warning',
+            );
+          }
+          // A Temp subdirectory: the fs scope covers paths under Temp, not Temp itself.
+          const tempFileName = `localsend/${Date.now()}-${result.filename}`;
+          await appService.writeFile(tempFileName, 'Temp', result.data);
+          const resolvedPath = await appService.resolveFilePath(tempFileName, 'Temp');
+          pendingTempSendFileRef.current = tempFileName;
+          setSendFiles([
+            {
+              path: resolvedPath,
+              fileName: result.filename,
+              mimeType: READEST_PACK_MIME,
+            },
+          ]);
+        } catch (err) {
+          console.error('Failed to create pack for Nearby transfer:', err);
+          toast(_('Failed to create pack'), 'error');
+        }
+        return;
+      }
+
       const resolved: SendFileInput[] = [];
       for (const book of books) {
         const file = await resolveBookSendFile(book, appService);
@@ -162,6 +301,61 @@ const LocalSendManager: React.FC = () => {
       if (!owned || !appService) return;
       if (payload.error || !payload.path) return; // failures are summarized on receive-end
       try {
+        if (isReadestPackFile(payload.fileName)) {
+          try {
+            const raw = await appService.readFile(payload.path, 'None', 'binary');
+            const pack = typeof raw === 'string' ? null : await extractCollectionPack(raw);
+            if (!pack) throw new Error('Not a readable Readest pack');
+            const { getGroupId, getGroupName, updateBooks } = useLibraryStore.getState();
+            const importedBooks: Book[] = [];
+            for (const { file: innerFile, groupName: packGroupName } of pack.books) {
+              const { groupId, groupName } = resolveImportGroup(
+                undefined,
+                packGroupName,
+                getGroupId,
+                getGroupName,
+              );
+              try {
+                const book = await ingestFile(
+                  {
+                    file: innerFile,
+                    books: useLibraryStore.getState().library,
+                    groupId,
+                    groupName,
+                    forceCopy: true,
+                  },
+                  {
+                    appService,
+                    settings: useSettingsStore.getState().settings,
+                    isLoggedIn: !!userRef.current,
+                  },
+                );
+                if (book) importedBooks.push(book);
+              } catch (err) {
+                console.error('Failed to ingest book from pack:', err);
+                recordFlow({ ...BOOK_RECEIVED, error: errorText(err) });
+              }
+            }
+            if (importedBooks.length === 0) throw new Error('No books imported from pack');
+            await updateBooks(envConfig, importedBooks);
+            for (const { title } of importedBooks) {
+              recordFlow({ ...BOOK_RECEIVED, bookTitle: title });
+            }
+            if (pack.collectionName) {
+              toast(
+                _('Restored collection "{{name}}" ({{count}} books)', {
+                  name: pack.collectionName,
+                  count: importedBooks.length,
+                }),
+                'success',
+              );
+            }
+          } finally {
+            await appService.deleteFile(payload.path, 'None').catch(() => {});
+          }
+          return;
+        }
+
         const { library } = useLibraryStore.getState();
         const book = await ingestFile(
           { file: payload.path, books: library, forceCopy: true },
@@ -172,9 +366,15 @@ const LocalSendManager: React.FC = () => {
           },
         );
         if (book) await useLibraryStore.getState().updateBooks(envConfig, [book]);
+        recordFlow({
+          ...BOOK_RECEIVED,
+          bookTitle: book?.title ?? payload.fileName,
+          count: book ? 1 : 0,
+        });
         await appService.deleteFile(payload.path, 'None').catch(() => {});
       } catch (err) {
         console.error('LocalSend import failed:', err);
+        recordFlow({ ...BOOK_RECEIVED, bookTitle: payload.fileName, error: errorText(err) });
         toast(_('Failed to import {{filename}}', { filename: payload.fileName }), 'error');
       }
     },
@@ -229,6 +429,11 @@ const LocalSendManager: React.FC = () => {
           if (reason === 'cancelled') {
             toast(_('Transfer from {{alias}} cancelled', { alias: owned.alias }));
           } else if (failed > 0) {
+            recordFlow({
+              ...BOOK_RECEIVED,
+              error: `${failed} of ${received + failed} files failed`,
+            });
+            haptic();
             toast(
               _('Received {{count}} book(s) from {{alias}}, {{failed}} failed', {
                 count: received,
@@ -238,6 +443,8 @@ const LocalSendManager: React.FC = () => {
               'warning',
             );
           } else {
+            playTransferDoneCue(cueOpts());
+            haptic();
             toast(
               _('Received {{count}} book(s) from {{alias}}', {
                 count: received,
@@ -253,9 +460,11 @@ const LocalSendManager: React.FC = () => {
         listen<SendEnd>(LOCALSEND_EVENTS.sendEnd, (event) => {
           const sendState = store().sendState;
           store().sendEnded();
+          void cleanupTempSendFile();
           if (!sendState) return; // another window's transfer
           const { status, error, filesSent } = event.payload;
           if (status === 'sent') {
+            recordFlow({ ...BOOK_SENT, count: filesSent });
             toast(
               _('Sent {{count}} book(s) to {{alias}}', {
                 count: filesSent,
@@ -268,6 +477,7 @@ const LocalSendManager: React.FC = () => {
           } else if (status === 'cancelled') {
             toast(_('Transfer cancelled'));
           } else {
+            recordFlow({ ...BOOK_SENT, error: error || 'Transfer failed' });
             toast(error || _('Transfer failed'), 'error');
           }
         }),
@@ -280,7 +490,7 @@ const LocalSendManager: React.FC = () => {
         promise.then((unlisten) => unlisten()).catch(() => {});
       });
     };
-  }, [appService, onFileDone, toast, _]);
+  }, [appService, onFileDone, toast, _, cueOpts, haptic]);
 
   // A request with no importable files is declined without a dialog.
   useEffect(() => {
@@ -293,18 +503,52 @@ const LocalSendManager: React.FC = () => {
     toast(_('No supported book files from {{alias}}', { alias: sender.alias }), 'warning');
   }, [pendingRequest, toast, _]);
 
+  // Paired auto-accept: a cert-verified, paired sender skips the dialog.
+  // Every window runs this; the respond call claims the session for exactly
+  // one of them (the same ownership rule as a manual accept).
+  useEffect(() => {
+    if (!pendingRequest) return;
+    const { supported } = partitionSupportedFiles(pendingRequest.files);
+    if (supported.length === 0) return; // the decline effect handles these
+    const { sessionId, sender } = pendingRequest;
+    if (!canAutoAccept(sender, pairingEntitled)) return;
+    refreshPairedDevice(sender.fingerprint, sender.alias, sender.deviceModel);
+    useLocalSendStore.getState().requestClosed(sessionId);
+    void (async () => {
+      const claimed = await respondLocalSend(
+        sessionId,
+        supported.map((file) => file.id),
+      );
+      if (claimed) {
+        useLocalSendStore.getState().claimSession(sessionId, sender.alias);
+        toast(_('Receiving from paired device {{alias}}', { alias: sender.alias }));
+        haptic();
+      }
+    })();
+  }, [pendingRequest, pairingEntitled, toast, _, haptic]);
+
   if (!isTauriAppPlatform()) return null;
 
   const showRequestDialog =
-    pendingRequest && partitionSupportedFiles(pendingRequest.files).supported.length > 0;
+    pendingRequest &&
+    partitionSupportedFiles(pendingRequest.files).supported.length > 0 &&
+    // Auto-accepted requests never flash the dialog; the effect above answers.
+    !canAutoAccept(pendingRequest.sender, pairingEntitled);
 
   return (
     <>
       {showRequestDialog && (
         <ReceiveRequestDialog
           request={pendingRequest}
-          onAccept={async (fileIds) => {
+          onAccept={async (fileIds, pairDevice) => {
             const { sessionId, sender } = pendingRequest;
+            if (pairDevice && sender.certVerified) {
+              addPairedDevice({
+                fingerprint: sender.fingerprint,
+                alias: sender.alias,
+                deviceModel: sender.deviceModel,
+              });
+            }
             useLocalSendStore.getState().requestClosed(sessionId);
             const claimed = await respondLocalSend(sessionId, fileIds);
             if (claimed) {
@@ -318,7 +562,15 @@ const LocalSendManager: React.FC = () => {
           }}
         />
       )}
-      {sendFiles && <DevicePickerDialog files={sendFiles} onClose={() => setSendFiles(null)} />}
+      {sendFiles && (
+        <DevicePickerDialog
+          files={sendFiles}
+          onClose={() => {
+            setSendFiles(null);
+            void cleanupTempSendFile();
+          }}
+        />
+      )}
       <TransferProgressCard onCancelReceive={(id) => void cancelLocalSendReceive(id)} />
     </>
   );

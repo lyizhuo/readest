@@ -3,6 +3,7 @@ import type { BookOrbitProxyPayload } from '@/types/bookorbit';
 import type { BookOrbitSettings } from '@/types/settings';
 import { isLanAddress } from '@/utils/network';
 import { normalizeCustomHeaders } from '@/utils/customHeaders';
+import { allowsSelfSignedCert, tlsFetch } from '@/utils/tls';
 import { getAppVersion } from '@/utils/version';
 import { getAPIBaseUrl, isTauriAppPlatform } from '../environment';
 import { formatKoDatetime } from './noteMapping';
@@ -77,15 +78,12 @@ export class BookOrbitClient {
 
     if (this.isLanServer || isTauriAppPlatform()) {
       const fetch = isTauriAppPlatform() ? tauriFetch : window.fetch;
-      return await fetch(`${this.serverUrl}/api/v1/koreader${endpoint}`, {
-        method,
-        headers,
-        body,
-        danger: {
-          acceptInvalidCerts: true,
-          acceptInvalidHostnames: true,
-        },
-      });
+      return await tlsFetch(
+        fetch,
+        `${this.serverUrl}/api/v1/koreader${endpoint}`,
+        { method, headers, body },
+        allowsSelfSignedCert(this.config),
+      );
     }
 
     const proxyBody: BookOrbitProxyPayload = {
@@ -168,7 +166,13 @@ export class BookOrbitClient {
   async matchCheck(books: MatchCheckBook[]): Promise<MatchCheckResponse> {
     return await this.postJson<MatchCheckResponse>('/plugin/match-check', {
       hashes: books.map((book) => book.hash),
-      books,
+      // The server validates title <= 500 and authors <= 1000 chars and rejects
+      // the whole request otherwise, which would leave the book unregistered.
+      books: books.map((book) => ({
+        ...book,
+        title: book.title?.slice(0, 500),
+        authors: book.authors?.slice(0, 1000),
+      })),
     });
   }
 

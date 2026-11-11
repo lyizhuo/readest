@@ -3,10 +3,12 @@ import { beforeEach, describe, expect, test, vi } from 'vitest';
 import type { BookDoc } from '@/libs/document';
 import {
   loadMediaOverlaySection,
-  type MediaOverlaySection,
+  MediaOverlaySection,
+  type NarrationPar,
 } from '@/services/tts/mediaOverlay/MediaOverlaySection';
 import { MediaOverlayTTS } from '@/services/tts/mediaOverlay/MediaOverlayTTS';
 import { parseSSMLMarks } from '@/utils/ssml';
+import * as CFI from 'foliate-js/epubcfi.js';
 
 const par = (id: string, begin: number, end: number) =>
   `<par><text src="ch1.xhtml#${id}"/><audio src="ch1.mp3" clipBegin="${begin}s" clipEnd="${end}s"/></par>`;
@@ -191,6 +193,94 @@ describe('MediaOverlayTTS', () => {
     expect(marksOf(tts.from(target))).toEqual(['3']);
   });
 
+  // #7342: a title page drawn as a picture is narrated, then playback carries on.
+  test('plays an image-only par in order and resumes onto it', async () => {
+    const imageDoc = new DOMParser().parseFromString(
+      '<html><body><div><span id="title"><img src="title.jpg" alt="Title. Author."/></span></div>' +
+        '<p id="s1">First sentence.</p></body></html>',
+      'text/html',
+    );
+    const book = {
+      sections: [{ mediaOverlay: { href: 'OEBPS/ch1.smil', id: 'smil1' } }],
+      loadText: async () =>
+        `<smil><body>${par('title', 13.192, 22.036)}${par('s1', 22.036, 25)}</body></smil>`,
+    } as unknown as BookDoc;
+    const imageSection = (await loadMediaOverlaySection(book, 0, imageDoc, 'en'))!;
+    const tts = new MediaOverlayTTS(imageDoc, imageSection, highlight);
+
+    expect(marksOf(tts.start())).toEqual(['0']);
+    expect(marksOf(tts.next())).toEqual(['1']);
+    // A location saved while the image played is its range's CFI, read back.
+    const cfi = CFI.fromRange(imageSection.pars[0]!.range);
+    expect(marksOf(tts.from(CFI.toRange(imageDoc, CFI.parse(cfi)) as Range))).toEqual(['0']);
+    // So is the start of the title page.
+    const page = imageDoc.createRange();
+    page.setStart(imageDoc.body, 0);
+    expect(marksOf(tts.from(page))).toEqual(['0']);
+  });
+
+  test('from(range) finds body text after an interleaved end-of-chapter footnote', async () => {
+    const footnoteDoc = new DOMParser().parseFromString(
+      '<html><body><p id="before">Before the note.</p>' +
+        '<p id="after">After the note.</p><p id="gap">Unnarrated text.</p>' +
+        '<p id="later">Later body text.</p>' +
+        '<aside role="doc-footnote" id="note">The footnote.</aside></body></html>',
+      'text/html',
+    );
+    const book = {
+      sections: [{ mediaOverlay: { href: 'OEBPS/ch1.smil', id: 'smil1' } }],
+      loadText: async () =>
+        '<smil><body>' +
+        par('before', 0, 1) +
+        par('note', 1, 2) +
+        par('after', 2, 3) +
+        par('later', 3, 4) +
+        '</body></smil>',
+    } as unknown as BookDoc;
+    const footnoteSection = (await loadMediaOverlaySection(book, 0, footnoteDoc, 'en'))!;
+    const tts = new MediaOverlayTTS(footnoteDoc, footnoteSection, highlight);
+    for (const [id, mark] of [
+      ['before', '0'],
+      ['after', '2'],
+      ['gap', '3'],
+      ['later', '3'],
+      ['note', '1'],
+    ] as const) {
+      const range = footnoteDoc.createRange();
+      range.selectNodeContents(footnoteDoc.getElementById(id)!);
+      expect(marksOf(tts.from(range)), `starting in ${id}`).toEqual([mark]);
+      expect(marksOf(tts.resume())).toEqual([mark]);
+    }
+    // Playback still follows the publisher's order: body, note, then body.
+    tts.start();
+    expect(marksOf(tts.next())).toEqual(['1']);
+    expect(marksOf(tts.next())).toEqual(['2']);
+  });
+
+  test('from(range) prefers a containing parent over a later nested phrase', async () => {
+    const nestedDoc = new DOMParser().parseFromString(
+      '<html><body><p id="parent">Before <span id="child">nested phrase</span> after.</p></body></html>',
+      'text/html',
+    );
+    const book = {
+      sections: [{ mediaOverlay: { href: 'OEBPS/ch1.smil', id: 'smil1' } }],
+      loadText: async () => `<smil><body>${par('parent', 0, 1)}${par('child', 1, 2)}</body></smil>`,
+    } as unknown as BookDoc;
+    const nestedSection = (await loadMediaOverlaySection(book, 0, nestedDoc, 'en'))!;
+    const tts = new MediaOverlayTTS(nestedDoc, nestedSection, highlight);
+    const parentRange = nestedSection.pars[0]!.range;
+    const childRange = nestedSection.pars[1]!.range;
+
+    expect(marksOf(tts.from(parentRange)), 'exact parent range').toEqual(['0', '1']);
+    expect(marksOf(tts.resume())).toEqual(['0', '1']);
+    expect(marksOf(tts.from(childRange)), 'exact child range').toEqual(['1']);
+
+    const afterChild = nestedDoc.createRange();
+    afterChild.setStart(nestedDoc.getElementById('parent')!.lastChild!, 1);
+    afterChild.collapse(true);
+    expect(marksOf(tts.from(afterChild)), 'parent text after child').toEqual(['0', '1']);
+  });
+
   // Found by end-to-end playback: narration skips unnarrated sections, so the
   // location playback was requested from usually belongs to a DIFFERENT
   // section's document. compareBoundaryPoints throws WrongDocumentError across
@@ -215,5 +305,38 @@ describe('MediaOverlayTTS', () => {
     target.setEnd(doc.body, 0);
 
     expect(marksOf(tts.from(target))).toEqual(['0', '1', '2']);
+  });
+
+  test('maps a page position proportionally into an approximately timed chapter', () => {
+    const approximateDoc = new DOMParser().parseFromString(
+      '<!DOCTYPE html><html><body><p>abcdefghij</p></body></html>',
+      'text/html',
+    );
+    const text = approximateDoc.querySelector('p')!.firstChild as Text;
+    const chapter = approximateDoc.createRange();
+    chapter.selectNodeContents(text);
+    const approximateSection = new MediaOverlaySection(
+      [
+        {
+          markName: '0',
+          blockIndex: 0,
+          range: chapter,
+          text: 'Chapter',
+          audioHref: 'chapter.m4b',
+          clipBegin: 20,
+          clipEnd: 120,
+        } satisfies NarrationPar,
+      ],
+      'en',
+      'approximate',
+    );
+    const tts = new MediaOverlayTTS(approximateDoc, approximateSection, highlight);
+    const page = approximateDoc.createRange();
+    page.setStart(text, 5);
+    page.setEnd(text, 8);
+
+    expect(marksOf(tts.from(page))).toEqual(['0']);
+    expect(tts.takeStartPosition()).toBeCloseTo(50, 5);
+    expect(tts.getPlaybackRange(0.75)?.toString()).toBe('h');
   });
 });

@@ -27,7 +27,7 @@ export const SETTINGS_REPLICA_ID = 'singleton';
  *     across devices.
  *   * Collection settings already synced via dedicated kinds
  *     (`customFonts`, `customTextures`, `customDictionaries`,
- *     `opdsCatalogs`). Note: `dictionarySettings` sub-fields
+ *     `opdsCatalogs`, `absServers`). Note: `dictionarySettings` sub-fields
  *     (providerOrder / providerEnabled / webSearches) ARE bundled
  *     here — see entries below. They ride this row for transport but
  *     are gated by the 'dictionary' sync category, not 'settings'
@@ -53,6 +53,12 @@ export const SETTINGS_WHITELIST = [
   'dictionarySettings.providerEnabled',
   'dictionarySettings.webSearches',
   'dictionarySettings.fontScale',
+  'dictionarySettings.autoPlayPronunciation',
+  'dictionarySettings.saveLookupsToVocabulary',
+  'dictionarySettings.contextTranslatorId',
+  'dictionarySettings.contextPromptId',
+  'dictionarySettings.contextSystemPrompt',
+  'dictionarySettings.contextMaxOutputTokens',
   // External integrations. Server URL + identifiers sync as plaintext;
   // the credential fields are listed in `encryptedFields` below so the
   // publish/pull middleware wraps them in cipher envelopes.
@@ -61,14 +67,23 @@ export const SETTINGS_WHITELIST = [
   'kosync.userkey',
   'kosync.password',
   'kosync.customHeaders',
+  'kosync.allowSelfSignedCert',
   'bookorbit.serverUrl',
   'bookorbit.username',
   'bookorbit.userkey',
   'bookorbit.password',
   'bookorbit.customHeaders',
+  'bookorbit.allowSelfSignedCert',
+  'grimmory.serverUrl',
+  'grimmory.username',
+  'grimmory.password',
+  'grimmory.customHeaders',
+  'grimmory.allowSelfSignedCert',
   'readwise.baseUrl',
   'readwise.accessToken',
   'hardcover.accessToken',
+  'notion.databaseId',
+  'notion.accessToken',
   // WebDAV connection. serverUrl + rootPath sync as plaintext so a fresh
   // device pre-fills the connect form; username / password are listed in
   // `encryptedFields` below. Per-device bookkeeping (enabled, deviceId,
@@ -118,6 +133,12 @@ export const SETTINGS_DICTIONARY_FIELDS = [
   'dictionarySettings.providerEnabled',
   'dictionarySettings.webSearches',
   'dictionarySettings.fontScale',
+  'dictionarySettings.autoPlayPronunciation',
+  'dictionarySettings.saveLookupsToVocabulary',
+  'dictionarySettings.contextTranslatorId',
+  'dictionarySettings.contextPromptId',
+  'dictionarySettings.contextSystemPrompt',
+  'dictionarySettings.contextMaxOutputTokens',
 ] as const;
 
 /**
@@ -142,8 +163,12 @@ export const SETTINGS_ENCRYPTED_FIELDS = [
   'bookorbit.userkey',
   'bookorbit.password',
   'bookorbit.customHeaders',
+  'grimmory.username',
+  'grimmory.password',
+  'grimmory.customHeaders',
   'readwise.accessToken',
   'hardcover.accessToken',
+  'notion.accessToken',
   'webdav.username',
   'webdav.password',
   's3.accessKeyId',
@@ -160,7 +185,11 @@ export type SettingsWhitelistKey = (typeof SETTINGS_WHITELIST)[number];
  * to/from a JSON string at this boundary so the crypto middleware only
  * ever sees a string.
  */
-const OBJECT_VALUED_ENCRYPTED_PATHS = ['kosync.customHeaders', 'bookorbit.customHeaders'] as const;
+const OBJECT_VALUED_ENCRYPTED_PATHS = [
+  'kosync.customHeaders',
+  'bookorbit.customHeaders',
+  'grimmory.customHeaders',
+] as const;
 
 // In practice every path comes from the compile-time SETTINGS_WHITELIST so
 // these never appear, but readPath/writePath are exported helpers and the

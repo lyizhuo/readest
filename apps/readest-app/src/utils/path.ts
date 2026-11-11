@@ -11,6 +11,44 @@ export const getFilename = (fileOrUri: string) => {
   return lastPart.split('?')[0]!;
 };
 
+export const getPathFilename = (path: string) => {
+  // Backslashes are separators in drive-rooted and UNC Windows paths only.
+  const normalized = /^(?:[a-z]:[\\/]|\\\\)/i.test(path) ? path.replace(/\\/g, '/') : path;
+  return normalized.split('/').pop()!;
+};
+
+export const getURLFilename = (url: string) => {
+  const name = new URL(url).pathname.split('/').pop() || 'remote-file';
+  try {
+    return decodeURIComponent(name);
+  } catch {
+    // Keep the encoded basename when the server uses non-UTF-8 path bytes.
+    return name;
+  }
+};
+
+/**
+ * Duplicate marker a browser or download manager appends when a download would
+ * overwrite an existing file. Several of them put it after the extension
+ * (`The_Amazing_Traveling.epub (1)`), which is what AO3 re-downloads look like
+ * on Android (issue #5959).
+ */
+const DUPLICATE_MARKER = /[\s_-]*\(\d+\)$/;
+
+export const stripDuplicateMarker = (filename: string) => filename.replace(DUPLICATE_MARKER, '');
+
+/**
+ * Lowercased extension of `filename` without the leading dot, or '' when it has
+ * none. Looks past a trailing duplicate marker, so `book.epub (1)` is still an
+ * `epub` — a plain `split('.').pop()` reads that as `epub (1)` and every
+ * extension whitelist then rejects the file.
+ */
+export const getFileExtension = (filename: string) => {
+  const name = stripDuplicateMarker(getFilename(filename));
+  const dotIndex = name.lastIndexOf('.');
+  return dotIndex < 0 ? '' : name.slice(dotIndex + 1).toLowerCase();
+};
+
 export const getBaseFilename = (filename: string) => {
   const normalizedPath = filename.replace(/\\/g, '/');
   const name = normalizedPath.split('/').pop() || '';

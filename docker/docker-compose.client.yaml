@@ -19,13 +19,18 @@ name: readest-client
 
 services:
   client:
-    # `archive` is built from feature/archive by .github/workflows/build.yml.
-    # Switch to `latest` once the archive feature is merged into main.
-    image: ghcr.io/lyizhuo/readest-client:archive
+    # `latest` is built from main, which now carries the archive feature
+    # (upstream synced + archive merged). Branch builds still publish
+    # `archive`/`sha-<short>` for testing before a merge.
+    image: ghcr.io/lyizhuo/readest-client:latest
     restart: unless-stopped
     ports:
       - "3000:3000"
     environment:
+      # Upstream's self-host switch: unlocks every premium feature (third-party
+      # cloud sync, offline TTS downloads, custom translators/TTS) with or
+      # without a signed-in user. No fork patch to the paywall flags needed.
+      SELF_HOSTED: "true"
       # Auth (hosted Supabase)
       SUPABASE_URL: https://fiwgjtjwpzpkuhxzvwmp.supabase.co
       SUPABASE_PUBLIC_URL: https://fiwgjtjwpzpkuhxzvwmp.supabase.co

@@ -3,8 +3,9 @@ import { fetch as tauriFetch } from '@tauri-apps/plugin-http';
 import { isTauriAppPlatform } from '@/services/environment';
 import { normalizeToShortLang } from '@/utils/lang';
 import { TranslationProvider } from '../types';
-import { splitTextIntoChunks } from '../utils';
+import { splitTextIntoSentenceChunks } from '../utils';
 import { YANDEX_REQUEST_HEADERS, YANDEX_SESSION_URL, YANDEX_TRANSLATE_URL } from './yandexShared';
+import { initSimpleCC, runSimpleCC } from '@/utils/simplecc';
 
 /**
  * Direct client for the Yandex Translate web API — the same endpoints the
@@ -22,10 +23,17 @@ import { YANDEX_REQUEST_HEADERS, YANDEX_SESSION_URL, YANDEX_TRANSLATE_URL } from
  */
 const MAX_CHARS_PER_REQUEST = 600;
 const MAX_CONCURRENT_REQUESTS = 3;
+// Yandex cuts longer sentences mid-clause; such sentences are pre-split at clauses.
+const MAX_CHARS_PER_SENTENCE = 250;
 // Reserve two requests for initial and refreshed sessions, and account for
 // every translate chunk potentially retrying once with the refreshed SID.
 const MAX_TRANSLATE_REQUESTS_PER_CALL = 29;
 const TRANSPORT_TIMEOUT_MS = 15_000;
+// The web proxy answers 429 once a user exceeds its per-minute budget; such chunks wait
+// for the Retry-After delay and go out again instead of failing the whole paragraph.
+const MAX_RATE_LIMIT_RETRIES = 3;
+const DEFAULT_RETRY_AFTER_MS = 5_000;
+const MAX_RETRY_AFTER_MS = 60_000;
 const PROXY_URL = '/api/yandex-translate';
 
 interface YandexSession {
@@ -112,11 +120,56 @@ const getRequestTarget = (endpoint: 'session' | 'translate', token?: string | nu
 const withParams = (base: string, params: URLSearchParams) =>
   `${base}${base.includes('?') ? '&' : '?'}${params}`;
 
-const requestSignal = (direct: boolean, signal?: AbortSignal) => {
-  if (!direct) return signal;
-  const timeout = AbortSignal.timeout(TRANSPORT_TIMEOUT_MS);
-  return signal ? AbortSignal.any([signal, timeout]) : timeout;
+async function withRequestSignal<T>(
+  direct: boolean,
+  signal: AbortSignal | undefined,
+  request: (signal?: AbortSignal) => Promise<T>,
+): Promise<T> {
+  if (!direct) return request(signal);
+  signal?.throwIfAborted();
+  const controller = new AbortController();
+  const abort = () => controller.abort(signal?.reason);
+  signal?.addEventListener('abort', abort, { once: true });
+  const timeout = setTimeout(
+    () => controller.abort(new DOMException('Translation request timed out', 'TimeoutError')),
+    TRANSPORT_TIMEOUT_MS,
+  );
+  try {
+    // Keep cancellation active through body consumption, then detach it so
+    // later timeouts/caller aborts cannot reach completed native resources.
+    return await request(controller.signal);
+  } finally {
+    clearTimeout(timeout);
+    signal?.removeEventListener('abort', abort);
+  }
+}
+
+const retryAfterMs = (response: Response) => {
+  const header = response.headers.get('Retry-After');
+  const seconds = header ? Number(header) : Number.NaN;
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.min(seconds * 1000, MAX_RETRY_AFTER_MS);
+  }
+  // Retry-After may also be an HTTP-date.
+  const delayMs = (header ? Date.parse(header) : Number.NaN) - Date.now();
+  return Number.isFinite(delayMs) && delayMs >= 0
+    ? Math.min(delayMs, MAX_RETRY_AFTER_MS)
+    : DEFAULT_RETRY_AFTER_MS;
 };
+
+const wait = (ms: number, signal?: AbortSignal) =>
+  new Promise<void>((resolve, reject) => {
+    signal?.throwIfAborted();
+    const abort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', abort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', abort, { once: true });
+  });
 
 // yu — random Yandex UID, yum — Metrika timestamp in microseconds
 const genYandexUID = () => BigInt(Math.floor(Math.random() * 1e19)).toString();
@@ -131,20 +184,18 @@ const baseParams = () => ({
 async function createSession(token?: string | null): Promise<string> {
   const { fetchImpl, url, headers, direct } = getRequestTarget('session', token);
   const params = new URLSearchParams(baseParams());
-  const signal = requestSignal(direct);
-  const response = await withRequestLimit(
-    () =>
-      fetchImpl(withParams(url, params), {
-        method: 'POST',
-        headers,
-        signal,
-      }),
-    signal,
-  );
-  if (!response.ok) {
-    throw new Error(`yandex session request failed with status ${response.status}`);
-  }
-  const data = await response.json();
+  const data = await withRequestSignal(direct, undefined, async (signal) => {
+    const response = await withRequestLimit(
+      () => fetchImpl(withParams(url, params), { method: 'POST', headers, signal }),
+      signal,
+    );
+    if (!response.ok) {
+      // Drain the native response before releasing its cancellation deadline.
+      await response.text().catch(() => {});
+      throw new Error(`yandex session request failed with status ${response.status}`);
+    }
+    return response.json();
+  });
   const session = data?.session;
   if (
     typeof session?.id !== 'string' ||
@@ -189,6 +240,7 @@ async function translateChunk(
   token?: string | null,
   signal?: AbortSignal,
   retrySession = true,
+  rateLimitRetries = MAX_RATE_LIMIT_RETRIES,
 ): Promise<string> {
   signal?.throwIfAborted();
   const sid = await getSession(token, signal);
@@ -209,18 +261,34 @@ async function translateChunk(
   ]);
 
   const { fetchImpl, url, headers, direct } = getRequestTarget('translate', token);
-  const transportSignal = requestSignal(direct, signal);
-  const response = await withRequestLimit(
-    () =>
-      fetchImpl(withParams(url, params), {
-        method: 'POST',
-        headers,
-        body: body.toString(),
-        signal: transportSignal,
-      }),
-    transportSignal,
-  );
-  const data = await response.json().catch(() => null);
+  const { response, data } = await withRequestSignal(direct, signal, async (transportSignal) => {
+    const response = await withRequestLimit(
+      () =>
+        fetchImpl(withParams(url, params), {
+          method: 'POST',
+          headers,
+          body: body.toString(),
+          signal: transportSignal,
+        }),
+      transportSignal,
+    );
+    const data = await response.json().catch(() => null);
+    return { response, data };
+  });
+  if (response.status === 429 && rateLimitRetries > 0) {
+    // The request slot and transport deadline are already released here, so waiting
+    // neither blocks other chunks nor counts against the request timeout.
+    await wait(retryAfterMs(response), signal);
+    return translateChunk(
+      text,
+      sourceLang,
+      targetLang,
+      token,
+      signal,
+      retrySession,
+      rateLimitRetries - 1,
+    );
+  }
   if (response.ok && !data) {
     throw new Error('yandex translate failed: malformed response');
   }
@@ -231,7 +299,7 @@ async function translateChunk(
     const sessionInvalid = errorCode === 401 || errorCode === 403;
     if (sessionInvalid && cachedSession?.id === sid) cachedSession = null;
     if (sessionInvalid && retrySession) {
-      return translateChunk(text, sourceLang, targetLang, token, signal, false);
+      return translateChunk(text, sourceLang, targetLang, token, signal, false, rateLimitRetries);
     }
     throw new Error(
       `yandex translate failed with status ${response.status}: ${data?.message ?? data?.error ?? 'unknown error'}`,
@@ -267,7 +335,9 @@ export const yandexProvider: TranslationProvider = {
     // passing source_lang=auto is rejected as "Invalid parameter: source_lang".
     const source_lang = sourceLang === 'AUTO' ? '' : normalizeLang(sourceLang);
     const target_lang = normalizeLang(targetLang);
-    const chunkedTexts = texts.map((text) => splitTextIntoChunks(text, MAX_CHARS_PER_REQUEST));
+    const chunkedTexts = texts.map((text) =>
+      splitTextIntoSentenceChunks(text, MAX_CHARS_PER_REQUEST, MAX_CHARS_PER_SENTENCE),
+    );
     const chunkCount = chunkedTexts.reduce((total, chunks) => total + chunks.length, 0);
     if (chunkCount > MAX_TRANSLATE_REQUESTS_PER_CALL) {
       throw new Error(
@@ -300,6 +370,16 @@ export const yandexProvider: TranslationProvider = {
     translatedChunks.forEach((chunks, index) => {
       results[index] = chunks.join('');
     });
+
+    // Yandex only speaks `zh`, and it is Simplified: `normalizeLang` above
+    // collapses every zh variant onto it, so a zh-TW/zh-HK/zh-MO reader was
+    // handed Simplified text labelled as their language. Convert the reply
+    // locally instead -- unlike DeepL, there is no target code to ask for.
+    if (normalizeToShortLang(targetLang) === 'zh-Hant') {
+      await initSimpleCC();
+      return results.map((text) => (text ? runSimpleCC(text, 's2t') : text));
+    }
+
     return results;
   },
 };

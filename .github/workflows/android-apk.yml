@@ -87,6 +87,7 @@ jobs:
           NEXT_PUBLIC_SUPABASE_URL=https://fiwgjtjwpzpkuhxzvwmp.supabase.co
           NEXT_PUBLIC_SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZpd2dqdGp3cHpwa3VoeHp2d21wIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODY3Njc4MTAsImV4cCI6MjEwMjM0MzgxMH0.pM4OK8-mgtlM3ag7wiTdfCrCAD6X76Cbom_-l4Ko6zU
           NEXT_PUBLIC_API_BASE_URL=https://read.620602.xyz
+          NEXT_PUBLIC_SELF_HOSTED=true
           EOF
           cp .env.local apps/readest-app/.env.local
 

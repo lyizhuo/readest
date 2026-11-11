@@ -20,10 +20,14 @@ import {
 import {
   ArchiveSettings,
   HardcoverSettings,
+  PageboundSettings,
   BookOrbitSettings,
+  GrimmorySettings,
   KOSyncSettings,
   LibraryGroupByType,
   LibrarySortByType,
+  NotionSettings,
+  ObsidianSettings,
   ReadSettings,
   ReadwiseSettings,
   SystemSettings,
@@ -33,13 +37,18 @@ import {
   OneDriveSettings,
   ICloudSettings,
 } from '@/types/settings';
-import { UserStorageQuota, UserDailyTranslationQuota } from '@/types/quota';
+import { UserStorageQuota, UserDailyTranslationQuota, UserDailyTTSQuota } from '@/types/quota';
 import { getDefaultMaxBlockSize, getDefaultMaxInlineSize } from '@/utils/config';
 import { stubTranslation as _ } from '@/utils/misc';
 import { DEFAULT_AI_SETTINGS } from './ai/constants';
+import {
+  DEFAULT_HANDWRITING_COLOR,
+  DEFAULT_HANDWRITING_WIDTH,
+  DEFAULT_MARKER_COLOR,
+  DEFAULT_MARKER_WIDTH,
+} from './handwriting/model';
 import { DEFAULT_ANNOTATION_TOOLBAR_ITEMS } from '@/utils/annotationToolbar';
-import { DEFAULT_SENTENCE_GAP_SEC } from './tts/EdgeTTSClient';
-import { DEFAULT_PARAGRAPH_GAP_SEC } from './tts/TTSController';
+import { DEFAULT_PARAGRAPH_GAP_SEC, DEFAULT_SENTENCE_GAP_SEC } from './tts/gap';
 
 export const DATA_SUBDIR = 'Readest';
 export const LOCAL_BOOKS_SUBDIR = `${DATA_SUBDIR}/Books`;
@@ -62,6 +71,16 @@ export const SUPPORTED_BOOK_EXTS = [
   'pdf',
   'txt',
   'md',
+  'html',
+  'htm',
+  'mhtml',
+  'mht',
+  'rbooks',
+  // docx/rtf are never parsed natively: importBook converts them to EPUB and
+  // imports the result. Listed here so every picker / drag-drop / folder-walk
+  // entry point lets them through to that conversion.
+  'docx',
+  'rtf',
 ];
 export const BOOK_ACCEPT_FORMATS = SUPPORTED_BOOK_EXTS.map((ext) => `.${ext}`).join(', ');
 export const BOOK_UNGROUPED_NAME = '';
@@ -78,6 +97,7 @@ export const DEFAULT_KOSYNC_SETTINGS = {
   deviceName: '',
   checksumMethod: 'binary',
   strategy: 'prompt',
+  sendMetadata: false,
   enabled: false,
 } as KOSyncSettings;
 
@@ -93,7 +113,20 @@ export const DEFAULT_BOOKORBIT_SETTINGS = {
   syncNotes: true,
   syncStats: true,
   syncBookStates: true,
+  autoSync: true,
 } as BookOrbitSettings;
+
+export const DEFAULT_GRIMMORY_SETTINGS: GrimmorySettings = {
+  enabled: false,
+  serverUrl: '',
+  username: '',
+  password: '',
+  strategy: 'prompt',
+  syncProgress: true,
+  syncNotes: true,
+  syncStats: true,
+  syncBookStates: true,
+};
 
 export const READWISE_API_BASE_URL = 'https://readwise.io/api/v2';
 
@@ -110,6 +143,31 @@ export const DEFAULT_HARDCOVER_SETTINGS = {
   lastSyncedAt: 0,
   autoSync: false,
 } as HardcoverSettings;
+
+export const DEFAULT_PAGEBOUND_SETTINGS = {
+  enabled: false,
+  email: '',
+  refreshToken: '',
+  apiToken: '',
+  lastSyncedAt: 0,
+  autoSync: false,
+} as PageboundSettings;
+
+export const NOTION_API_BASE_URL = 'https://api.notion.com/v1';
+export const NOTION_API_VERSION = '2026-03-11';
+
+export const DEFAULT_NOTION_SETTINGS = {
+  enabled: false,
+  accessToken: '',
+  databaseId: '',
+  lastSyncedAt: 0,
+  includeChapterHeading: true,
+} as NotionSettings;
+
+export const DEFAULT_OBSIDIAN_SETTINGS: ObsidianSettings = {
+  enabled: false,
+  folder: '',
+};
 
 export const DEFAULT_WEBDAV_SETTINGS = {
   enabled: false,
@@ -198,6 +256,9 @@ export const DEFAULT_SYSTEM_SETTINGS: Partial<SystemSettings> = {
       refresh: null,
     },
   },
+  gamepadEnabled: true,
+  reverseWheelPaging: false,
+  hideBookshelfPageButtons: true,
   openLastBooks: false,
   lastOpenBooks: [],
   autoImportBooksOnOpen: false,
@@ -214,6 +275,7 @@ export const DEFAULT_SYSTEM_SETTINGS: Partial<SystemSettings> = {
   libraryAutoColumns: true,
   libraryColumns: 6,
   librarySkeuomorphicCovers: false,
+  libraryHideCovers: false,
   libraryRecentShelfEnabled: false,
 
   metadataSeriesCollapsed: false,
@@ -233,8 +295,12 @@ export const DEFAULT_SYSTEM_SETTINGS: Partial<SystemSettings> = {
 
   kosync: DEFAULT_KOSYNC_SETTINGS,
   bookorbit: DEFAULT_BOOKORBIT_SETTINGS,
+  grimmory: DEFAULT_GRIMMORY_SETTINGS,
   readwise: DEFAULT_READWISE_SETTINGS,
   hardcover: DEFAULT_HARDCOVER_SETTINGS,
+  pagebound: DEFAULT_PAGEBOUND_SETTINGS,
+  notion: DEFAULT_NOTION_SETTINGS,
+  obsidian: DEFAULT_OBSIDIAN_SETTINGS,
   webdav: DEFAULT_WEBDAV_SETTINGS,
   googleDrive: DEFAULT_GOOGLE_DRIVE_SETTINGS,
   s3: DEFAULT_S3_SETTINGS,
@@ -255,6 +321,9 @@ export const DEFAULT_SYSTEM_SETTINGS: Partial<SystemSettings> = {
     font: true,
     texture: true,
     opds_catalog: true,
+    abs_server: true,
+    custom_translator: true,
+    custom_tts: true,
     settings: true,
   },
 };
@@ -293,6 +362,11 @@ export const DEFAULT_READSETTINGS: ReadSettings = {
   wordLensAutoDownload: true,
 
   customThemes: [],
+  handwritingColor: DEFAULT_HANDWRITING_COLOR,
+  handwritingWidth: DEFAULT_HANDWRITING_WIDTH,
+  handwritingTool: 'pen',
+  handwritingMarkerColor: DEFAULT_MARKER_COLOR,
+  handwritingMarkerWidth: DEFAULT_MARKER_WIDTH,
   highlightStyle: 'highlight',
   highlightStyles: {
     highlight: 'yellow',
@@ -314,6 +388,7 @@ export const DEFAULT_BOOK_FONT: BookFont = {
   serifFont: 'Bitter',
   sansSerifFont: 'Roboto',
   monospaceFont: 'Consolas',
+  ignorePublisherFonts: [],
   defaultFont: 'Serif',
   defaultCJKFont: 'LXGW WenKai GB Screen',
   defaultFontSize: 16,
@@ -331,17 +406,21 @@ export const DEFAULT_BOOK_LAYOUT: BookLayout = {
   compactMarginLeftPx: 16,
   compactMarginRightPx: 16,
   gapPercent: 5,
+  columnGapPx: 0,
   scrolled: false,
   scrolledDirection: 'vertical',
   webtoonMode: false,
+  lockHorizontalPan: false,
   noContinuousScroll: false,
   disableClick: false,
   disableSwipe: false,
+  disablePullDownToBookmark: false,
   fullscreenClickArea: false,
   swapClickArea: false,
   disableDoubleClick: false,
   volumeKeysToFlip: false,
   maxColumnCount: 2,
+  duoBookMode: true,
   maxInlineSize: getDefaultMaxInlineSize(),
   maxBlockSize: getDefaultMaxBlockSize(),
   writingMode: 'auto',
@@ -351,6 +430,7 @@ export const DEFAULT_BOOK_LAYOUT: BookLayout = {
   allowScript: false,
   hideScrollbar: false,
   autoScrollSpeed: 100,
+  autoScrollRunning: false,
 };
 
 export const DEFAULT_BOOK_LANGUAGE: BookLanguage = {
@@ -374,6 +454,13 @@ export const DEFAULT_BOOK_STYLE: BookStyle = {
   highlightOpacity: 0.4,
   codeHighlighting: false,
   codeLanguage: 'auto-detect',
+  dialogueHighlight: false,
+  dialogueHighlightCustomColor: false,
+  dialogueHighlightColor: HIGHLIGHT_COLOR_HEX['yellow'] ?? '#facc15',
+  dialogueHighlightCustomTextColor: false,
+  dialogueHighlightTextColor: '',
+  dialogueHighlightItalic: false,
+  dialogueHighlightWeight: 'normal',
   userStylesheet: '',
   userUIStylesheet: '',
 
@@ -386,6 +473,7 @@ export const DEFAULT_BOOK_STYLE: BookStyle = {
   spreadMode: 'auto',
   keepCoverSpread: true,
   invertImgColorInDark: false,
+  transparentImageBackground: false,
   applyThemeToPDF: false,
   contrast: 100,
 };
@@ -413,6 +501,9 @@ export const DEFAULT_EINK_VIEW_SETTINGS: Partial<ViewSettings> = {
   isEink: true,
   animated: false,
   volumeKeysToFlip: true,
+  // Matches the text-sm the header/footer used to hard-code in e-ink mode,
+  // so e-ink devices keep their larger chrome once the size is configurable.
+  headerFooterFontSize: 14,
 };
 
 export const DEFAULT_PARAGRAPH_MODE_CONFIG: ParagraphModeConfig = {
@@ -423,6 +514,7 @@ export const DEFAULT_VIEW_CONFIG: ViewConfig = {
   sideBarTab: 'toc',
   uiLanguage: '',
   sortedTOC: false,
+  showTOCThumbnails: true,
 
   doubleBorder: false,
   borderColor: 'red',
@@ -438,13 +530,20 @@ export const DEFAULT_VIEW_CONFIG: ViewConfig = {
   showBatteryPercentage: true,
   use24HourClock: false,
   showPaginationButtons: false,
+  stablePageNumbers: true,
   progressStyle: 'fraction',
   referencePageCount: 0,
+
+  headerFooterFontSize: 12,
+  headerFooterTextColor: '',
+  headerFooterBackground: 'auto',
+  headerFooterBgOpacity: 0.85,
 
   animated: false,
   pageTurnStyle: 'push',
   isEink: false,
   isColorEink: false,
+  einkAutoRefreshInterval: 0,
 
   paragraphMode: DEFAULT_PARAGRAPH_MODE_CONFIG,
 
@@ -453,6 +552,9 @@ export const DEFAULT_VIEW_CONFIG: ViewConfig = {
   readingRulerPosition: 33,
   readingRulerOpacity: 0.5,
   readingRulerColor: 'transparent',
+  readingRulerStyle: 'band',
+  readingRulerLineColor: '#808080',
+  readingRulerLineThickness: 2,
 };
 
 export const DEFAULT_TTS_CONFIG: TTSConfig = {
@@ -466,14 +568,21 @@ export const DEFAULT_TTS_CONFIG: TTSConfig = {
   ttsHighlightGranularity: 'word',
   ttsMediaMetadata: 'sentence',
   ttsPlayerStyle: 'full',
+  ttsSkipInlineAnnotations: false,
+  ttsPauseAfterSentence: false,
 };
 
 export const DEFAULT_TRANSLATOR_CONFIG: TranslatorConfig = {
   translationEnabled: false,
   translationProvider: 'deepl',
+  translationPromptId: 'default',
   translateTargetLang: '',
   showTranslateSource: true,
   ttsReadAloudText: 'both',
+  translationFont: '',
+  translationFontStyle: 'normal',
+  translationFontSize: 1,
+  translationColor: '',
 };
 
 export const DEFAULT_NOTE_EXPORT_CONFIG: NoteExportConfig = {
@@ -484,6 +593,7 @@ export const DEFAULT_NOTE_EXPORT_CONFIG: NoteExportConfig = {
   includeCoverImage: false,
   includeChapterTitles: true,
   includeQuotes: true,
+  includeContext: false,
   includeNotes: true,
   includePageNumber: true,
   includeTimestamp: false,
@@ -504,6 +614,7 @@ export const DEFAULT_NOTE_EXPORT_CONFIG: NoteExportConfig = {
 export const DEFAULT_ANNOTATOR_CONFIG: AnnotatorConfig = {
   enableAnnotationQuickActions: true,
   annotationQuickAction: null,
+  keepSelectionAfterLookup: false,
   annotationToolbarItems: DEFAULT_ANNOTATION_TOOLBAR_ITEMS,
   copyToNotebook: false,
   noteExportConfig: DEFAULT_NOTE_EXPORT_CONFIG,
@@ -940,6 +1051,12 @@ export const MAX_ZOOM_LEVEL = 500;
 export const MIN_ZOOM_LEVEL = 50;
 export const ZOOM_STEP = 10;
 
+// Reflowable books have no scale factor, so the zoom shortcuts step the book's
+// own font size instead (issue #5694). The bounds match Settings > Font.
+export const MAX_FONT_SIZE = 120;
+export const MIN_FONT_SIZE = 8;
+export const FONT_SIZE_STEP = 1;
+
 export const MAX_CONTRAST = 300;
 export const MIN_CONTRAST = 50;
 export const CONTRAST_STEP = 10;
@@ -965,6 +1082,19 @@ export const DEFAULT_DAILY_TRANSLATION_QUOTA: UserDailyTranslationQuota = {
   pro: 500 * 1024,
   purchase: 0,
 };
+
+export const DEFAULT_DAILY_TTS_QUOTA: UserDailyTTSQuota = {
+  free: 0,
+  plus: 500_000,
+  pro: 1_000_000,
+  purchase: 0,
+};
+
+// Readest Voice previews: one sample of at most this many characters, open to
+// any signed-in reader, within this daily allowance when their plan's quota is
+// smaller (about 30 typical samples).
+export const READEST_VOICE_PREVIEW_MAX_CHARS = 400;
+export const READEST_VOICE_PREVIEW_DAILY_CHARS = 6_000;
 
 export const DOUBLE_CLICK_INTERVAL_THRESHOLD_MS = 250;
 export const DISABLE_DOUBLE_CLICK_ON_MOBILE = true;
@@ -1061,6 +1191,7 @@ export const TRANSLATED_LANGS = {
   ro: 'Română',
   hu: 'Magyar',
   uz: 'Oʻzbek',
+  ka: 'ქართული',
 };
 
 export const TRANSLATOR_LANGS: Record<string, string> = {

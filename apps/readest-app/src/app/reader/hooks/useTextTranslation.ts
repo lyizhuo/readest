@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { FoliateView } from '@/types/view';
 import { UseTranslatorOptions } from '@/services/translators';
 import { useReaderStore } from '@/store/readerStore';
+import { useBookDataStore } from '@/store/bookDataStore';
 import { useBookProgress } from '@/store/readerProgressStore';
 import { useTranslator } from '@/hooks/useTranslator';
 import { useTranslation } from '@/hooks/useTranslation';
@@ -82,6 +83,86 @@ export const createTranslationTargetNode = ({
 
 const SOURCE_HIDDEN_CLASS = 'translation-source-hidden';
 
+export const groupTextNodesByDocument = (nodes: HTMLElement[]) => {
+  const grouped = new Map<Document, HTMLElement[]>();
+  nodes.forEach((node) => {
+    const documentNodes = grouped.get(node.ownerDocument);
+    if (documentNodes) {
+      documentNodes.push(node);
+    } else {
+      grouped.set(node.ownerDocument, [node]);
+    }
+  });
+  return grouped;
+};
+
+export const observeTextNodesByDocument = (
+  nodes: HTMLElement[],
+  createObserver: (document: Document) => IntersectionObserver,
+) =>
+  Array.from(groupTextNodesByDocument(nodes), ([document, documentNodes]) => {
+    const observer = createObserver(document);
+    documentNodes.forEach((node) => observer.observe(node));
+    return observer;
+  });
+
+/**
+ * Maps a fresh walk of the (possibly already translated) DOM back to one entry
+ * per source paragraph.
+ *
+ * Two shapes have to be normalized. Generated `.translation-target` wrappers are
+ * never source text, so they are dropped outright. A hidden original is *wrapped*
+ * rather than erased, so `walkTextNodes` stops seeing direct text on the
+ * paragraph, descends past it, and emits the `.translation-source-hidden` wrapper
+ * instead — that one is folded back to the paragraph that owns it.
+ *
+ * Folding rather than dropping matters because `allTextNodes` is addressed by
+ * index: `getTranslationContextNodes` slices a window around the visible nodes
+ * and `findNodeIndicesInRange` maps the reading position to a slot. Dropping an
+ * already translated paragraph shifts every index after it and leaves the
+ * reading position unresolvable, which silently kills the read-ahead. Keeping
+ * the paragraph is safe because `scheduleTranslation` and `translateElement`
+ * both already bail when it holds a `.translation-target`.
+ */
+export const resolveTranslationSourceNodes = (nodes: HTMLElement[]) => {
+  const sources: HTMLElement[] = [];
+  const seen = new Set<HTMLElement>();
+  for (const node of nodes) {
+    if (node.closest('.translation-target')) continue;
+    const hider = node.closest<HTMLElement>(`.${SOURCE_HIDDEN_CLASS}`);
+    const source = hider?.parentElement ?? node;
+    if (seen.has(source)) continue;
+    seen.add(source);
+    sources.push(source);
+  }
+  return sources;
+};
+
+export const getTranslationContextNodes = (
+  nodes: HTMLElement[],
+  document: Document,
+  visibleElements: Set<HTMLElement>,
+) => {
+  const documentNodes = nodes.filter((node) => node.ownerDocument === document);
+  if (documentNodes.length === 0 || visibleElements.size === 0) return [];
+
+  let firstIdx = documentNodes.length;
+  let lastIdx = -1;
+  for (const element of visibleElements) {
+    const index = documentNodes.indexOf(element);
+    if (index !== -1) {
+      if (index < firstIdx) firstIdx = index;
+      if (index > lastIdx) lastIdx = index;
+    }
+  }
+  if (lastIdx === -1) return [];
+
+  return documentNodes.slice(
+    Math.max(0, firstIdx - 1),
+    Math.min(documentNodes.length, lastIdx + 3),
+  );
+};
+
 /**
  * Hides or restores a paragraph's original text.
  *
@@ -130,11 +211,16 @@ export function useTextTranslation(
   const enabled = useRef(viewSettings?.translationEnabled);
   const [provider, setProvider] = useState(viewSettings?.translationProvider);
   const [targetLang, setTargetLang] = useState(viewSettings?.translateTargetLang);
+  const [promptId, setPromptId] = useState(viewSettings?.translationPromptId);
+  const book = useBookDataStore((s) => s.getBookData(bookKey)?.book);
   const showTranslateSourceRef = useRef(viewSettings?.showTranslateSource);
 
-  const { translate } = useTranslator({
+  const { translate, translator } = useTranslator({
     provider,
     targetLang: targetLang || getLocale(),
+    promptId,
+    bookTitle: book?.title,
+    bookAuthor: book?.author,
   } as UseTranslatorOptions);
 
   const translateRef = useRef(translate);
@@ -143,15 +229,39 @@ export function useTextTranslation(
   const translatorPreservesMarkup = !!getTranslators().find(
     (translator) => translator.name === provider,
   )?.preservesMarkup;
-  const observerRef = useRef<IntersectionObserver | null>(null);
+  const observerRefs = useRef<IntersectionObserver[]>([]);
   const translatedElements = useRef<HTMLElement[]>([]);
   const allTextNodes = useRef<HTMLElement[]>([]);
   const translationQueue = useRef<HTMLElement[]>([]);
   const activeTranslations = useRef(0);
-  const MAX_CONCURRENT_TRANSLATIONS = 5;
+  // Read through a ref: the queue drains from observer callbacks created on
+  // earlier renders. Batching providers ask for more in-flight paragraphs.
+  const maxConcurrentRef = useRef(5);
+  maxConcurrentRef.current = translator?.concurrency ?? 5;
   const pendingDOMUpdates = useRef<Array<() => void>>([]);
   const batchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hintTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // A translation can resolve after the hook is gone. Scheduling its DOM work
+  // then would start a fresh 50 ms timer that runs against a torn-down
+  // environment (and, in tests, after the document is gone: `Node is not
+  // defined`), so both the resolve path and the batcher check this first.
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      // The `[view]` cleanup misses these when translation was off at mount.
+      if (batchTimerRef.current) {
+        clearTimeout(batchTimerRef.current);
+        batchTimerRef.current = null;
+      }
+      observerRefs.current.forEach((observer) => observer.disconnect());
+      observerRefs.current = [];
+      translationQueue.current = [];
+      pendingDOMUpdates.current = [];
+    };
+  }, []);
 
   const toggleTranslationVisibility = (visible: boolean) => {
     translatedElements.current.forEach((element) => {
@@ -185,16 +295,15 @@ export function useTextTranslation(
   const observeTextNodes = () => {
     if (!view || !enabled.current) return;
 
-    const observer = createTranslationObserver();
-    observerRef.current = observer;
-    const nodes = walkTextNodes(view, ['pre', 'code', 'math']);
+    const nodes = resolveTranslationSourceNodes(walkTextNodes(view, ['pre', 'code', 'math']));
     console.log(
       'Observing text nodes for translation:',
       nodes.length,
       // nodes.map((n) => n.textContent),
     );
     allTextNodes.current = nodes;
-    nodes.forEach((el) => observer.observe(el));
+    observerRefs.current.forEach((observer) => observer.disconnect());
+    observerRefs.current = observeTextNodesByDocument(nodes, createTranslationObserver);
   };
 
   const updateTranslation = () => {
@@ -208,6 +317,10 @@ export function useTextTranslation(
     translatedElements.current.forEach((element) => {
       const translationTargets = element.querySelectorAll('.translation-target');
       translationTargets.forEach((target) => target.remove());
+      // The hidden source wrapper is `display: none`, so a paragraph left with
+      // neither a target nor a visible original renders blank for as long as the
+      // re-translation is in flight, and stays blank if that translation fails.
+      setSourceVisibility(element, true);
     });
 
     translatedElements.current = [];
@@ -216,9 +329,10 @@ export function useTextTranslation(
     }
   };
 
-  const createTranslationObserver = () => {
+  const createTranslationObserver = (document: Document) => {
     const visibleElements = new Set<HTMLElement>();
-    return new IntersectionObserver(
+    const Observer = document.defaultView?.IntersectionObserver ?? IntersectionObserver;
+    return new Observer(
       (entries) => {
         for (const entry of entries) {
           if (entry.isIntersecting) {
@@ -228,32 +342,8 @@ export function useTextTranslation(
           }
         }
 
-        if (visibleElements.size === 0) return;
-
-        const nodes = allTextNodes.current;
-        if (nodes.length === 0) return;
-
-        let firstIdx = nodes.length;
-        let lastIdx = -1;
-        for (const el of visibleElements) {
-          const idx = nodes.indexOf(el);
-          if (idx !== -1) {
-            if (idx < firstIdx) firstIdx = idx;
-            if (idx > lastIdx) lastIdx = idx;
-          }
-        }
-
-        if (lastIdx === -1) return;
-
-        const startIdx = Math.max(0, firstIdx - 1);
-        const endIdx = Math.min(nodes.length - 1, lastIdx + 2);
-
-        for (let i = startIdx; i <= endIdx; i++) {
-          const node = nodes[i];
-          if (node) {
-            scheduleTranslation(node);
-          }
-        }
+        const nodes = getTranslationContextNodes(allTextNodes.current, document, visibleElements);
+        nodes.forEach((node) => scheduleTranslation(node));
       },
       { threshold: 0 },
     );
@@ -270,7 +360,7 @@ export function useTextTranslation(
 
   const drainTranslationQueue = () => {
     while (
-      activeTranslations.current < MAX_CONCURRENT_TRANSLATIONS &&
+      activeTranslations.current < maxConcurrentRef.current &&
       translationQueue.current.length > 0
     ) {
       const el = translationQueue.current.shift()!;
@@ -289,6 +379,7 @@ export function useTextTranslation(
   };
 
   const batchDOMUpdate = (update: () => void) => {
+    if (!mountedRef.current) return;
     pendingDOMUpdates.current.push(update);
     if (!batchTimerRef.current) {
       batchTimerRef.current = setTimeout(() => {
@@ -300,15 +391,18 @@ export function useTextTranslation(
   };
 
   const recreateTranslationObserver = () => {
-    const observer = createTranslationObserver();
-    observerRef.current?.disconnect();
-    observerRef.current = observer;
-    allTextNodes.current.forEach((el) => observer.observe(el));
+    observerRefs.current.forEach((observer) => observer.disconnect());
+    observerRefs.current = observeTextNodesByDocument(
+      allTextNodes.current,
+      createTranslationObserver,
+    );
   };
 
   const translateElement = async (el: HTMLElement) => {
     if (!enabled.current) return;
-    const text = el.textContent?.replaceAll('\n', '').trim();
+    // The payload's text leaves out ruby readings and injected nodes.
+    const payload = extractSourcePayload(el);
+    const text = payload.text.replaceAll('\n', '').trim();
     if (!text) return;
 
     if (el.classList.contains('translation-target')) {
@@ -325,7 +419,6 @@ export function useTextTranslation(
       // tags for us; otherwise send bare text. Markup is split at run
       // boundaries so a long formatted paragraph still keeps its formatting
       // instead of falling back — each chunk is well-formed on its own.
-      const payload = extractSourcePayload(el);
       const markupChunks =
         translatorPreservesMarkup && payload.hasMarkup
           ? splitMarkupIntoChunks(payload.html, MAX_MARKUP_PAYLOAD_CHARS, splitTextIntoChunks)
@@ -333,6 +426,7 @@ export function useTextTranslation(
       const useMarkup = markupChunks.length > 0;
 
       const translated = await translateRef.current(useMarkup ? markupChunks : [text]);
+      if (!mountedRef.current) return;
       const translatedText = translated.join('');
       if (!translatedText || text === translatedText) return;
 
@@ -439,6 +533,7 @@ export function useTextTranslation(
     const enabledChanged = enabled.current !== viewSettings.translationEnabled;
     const providerChanged = provider !== viewSettings.translationProvider;
     const targetLangChanged = targetLang !== viewSettings.translateTargetLang;
+    const promptChanged = promptId !== viewSettings.translationPromptId;
     const showTranslateSourceChanged =
       showTranslateSourceRef.current !== viewSettings.showTranslateSource;
 
@@ -454,6 +549,10 @@ export function useTextTranslation(
       setTargetLang(viewSettings.translateTargetLang);
     }
 
+    if (promptChanged) {
+      setPromptId(viewSettings.translationPromptId);
+    }
+
     if (showTranslateSourceChanged) {
       showTranslateSourceRef.current = viewSettings.showTranslateSource;
     }
@@ -463,11 +562,16 @@ export function useTextTranslation(
       if (enabled.current) {
         observeTextNodes();
       }
-    } else if (providerChanged || targetLangChanged || showTranslateSourceChanged) {
+    } else if (
+      providerChanged ||
+      targetLangChanged ||
+      promptChanged ||
+      showTranslateSourceChanged
+    ) {
       updateTranslation();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [bookKey, viewSettings, provider, targetLang]);
+  }, [bookKey, viewSettings, provider, targetLang, promptId]);
 
   useEffect(() => {
     if (!view || !enabled.current) return;
@@ -483,7 +587,8 @@ export function useTextTranslation(
         view.removeEventListener('load', observeTextNodes);
         view.removeEventListener('load', hintInitialTranslating);
       }
-      observerRef.current?.disconnect();
+      observerRefs.current.forEach((observer) => observer.disconnect());
+      observerRefs.current = [];
       translatedElements.current = [];
       translationQueue.current = [];
       activeTranslations.current = 0;

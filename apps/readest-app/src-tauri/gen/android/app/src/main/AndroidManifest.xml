@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET"/>
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
     <!-- LocalSend device discovery: receiving multicast announcements needs a
          MulticastLock, which requires these two permissions. -->
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"/>
-    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>
@@ -27,17 +27,18 @@
         android:hardwareAccelerated="true"
         android:usesCleartextTraffic="${usesCleartextTraffic}">
 
-        <!-- Android Auto media capability intentionally NOT declared here. The
-             car-application meta-data (gms car application) is withdrawn for
-             this release to pass Play's Auto review, which rejected version
-             code 11020 for inconsistent TTS playback in the car. Previously
-             withdrawn in #5038 for the same reason and re-enabled in #5066; it
-             is withdrawn again until the car audio bug is fixed. The
-             automotive_app_desc.xml resource and the exported
-             MediaBrowserService (needed for the phone lock-screen/background
-             TTS media session) stay in place; re-add the car-application
-             meta-data pointing at @xml/automotive_app_desc to re-enable
-             Android Auto. -->
+        <!-- Android Auto opt-in. Play's Auto review rejected version code
+             11020 ("Audio inconsistently plays on the Android Auto
+             environment"), which blocked the whole release; it was withdrawn
+             in #5038, restored in #5066, and withdrawn again in #5235. It now
+             ships to the FOSS/GitHub builds only: build.gradle.kts resolves
+             `carAppMetaName` to an inert name for storeFlavor=googleplay, so
+             the Play build advertises no car application and skips Auto
+             review. Flip that mapping once the car audio path is validated
+             on real hardware. -->
+        <meta-data
+            android:name="${carAppMetaName}"
+            android:resource="@xml/automotive_app_desc" />
 
         <!-- Sentry auto-init (ContentProvider). Empty DSN => disabled. Release
              is auto-detected from versionName; performance and PII stay at
@@ -47,7 +48,7 @@
         <meta-data android:name="io.sentry.ndk.enable" android:value="false" />
 
         <activity
-            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode"
+            android:configChanges="orientation|keyboardHidden|keyboard|navigation|screenSize|locale|smallestScreenSize|screenLayout|uiMode"
             android:launchMode="singleTask"
             android:label="@string/main_activity_title"
             android:hardwareAccelerated="true"
@@ -110,6 +111,8 @@
                 <data android:pathSuffix=".txt" />
                 <data android:pathPattern=".*\\.md" />
                 <data android:pathSuffix=".md" />
+                <data android:pathPattern=".*\\.rbooks" />
+                <data android:pathSuffix=".rbooks" />
             </intent-filter>
 
             <intent-filter>
@@ -292,6 +295,15 @@
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:mimeType="text/markdown" />
                 <data android:pathPattern=".*\\.md" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:mimeType="application/x-readest-books" />
+                <data android:pathPattern=".*\\.rbooks" />
             </intent-filter>
             
             <!-- tauri-file-associations. AUTO-GENERATED. DO NOT REMOVE. -->

@@ -4,6 +4,7 @@ import clsx from 'clsx';
 import { useEnv } from '@/context/EnvContext';
 import { useTranslation } from '@/hooks/useTranslation';
 import { useSettingsStore } from '@/store/settingsStore';
+import { useEnsureSettingsLoaded } from '@/hooks/useEnsureSettingsLoaded';
 import {
   isReadestCloudEnabled,
   getEnabledFileSyncBackends,
@@ -36,6 +37,10 @@ const useCategoryCopy = (): Record<SyncCategory, CategoryCopy> => {
       title: _('Annotations'),
       description: _('Highlights and notes'),
     },
+    book_data: {
+      title: _('Book Data'),
+      description: _('Downloaded read-aloud audio and translations'),
+    },
     dictionary: {
       title: _('Dictionaries'),
       description: _('Imported dictionary bundles and settings'),
@@ -51,6 +56,22 @@ const useCategoryCopy = (): Record<SyncCategory, CategoryCopy> => {
     opds_catalog: {
       title: _('OPDS catalogs'),
       description: _('Saved catalog URLs and (encrypted) credentials'),
+    },
+    abs_server: {
+      title: _('Audiobookshelf Servers'),
+      description: _('Saved server URLs and (encrypted) credentials'),
+    },
+    custom_translator: {
+      title: _('Translators'),
+      description: _('Custom translation providers, prompts, and (encrypted) API keys'),
+    },
+    custom_tts: {
+      title: _('TTS Services'),
+      description: _('Custom text-to-speech services and (encrypted) API keys'),
+    },
+    vocabulary: {
+      title: _('Vocabulary'),
+      description: _('Looked-up words, their sentences, and Learning / Mastered marks'),
     },
     settings: {
       // Dictionary preferences ride this row too, but they're gated by the
@@ -75,12 +96,16 @@ export function SyncCategoriesSection() {
   const _ = useTranslation();
   const { envConfig } = useEnv();
   const { settings, setSettings, saveSettings } = useSettingsStore();
+  const hydrated = useEnsureSettingsLoaded();
   const copy = useCategoryCopy();
   const readestEnabled = isReadestCloudEnabled(settings);
   const backends = getEnabledFileSyncBackends(settings);
   const cloudProviderName = cloudProvidersDisplayName(backends);
 
-  if (!settings) return null;
+  // A refreshed /user renders before the store is hydrated, where every
+  // category reads its default. Showing that would misreport the user's real
+  // choices, and toggling a row would persist the empty object over them.
+  if (!settings || !hydrated) return null;
 
   const enabled = (category: SyncCategory): boolean => {
     const value = settings.syncCategories?.[category];

@@ -26,6 +26,7 @@ export class ReaderPage extends BasePage {
   readonly proofreadPopup: Locator;
   readonly noteEditor: Locator;
   readonly annotationItems: Locator;
+  readonly rangeHandles: Locator;
   readonly pageJumpInput: Locator;
 
   constructor(page: Page) {
@@ -47,8 +48,14 @@ export class ReaderPage extends BasePage {
     this.dictionaryPopup = page.locator('.popup-container:has([data-testid="dict-title"])');
     this.translatorPopup = page.locator('.popup-container:has(h1:text-is("Original Text"))');
     this.proofreadPopup = page.locator('.popup-container:has-text("Selected text:")');
-    this.noteEditor = page.locator('.note-editor-container');
+    // Annotate opens the note editor on the selection itself — inside the
+    // toolbar popup at desktop widths, in a bottom sheet on phones. The
+    // sidebar's own inline editor shares the test id; only one is ever open.
+    this.noteEditor = page.locator('[data-testid="booknote-note-editor"]');
     this.annotationItems = page.locator('li.booknote-item[role="button"]');
+    // The app-drawn range-edit handles (the selection / annotation range
+    // editors), as opposed to the browser's native selection handles.
+    this.rangeHandles = page.locator('[data-testid="selection-handle"]');
   }
 
   /** Wait until the reader route is active and the book viewer has mounted. */
@@ -155,12 +162,23 @@ export class ReaderPage extends BasePage {
   // --- reader settings ---
 
   /**
+   * Open the settings dialog from the header's view menu. The header used to
+   * carry a dedicated "Font & Layout" button, but it duplicated the mobile
+   * footer's Font tab and was removed (#5652); the view menu's "Settings"
+   * entry is the header's remaining route into the dialog.
+   */
+  async openSettings(): Promise<void> {
+    await this.revealHeader();
+    await this.headerBar.locator('button[aria-label="View Options"]').click();
+    await this.page.locator('.view-menu').getByText('Settings', { exact: true }).click();
+  }
+
+  /**
    * Open the settings dialog, increase the default font size by one step,
    * and return the value before and after.
    */
   async increaseFontSize(): Promise<{ before: string; after: string }> {
-    await this.revealHeader();
-    await this.headerBar.locator('button[aria-label="Font & Layout"]').click();
+    await this.openSettings();
     await this.page.locator('[data-tab="Font"]').click();
 
     const row = this.page.locator('[data-setting-id="settings.font.defaultFontSize"]');
@@ -180,11 +198,28 @@ export class ReaderPage extends BasePage {
    * Settings -> Behavior -> Customize Toolbar, by its chip label.
    */
   async enableAnnotationTool(name: string): Promise<void> {
-    await this.revealHeader();
-    await this.headerBar.locator('button[aria-label="Font & Layout"]').click();
+    await this.openSettings();
     await this.page.locator('[data-tab="Control"]').click();
     await this.page.locator('[data-setting-id="settings.control.customizeToolbar"]').click();
     await this.page.getByRole('button', { name, exact: true }).click();
+    await this.page.keyboard.press('Escape');
+  }
+
+  /**
+   * Settings -> Control -> Keep Text Selected After Lookup. The row only shows
+   * while the quick action is Dictionary, so set that first.
+   */
+  async setKeepSelectionAfterLookup(keep: boolean): Promise<void> {
+    await this.openSettings();
+    await this.page.locator('[data-tab="Control"]').click();
+
+    const toggle = this.page
+      .locator('[data-setting-id="settings.control.keepSelectionAfterLookup"]')
+      .getByRole('checkbox')
+      .first();
+    await toggle.waitFor({ state: 'visible' });
+    await toggle.setChecked(keep);
+
     await this.page.keyboard.press('Escape');
   }
 
@@ -194,8 +229,7 @@ export class ReaderPage extends BasePage {
    * margin, right under the header bar's hover strip.
    */
   async setPageHeaderVisible(visible: boolean): Promise<void> {
-    await this.revealHeader();
-    await this.headerBar.locator('button[aria-label="Font & Layout"]').click();
+    await this.openSettings();
     await this.page.locator('[data-tab="Layout"]').click();
 
     const toggle = this.page
@@ -330,6 +364,19 @@ export class ReaderPage extends BasePage {
     throw new Error('no visible book section found in the viewer');
   }
 
+  /** Press one of the reader's zoom shortcuts. */
+  async pressZoomShortcut(key: '=' | '-' | '0'): Promise<void> {
+    await this.page.keyboard.press(`Control+${key}`);
+  }
+
+  /** The px font size the book text is currently rendered at. */
+  async bookFontSize(): Promise<number> {
+    const frame = await this.visibleSectionFrame();
+    return frame
+      .locator('body')
+      .evaluate((body) => Number.parseFloat(getComputedStyle(body).fontSize));
+  }
+
   /**
    * Select a paragraph of book text and raise the annotation popup.
    *
@@ -380,25 +427,117 @@ export class ReaderPage extends BasePage {
     await this.annotationPopup.waitFor({ state: 'visible' });
   }
 
-  /** A tool button inside the annotation popup, by its accessible name. */
+  /**
+   * Select a single word of book text.
+   *
+   * The instant quick action only fires for a single lookup term, and it fires
+   * off the selection itself — so unlike {@link selectText} this waits for no
+   * popup, leaving the spec to say which one it expects. Returns the word, so a
+   * spec can assert the selection is (still) exactly that.
+   */
+  async selectWord(): Promise<string> {
+    await this.openTocChapter(3);
+    const frame = await this.visibleSectionFrame();
+
+    return frame.locator('body').evaluate(() => {
+      const paragraphs = Array.from(document.querySelectorAll('p'));
+      const target = paragraphs.find((p) => (p.textContent ?? '').trim().length > 60);
+      if (!target) {
+        throw new Error('no selectable paragraph in the visible section');
+      }
+      const walker = document.createTreeWalker(target, NodeFilter.SHOW_TEXT);
+      let textNode = walker.nextNode();
+      let word: { node: Node; start: number; end: number } | null = null;
+      while (textNode && !word) {
+        const text = textNode.textContent ?? '';
+        const match = /[A-Za-z]{4,}/.exec(text);
+        if (match) {
+          word = { node: textNode, start: match.index, end: match.index + match[0].length };
+        }
+        textNode = walker.nextNode();
+      }
+      if (!word) {
+        throw new Error('no single word found in the target paragraph');
+      }
+      const range = document.createRange();
+      range.setStart(word.node, word.start);
+      range.setEnd(word.node, word.end);
+      const selection = document.getSelection();
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+      return range.toString();
+    });
+  }
+
+  /** The text currently selected inside the on-screen book section. */
+  async selectedSectionText(): Promise<string> {
+    const frame = await this.visibleSectionFrame();
+    return frame.locator('body').evaluate(() => document.getSelection()?.toString() ?? '');
+  }
+
+  /**
+   * Turn on an instant quick action (`Instant Dictionary`, `Instant Highlight`,
+   * …) from the header bar's quick-action dropdown.
+   */
+  async setQuickAction(action: string): Promise<void> {
+    await this.revealHeader();
+    await this.headerBar.getByRole('button', { name: 'Enable Quick Action on Selection' }).click();
+    await this.page.getByRole('menuitem', { name: `Instant ${action}` }).click();
+  }
+
+  /**
+   * A tool button inside the annotation popup, by its accessible name. The
+   * match is exact for string names: the highlight style/color strip shows
+   * alongside the toolbar since #5983, and its "Select highlight style"
+   * button would also answer to a substring match on 'Highlight'.
+   */
   popupTool(name: string | RegExp): Locator {
-    return this.annotationPopup.getByRole('button', { name });
+    return this.annotationPopup.getByRole('button', { name, exact: typeof name === 'string' });
   }
 
   async highlightSelection(): Promise<void> {
     await this.popupTool('Highlight').click();
   }
 
+  /**
+   * Click the first highlight drawn in the book, opening its toolbar and
+   * range editor.
+   *
+   * The overlay is an SVG laid over its section iframe in that iframe's own
+   * client coordinates, so a point just inside the highlight path's top-left
+   * corner (the start of its first line — {@link selectText} selects from a
+   * paragraph start) is a point on the highlighted text in that document. The
+   * click is dispatched there rather than through the page mouse, so it also
+   * reaches a highlight in a prerendered section that is not on screen.
+   */
+  async clickHighlight(): Promise<void> {
+    const overlay = this.foliateView.locator('svg g path').first();
+    await overlay.waitFor({ state: 'attached' });
+    await overlay.evaluate((node) => {
+      const path = node as SVGPathElement;
+      const box = path.getBBox();
+      const doc = path.ownerSVGElement?.parentElement?.querySelector('iframe')?.contentDocument;
+      if (!doc) throw new Error('highlight overlay has no section document');
+      doc.dispatchEvent(
+        new MouseEvent('click', { clientX: box.x + 4, clientY: box.y + 4, bubbles: true }),
+      );
+    });
+  }
+
   async selectHighlightColor(color: string): Promise<void> {
     await this.page.locator(`[aria-label="Select ${color} color"]`).click();
   }
 
-  /** Annotate the current selection with a note. */
+  /**
+   * Annotate the current selection with a note. Annotate highlights the
+   * selection and opens the annotations tab with the new item already in edit
+   * mode, so the note is written and saved inside that item.
+   */
   async addNote(text: string): Promise<void> {
     await this.popupTool('Annotate').click();
     await this.noteEditor.waitFor({ state: 'visible' });
     await this.noteEditor.getByRole('textbox').fill(text);
-    await this.notebook.getByRole('button', { name: 'Save' }).click();
+    await this.noteEditor.getByRole('button', { name: 'Save' }).click();
   }
 
   /** Read the system clipboard (the context must grant `clipboard-read`). */

@@ -15,6 +15,7 @@ import {
   NoteExportFormat,
 } from '@/types/book';
 import { buildAnnotationExport } from '@/services/annotation/providers/readest';
+import { getAnnotationContexts } from '@/services/annotation/context';
 import { DEFAULT_NOTE_EXPORT_CONFIG } from '@/services/constants';
 import { saveViewSettings } from '@/helpers/settings';
 import {
@@ -24,6 +25,7 @@ import {
 } from '@/app/reader/utils/annotatorUtil';
 import { renderNoteTemplate, formatBlockQuote } from '@/utils/note';
 import { getPublicCoverUrl } from '@/utils/cover';
+import { sanitizeNoteHtml } from '@/app/reader/utils/noteMarkdown';
 import {
   AnnotationLinkType,
   buildAnnotationAppUrl,
@@ -49,7 +51,11 @@ interface ExportMarkdownDialogProps {
   onExport: (
     content: string,
     format: NoteExportFormat,
-    sharePosition?: { x: number; y: number; preferredEdge?: 'top' | 'bottom' | 'left' | 'right' },
+    options: {
+      // Hand the file to the OS share sheet instead of writing it to disk.
+      share: boolean;
+      sharePosition?: { x: number; y: number; preferredEdge?: 'top' | 'bottom' | 'left' | 'right' };
+    },
   ) => void;
 }
 
@@ -124,6 +130,7 @@ const ExportMarkdownDialog: React.FC<ExportMarkdownDialogProps> = ({
       excludedStyles: noteExportConfig.excludedStyles ?? [],
       // Configs persisted before the cover option existed.
       includeCoverImage: noteExportConfig.includeCoverImage ?? false,
+      includeContext: noteExportConfig.includeContext ?? false,
       // Configs persisted before the format select existed only recorded the
       // markdown/plain-text toggle.
       exportFormat:
@@ -157,6 +164,35 @@ const ExportMarkdownDialog: React.FC<ExportMarkdownDialogProps> = ({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen, wantsCoverImage, bookKey, appService]);
+
+  // Context is read from the book's section documents, so it is only loaded
+  // when the export shows it: the checkbox in simple mode, the
+  // annotation.context variable in template mode.
+  const wantsContext =
+    !isJson &&
+    (exportConfig.useCustomTemplate
+      ? exportConfig.customTemplate.includes('annotation.context')
+      : exportConfig.includeContext);
+  const [contexts, setContexts] = useState<Record<string, string> | null>(null);
+  useEffect(() => {
+    if (!isOpen || !wantsContext || contexts) return;
+    const bookDoc = getBookData(bookKey)?.bookDoc;
+    if (!bookDoc) {
+      setContexts({});
+      return;
+    }
+    let cancelled = false;
+    const notes = Object.values(booknoteGroups).flatMap((group) => group.booknotes);
+    getAnnotationContexts(bookDoc, notes).then((result) => {
+      if (!cancelled) setContexts(result);
+    });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, wantsContext, bookKey, booknoteGroups]);
+  // Hold the export until the requested context is in the output.
+  const isLoadingContext = wantsContext && !contexts;
 
   useEffect(() => {
     const customTemplate = exportConfig.customTemplate;
@@ -283,6 +319,7 @@ const ExportMarkdownDialog: React.FC<ExportMarkdownDialogProps> = ({
             webLink: buildAnnotationWebUrl({ bookHash, noteId: note.id, cfi: note.cfi }),
             appLink: buildAnnotationAppUrl({ bookHash, noteId: note.id, cfi: note.cfi }),
             text: note.text || '',
+            context: contexts?.[note.id] ?? '',
             note: note.note || '',
             style: note.style,
             color: note.color,
@@ -345,6 +382,13 @@ const ExportMarkdownDialog: React.FC<ExportMarkdownDialogProps> = ({
             lines.push(formatBlockQuote(note.text));
           }
 
+          // Add context
+          const context = contexts?.[note.id];
+          if (exportConfig.includeContext && context) {
+            lines.push('');
+            lines.push(`**${_('Context')}**: ${context}`);
+          }
+
           // Add note
           if (exportConfig.includeNotes && note.note) {
             lines.push('');
@@ -405,13 +449,14 @@ const ExportMarkdownDialog: React.FC<ExportMarkdownDialogProps> = ({
     progress,
     location,
     coverImageUrl,
+    contexts,
     _,
   ]);
 
   // Convert markdown to HTML for preview
   const htmlPreview = useMemo(() => {
     if (!markdownPreview || isJson) return '';
-    const html = marked.parse(markdownPreview) as string;
+    const html = sanitizeNoteHtml(marked.parse(markdownPreview) as string);
     return (
       html
         .replace(/<a href=/g, '<a target="_blank" rel="noopener noreferrer" href=')
@@ -430,8 +475,17 @@ const ExportMarkdownDialog: React.FC<ExportMarkdownDialogProps> = ({
     }));
   };
 
-  const handleExport = (e: React.MouseEvent<HTMLButtonElement>) => {
-    // Anchor the macOS / iPad share sheet to the Export button rect so
+  // macOS gets a Share button next to a Save button that writes to disk
+  // (#6201). Android's share sheet can't save the file to storage, so it gets
+  // an Export button that opens the system save dialog next to Share.
+  // Elsewhere a single Export keeps the platform's one path: share sheet on
+  // iOS, save dialog on Windows/Linux, download on web.
+  const isAndroid = !!appService?.isAndroidApp;
+  const isMacOS = !!appService?.isMacOSApp;
+  const canSaveAndShare = isMacOS || isAndroid;
+
+  const handleExport = (e: React.MouseEvent<HTMLButtonElement>, share: boolean) => {
+    // Anchor the macOS / iPad share sheet to the clicked button's rect so
     // NSSharingServicePicker doesn't fall back to the WebView's top-left.
     // `preferredEdge: 'bottom'` maps to NSMinYEdge — in the flipped WKWebView
     // coord space that's the rect's top edge, so the popover appears above
@@ -442,7 +496,7 @@ const ExportMarkdownDialog: React.FC<ExportMarkdownDialogProps> = ({
       y: rect.top,
       preferredEdge: 'bottom' as const,
     };
-    onExport(markdownPreview, exportConfig.exportFormat, sharePosition);
+    onExport(markdownPreview, exportConfig.exportFormat, { share, sharePosition });
   };
 
   return (
@@ -450,8 +504,8 @@ const ExportMarkdownDialog: React.FC<ExportMarkdownDialogProps> = ({
       isOpen={isOpen}
       title={_('Export Annotations')}
       onClose={onCancel}
-      boxClassName='sm:!w-[75%] sm:h-auto sm:!max-h-[90vh] sm:!max-w-5xl'
-      contentClassName='sm:!px-8 sm:!py-2'
+      boxClassName='sm:w-[75%]! sm:h-auto sm:max-h-[90vh]! sm:max-w-5xl!'
+      contentClassName='sm:px-8! sm:py-2!'
     >
       <div className='flex flex-col gap-4'>
         {/* Export Format */}
@@ -465,7 +519,7 @@ const ExportMarkdownDialog: React.FC<ExportMarkdownDialogProps> = ({
                 exportFormat: e.target.value as NoteExportFormat,
               }))
             }
-            className='select select-bordered select-sm eink-bordered'
+            className='select select-sm eink-bordered'
           >
             <option value='markdown'>{_('Markdown')}</option>
             <option value='text'>{_('Plain Text')}</option>
@@ -570,6 +624,17 @@ const ExportMarkdownDialog: React.FC<ExportMarkdownDialogProps> = ({
               <label className='flex cursor-pointer items-center gap-2'>
                 <input
                   type='checkbox'
+                  checked={exportConfig.includeContext}
+                  onChange={() => handleToggle('includeContext')}
+                  className='checkbox checkbox-sm'
+                  disabled={exportConfig.useCustomTemplate}
+                />
+                <span className='text-sm'>{_('Context')}</span>
+              </label>
+
+              <label className='flex cursor-pointer items-center gap-2'>
+                <input
+                  type='checkbox'
                   checked={exportConfig.includeNotes}
                   onChange={() => handleToggle('includeNotes')}
                   className='checkbox checkbox-sm'
@@ -611,7 +676,7 @@ const ExportMarkdownDialog: React.FC<ExportMarkdownDialogProps> = ({
                     linkType: e.target.value as AnnotationLinkType,
                   }))
                 }
-                className='select select-bordered select-sm eink-bordered'
+                className='select select-sm eink-bordered'
               >
                 <option value='app'>{_('App Link')}</option>
                 <option value='web'>{_('Web Link')}</option>
@@ -721,7 +786,7 @@ const ExportMarkdownDialog: React.FC<ExportMarkdownDialogProps> = ({
                         onChange={(e) =>
                           setExportConfig({ ...exportConfig, customTemplate: e.target.value })
                         }
-                        className='textarea textarea-bordered w-full font-mono text-xs'
+                        className='textarea w-full font-mono text-xs'
                         rows={12}
                         placeholder={defaultTemplate}
                       />
@@ -732,29 +797,29 @@ const ExportMarkdownDialog: React.FC<ExportMarkdownDialogProps> = ({
                         <p className='mb-2 font-bold'>{_('Template Syntax:')}</p>
                         <ul className='space-y-1 font-mono'>
                           <li>
-                            <code className='bg-base-300 rounded px-1'>{'{{ variable }}'}</code> -{' '}
-                            {_('Insert value')}
+                            <code className='bg-base-300 rounded-sm px-1'>{'{{ variable }}'}</code>{' '}
+                            - {_('Insert value')}
                           </li>
                           <li>
-                            <code className='bg-base-300 rounded px-1'>
+                            <code className='bg-base-300 rounded-sm px-1'>
                               {'{{ variable | date }}'}
                             </code>{' '}
                             - {_('Format date (locale)')}
                           </li>
                           <li>
-                            <code className='bg-base-300 rounded px-1'>
+                            <code className='bg-base-300 rounded-sm px-1'>
                               {"{{ variable | date('%Y-%m-%d') }}"}
                             </code>{' '}
                             - {_('Format date (custom)')}
                           </li>
                           <li>
-                            <code className='bg-base-300 rounded px-1'>
+                            <code className='bg-base-300 rounded-sm px-1'>
                               {'{% if variable %}...{% endif %}'}
                             </code>{' '}
                             - {_('Conditional')}
                           </li>
                           <li>
-                            <code className='bg-base-300 rounded px-1'>
+                            <code className='bg-base-300 rounded-sm px-1'>
                               {'{% for item in list %}...{% endfor %}'}
                             </code>{' '}
                             - {_('Loop')}
@@ -765,68 +830,74 @@ const ExportMarkdownDialog: React.FC<ExportMarkdownDialogProps> = ({
                         <p className='mb-2 font-bold'>{_('Available Variables:')}</p>
                         <ul className='space-y-1'>
                           <li>
-                            <code className='bg-base-300 rounded px-1'>title</code> -{' '}
+                            <code className='bg-base-300 rounded-sm px-1'>title</code> -{' '}
                             {_('Book title')}
                           </li>
                           <li>
-                            <code className='bg-base-300 rounded px-1'>author</code> -{' '}
+                            <code className='bg-base-300 rounded-sm px-1'>author</code> -{' '}
                             {_('Book author')}
                           </li>
                           <li>
-                            <code className='bg-base-300 rounded px-1'>exportDate</code> -{' '}
+                            <code className='bg-base-300 rounded-sm px-1'>exportDate</code> -{' '}
                             {_('Export date')}
                           </li>
                           <li>
-                            <code className='bg-base-300 rounded px-1'>coverImageUrl</code> -{' '}
+                            <code className='bg-base-300 rounded-sm px-1'>coverImageUrl</code> -{' '}
                             {_('Public cover image URL (empty if unavailable)')}
                           </li>
                           <li>
-                            <code className='bg-base-300 rounded px-1'>chapters</code> -{' '}
+                            <code className='bg-base-300 rounded-sm px-1'>chapters</code> -{' '}
                             {_('Array of chapters')}
                           </li>
                           <li className='ml-4'>
-                            <code className='bg-base-300 rounded px-1'>chapter.title</code> -{' '}
+                            <code className='bg-base-300 rounded-sm px-1'>chapter.title</code> -{' '}
                             {_('Chapter title')}
                           </li>
                           <li className='ml-4'>
-                            <code className='bg-base-300 rounded px-1'>chapter.annotations</code> -{' '}
-                            {_('Array of annotations')}
+                            <code className='bg-base-300 rounded-sm px-1'>chapter.annotations</code>{' '}
+                            - {_('Array of annotations')}
                           </li>
                           <li className='ml-8'>
-                            <code className='bg-base-300 rounded px-1'>annotation.text</code> -{' '}
+                            <code className='bg-base-300 rounded-sm px-1'>annotation.text</code> -{' '}
                             {_('Highlighted text')}
                           </li>
                           <li className='ml-8'>
-                            <code className='bg-base-300 rounded px-1'>annotation.note</code> -{' '}
+                            <code className='bg-base-300 rounded-sm px-1'>annotation.context</code>{' '}
+                            - {_('Sentence around the highlight')}
+                          </li>
+                          <li className='ml-8'>
+                            <code className='bg-base-300 rounded-sm px-1'>annotation.note</code> -{' '}
                             {_('Annotation note')}
                           </li>
                           <li className='ml-8'>
-                            <code className='bg-base-300 rounded px-1'>annotation.style</code> -{' '}
+                            <code className='bg-base-300 rounded-sm px-1'>annotation.style</code> -{' '}
                             {_('Annotation style')}: underline | highlight | squiggly
                           </li>
                           <li className='ml-8'>
-                            <code className='bg-base-300 rounded px-1'>annotation.color</code> -{' '}
+                            <code className='bg-base-300 rounded-sm px-1'>annotation.color</code> -{' '}
                             {_('Annotation color')}: yellow | red | green | blue | violet
                           </li>
                           <li className='ml-8'>
-                            <code className='bg-base-300 rounded px-1'>annotation.page</code> -{' '}
+                            <code className='bg-base-300 rounded-sm px-1'>annotation.page</code> -{' '}
                             {_('Annotation page number')}
                           </li>
                           <li className='ml-8'>
-                            <code className='bg-base-300 rounded px-1'>annotation.timestamp</code> -{' '}
-                            {_('Annotation time')}
+                            <code className='bg-base-300 rounded-sm px-1'>
+                              annotation.timestamp
+                            </code>{' '}
+                            - {_('Annotation time')}
                           </li>
                           <li className='ml-8'>
-                            <code className='bg-base-300 rounded px-1'>annotation.link</code> -{' '}
+                            <code className='bg-base-300 rounded-sm px-1'>annotation.link</code> -{' '}
                             {_('Annotation link (follows the selected Link Type)')}
                           </li>
                           <li className='ml-8'>
-                            <code className='bg-base-300 rounded px-1'>annotation.appLink</code> -{' '}
-                            {_('App deeplink (readest://)')}
+                            <code className='bg-base-300 rounded-sm px-1'>annotation.appLink</code>{' '}
+                            - {_('App deeplink (readest://)')}
                           </li>
                           <li className='ml-8'>
-                            <code className='bg-base-300 rounded px-1'>annotation.webLink</code> -{' '}
-                            {_('Universal web link (https://)')}
+                            <code className='bg-base-300 rounded-sm px-1'>annotation.webLink</code>{' '}
+                            - {_('Universal web link (https://)')}
                           </li>
                         </ul>
                       </div>
@@ -834,52 +905,56 @@ const ExportMarkdownDialog: React.FC<ExportMarkdownDialogProps> = ({
                         <p className='mb-2 font-bold'>{_('Available Formatters:')}</p>
                         <ul className='space-y-1 font-mono'>
                           <li>
-                            <code className='bg-base-300 rounded px-1'>date</code> /{' '}
-                            <code className='bg-base-300 rounded px-1'>{"date('%Y-%m-%d')"}</code> -{' '}
-                            {_('Format date')}
+                            <code className='bg-base-300 rounded-sm px-1'>date</code> /{' '}
+                            <code className='bg-base-300 rounded-sm px-1'>
+                              {"date('%Y-%m-%d')"}
+                            </code>{' '}
+                            - {_('Format date')}
                           </li>
                           <li>
-                            <code className='bg-base-300 rounded px-1'>blockquote</code> -{' '}
+                            <code className='bg-base-300 rounded-sm px-1'>blockquote</code> -{' '}
                             {_('Markdown block quote (> per line)')}
                           </li>
                           <li>
-                            <code className='bg-base-300 rounded px-1'>nl2br</code> -{' '}
+                            <code className='bg-base-300 rounded-sm px-1'>nl2br</code> -{' '}
                             {_('Newlines to <br>')}
                           </li>
                           <li>
-                            <code className='bg-base-300 rounded px-1'>upper</code> /{' '}
-                            <code className='bg-base-300 rounded px-1'>lower</code> /{' '}
-                            <code className='bg-base-300 rounded px-1'>capitalize</code> /{' '}
-                            <code className='bg-base-300 rounded px-1'>title</code> -{' '}
+                            <code className='bg-base-300 rounded-sm px-1'>upper</code> /{' '}
+                            <code className='bg-base-300 rounded-sm px-1'>lower</code> /{' '}
+                            <code className='bg-base-300 rounded-sm px-1'>capitalize</code> /{' '}
+                            <code className='bg-base-300 rounded-sm px-1'>title</code> -{' '}
                             {_('Change case')}
                           </li>
                           <li>
-                            <code className='bg-base-300 rounded px-1'>trim</code> -{' '}
+                            <code className='bg-base-300 rounded-sm px-1'>trim</code> -{' '}
                             {_('Trim whitespace')}
                           </li>
                           <li>
-                            <code className='bg-base-300 rounded px-1'>truncate(n)</code> -{' '}
+                            <code className='bg-base-300 rounded-sm px-1'>truncate(n)</code> -{' '}
                             {_('Truncate to n characters')}
                           </li>
                           <li>
-                            <code className='bg-base-300 rounded px-1'>{"replace('a', 'b')"}</code>{' '}
+                            <code className='bg-base-300 rounded-sm px-1'>
+                              {"replace('a', 'b')"}
+                            </code>{' '}
                             - {_('Replace text')}
                           </li>
                           <li>
-                            <code className='bg-base-300 rounded px-1'>default(val)</code> -{' '}
+                            <code className='bg-base-300 rounded-sm px-1'>default(val)</code> -{' '}
                             {_('Fallback value')}
                           </li>
                           <li>
-                            <code className='bg-base-300 rounded px-1'>length</code> -{' '}
+                            <code className='bg-base-300 rounded-sm px-1'>length</code> -{' '}
                             {_('Get length')}
                           </li>
                           <li>
-                            <code className='bg-base-300 rounded px-1'>first</code> /{' '}
-                            <code className='bg-base-300 rounded px-1'>last</code> -{' '}
+                            <code className='bg-base-300 rounded-sm px-1'>first</code> /{' '}
+                            <code className='bg-base-300 rounded-sm px-1'>last</code> -{' '}
                             {_('First/last element')}
                           </li>
                           <li>
-                            <code className='bg-base-300 rounded px-1'>{"join(', ')"}</code> -{' '}
+                            <code className='bg-base-300 rounded-sm px-1'>{"join(', ')"}</code> -{' '}
                             {_('Join array')}
                           </li>
                         </ul>
@@ -888,27 +963,27 @@ const ExportMarkdownDialog: React.FC<ExportMarkdownDialogProps> = ({
                         <p className='mb-2 font-bold'>{_('Date Format Tokens:')}</p>
                         <ul className='space-y-1 font-mono'>
                           <li>
-                            <code className='bg-base-300 rounded px-1'>%Y</code> -{' '}
+                            <code className='bg-base-300 rounded-sm px-1'>%Y</code> -{' '}
                             {_('Year (4 digits)')}
                           </li>
                           <li>
-                            <code className='bg-base-300 rounded px-1'>%m</code> -{' '}
+                            <code className='bg-base-300 rounded-sm px-1'>%m</code> -{' '}
                             {_('Month (01-12)')}
                           </li>
                           <li>
-                            <code className='bg-base-300 rounded px-1'>%d</code> -{' '}
+                            <code className='bg-base-300 rounded-sm px-1'>%d</code> -{' '}
                             {_('Day (01-31)')}
                           </li>
                           <li>
-                            <code className='bg-base-300 rounded px-1'>%H</code> -{' '}
+                            <code className='bg-base-300 rounded-sm px-1'>%H</code> -{' '}
                             {_('Hour (00-23)')}
                           </li>
                           <li>
-                            <code className='bg-base-300 rounded px-1'>%M</code> -{' '}
+                            <code className='bg-base-300 rounded-sm px-1'>%M</code> -{' '}
                             {_('Minute (00-59)')}
                           </li>
                           <li>
-                            <code className='bg-base-300 rounded px-1'>%S</code> -{' '}
+                            <code className='bg-base-300 rounded-sm px-1'>%S</code> -{' '}
                             {_('Second (00-59)')}
                           </li>
                         </ul>
@@ -963,17 +1038,35 @@ const ExportMarkdownDialog: React.FC<ExportMarkdownDialogProps> = ({
         </div>
 
         {/* Footer Actions */}
-        <div className='mt-4 flex items-center justify-end'>
+        {/* The native insets on Android cover only the display cutout; env()
+            also counts the navigation bar, and 16px clears rounded corners. */}
+        <div
+          className='mt-4 flex items-center justify-end'
+          style={{
+            paddingBottom: appService?.hasSafeAreaInset
+              ? 'calc(env(safe-area-inset-bottom, 0px) + 16px)'
+              : undefined,
+          }}
+        >
           <div className='flex gap-4'>
             <button onClick={onCancel} className='btn btn-ghost btn-sm'>
               {_('Cancel')}
             </button>
+            {canSaveAndShare && (
+              <button
+                onClick={(e) => handleExport(e, isMacOS)}
+                className='btn btn-ghost btn-sm eink-bordered'
+                disabled={filteredNotesCount === 0 || isLoadingContext}
+              >
+                {isMacOS ? _('Share') : _('Export')}
+              </button>
+            )}
             <button
-              onClick={handleExport}
-              className='btn btn-primary btn-sm'
-              disabled={filteredNotesCount === 0}
+              onClick={(e) => handleExport(e, !isMacOS)}
+              className='btn btn-contrast btn-sm'
+              disabled={filteredNotesCount === 0 || isLoadingContext}
             >
-              {_('Export')}
+              {isMacOS ? _('Save') : isAndroid ? _('Share') : _('Export')}
             </button>
           </div>
         </div>

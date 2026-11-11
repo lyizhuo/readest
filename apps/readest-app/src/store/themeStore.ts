@@ -15,10 +15,12 @@ import {
   resolveThemeIsDarkMode,
 } from '@/utils/ambientLight';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { CustomTheme, Palette, ThemeMode } from '@/styles/themes';
+import { CustomTheme, Palette, ThemeMode, ThemeScope } from '@/styles/themes';
 import { EnvConfigType, isWebAppPlatform } from '@/services/environment';
 import { SystemSettings } from '@/types/settings';
+import type { DuoFoldState } from '@/utils/bridge';
 import { Insets } from '@/types/misc';
+import { RecordedScreenInsets, RecordedScreenInsetsBySize } from '@/utils/insets';
 
 declare global {
   interface Window {
@@ -28,8 +30,30 @@ declare global {
 }
 
 interface ThemeState {
+  /**
+   * The theme currently painted on screen — the resolved values for
+   * `themeScope`, not raw storage. Everything that just wants to know "what
+   * does the UI look like right now" reads these (issue #5945).
+   */
   themeMode: ThemeMode;
   themeColor: string;
+  /** Which page's theme is applied. Every non-reader route is 'library'. */
+  themeScope: ThemeScope;
+  /**
+   * The reader pair, persisted under the original `themeMode`/`themeColor`
+   * keys. `getThemeCode` reads those same keys, so book content and reader
+   * overlays follow this pair without any coupling to the scope machinery.
+   */
+  readerThemeMode: ThemeMode;
+  readerThemeColor: string;
+  /**
+   * Library overrides; null means "inherit the reader pair", exactly like the
+   * undefined `libraryBackgroundTextureId` fields (#4743). Absent until the
+   * user picks a library value in Settings → Theme, so an upgrade changes
+   * nothing about how the app looks or how the quick toggles behave.
+   */
+  libraryThemeMode: ThemeMode | null;
+  libraryThemeColor: string | null;
   systemIsDarkMode: boolean;
   ambientIsDarkMode: boolean;
   themeCode: ThemeCode;
@@ -38,6 +62,19 @@ interface ThemeState {
   statusBarHeight: number;
   systemUIAlwaysHidden: boolean;
   safeAreaInsets: Insets | null;
+  // iPhone Duo: top and side insets seen with the status bar hidden, per window
+  // size; the reading page keeps them while the toolbar shows the status bar
+  // (see getReadingScreenInsets).
+  statusBarHiddenInsets: RecordedScreenInsetsBySize | null;
+  // The same while the status bar shows, for the toolbars that show with it.
+  statusBarShownInsets: RecordedScreenInsetsBySize | null;
+  // Radius (px) of the rounded bottom screen corners, 0 when unknown.
+  screenCornerRadius: number;
+  // iPhone Duo, whose vertical status strip is a large left/right inset (#6307).
+  // Every horizontal-inset rule is gated on it, so no other device changes.
+  isIPhoneDuo: boolean;
+  // iPhone Duo hinge status and folding region, null elsewhere.
+  duoFold: DuoFoldState | null;
   isRoundedWindow: boolean;
   setSystemUIAlwaysHidden: (hidden: boolean) => void;
   setStatusBarHeight: (height: number) => void;
@@ -46,6 +83,11 @@ interface ThemeState {
   getIsDarkMode: () => boolean;
   setThemeMode: (mode: ThemeMode) => void;
   setThemeColor: (color: string) => void;
+  setThemeScope: (scope: ThemeScope) => void;
+  setScopedThemeMode: (scope: ThemeScope, mode: ThemeMode) => void;
+  setScopedThemeColor: (scope: ThemeScope, color: string) => void;
+  getScopedTheme: (scope: ThemeScope) => { themeMode: ThemeMode; themeColor: string };
+  resetThemeScopes: () => void;
   updateAppTheme: (color: keyof Palette) => void;
   saveCustomTheme: (
     envConfig: EnvConfigType,
@@ -56,7 +98,30 @@ interface ThemeState {
   handleSystemThemeChange: (isDark: boolean) => void;
   handleAmbientLightChange: (lux: number) => void;
   updateSafeAreaInsets: (insets: Insets) => void;
+  recordStatusBarHiddenInsets: (insets: Insets) => void;
+  recordStatusBarShownInsets: (insets: Insets) => void;
+  updateScreenCornerRadius: (radius: number) => void;
+  setIsIPhoneDuo: (isIPhoneDuo: boolean) => void;
+  setDuoFold: (fold: DuoFoldState | null) => void;
 }
+
+// The records with this window size's set to these insets, or null when it
+// already holds them. Each size keeps its own, so turning the device back
+// finds the one taken there before.
+const recordScreenInsets = (
+  records: RecordedScreenInsetsBySize | null,
+  { top, left, right }: Insets,
+): RecordedScreenInsetsBySize | null => {
+  const width = window.innerWidth;
+  const height = window.innerHeight;
+  const key = `${width}x${height}`;
+  const prev: RecordedScreenInsets | undefined = records?.[key];
+  if (prev && prev.top === top && prev.left === left && prev.right === right) return null;
+  return { ...records, [key]: { width, height, top, left, right } };
+};
+
+const LIBRARY_THEME_MODE_KEY = 'libraryThemeMode';
+const LIBRARY_THEME_COLOR_KEY = 'libraryThemeColor';
 
 const getInitialThemeMode = (): ThemeMode => {
   if (typeof window !== 'undefined' && localStorage) {
@@ -72,6 +137,21 @@ const getInitialThemeColor = (): string => {
     return localStorage.getItem('themeColor') || defaultColor;
   }
   return 'default';
+};
+
+const getInitialLibraryThemeMode = (): ThemeMode | null => {
+  if (typeof window !== 'undefined' && localStorage) {
+    const stored = localStorage.getItem(LIBRARY_THEME_MODE_KEY);
+    if (isValidThemeMode(stored)) return stored;
+  }
+  return null;
+};
+
+const getInitialLibraryThemeColor = (): string | null => {
+  if (typeof window !== 'undefined' && localStorage) {
+    return localStorage.getItem(LIBRARY_THEME_COLOR_KEY) || null;
+  }
+  return null;
 };
 
 const getInitialAmbientIsDarkMode = (systemIsDarkMode: boolean): boolean => {
@@ -92,6 +172,36 @@ const applyDataTheme = (themeColor: string, isDarkMode: boolean) => {
     'data-theme',
     `${themeColor}-${isDarkMode ? 'dark' : 'light'}`,
   );
+};
+
+/**
+ * Resolve one scope's pair from the raw stored values. The reader pair is the
+ * base; the library falls back to it per field, so a user who only overrides
+ * the mode keeps following the reader's color.
+ */
+const resolveScopedTheme = (
+  scope: ThemeScope,
+  raw: Pick<
+    ThemeState,
+    'readerThemeMode' | 'readerThemeColor' | 'libraryThemeMode' | 'libraryThemeColor'
+  >,
+): { themeMode: ThemeMode; themeColor: string } => {
+  if (scope === 'reader') {
+    return { themeMode: raw.readerThemeMode, themeColor: raw.readerThemeColor };
+  }
+  return {
+    themeMode: raw.libraryThemeMode ?? raw.readerThemeMode,
+    themeColor: raw.libraryThemeColor ?? raw.readerThemeColor,
+  };
+};
+
+/**
+ * The reader owns `/reader`; everything else (library, settings, OPDS, player,
+ * auth) shares the library scope so no route paints a third look.
+ */
+export const getThemeScopeForPath = (pathname?: string): ThemeScope => {
+  const path = pathname ?? (typeof window !== 'undefined' ? window.location.pathname : '');
+  return path.startsWith('/reader') ? 'reader' : 'library';
 };
 
 let ambientLightListener: PluginListener | null = null;
@@ -156,15 +266,63 @@ const syncAmbientLightSubscription = (mode: ThemeMode) => {
 export const useThemeStore = create<ThemeState>((set, get) => {
   const initialThemeMode = getInitialThemeMode();
   const initialThemeColor = getInitialThemeColor();
+  const initialLibraryThemeMode = getInitialLibraryThemeMode();
+  const initialLibraryThemeColor = getInitialLibraryThemeColor();
   const systemIsDarkMode =
     typeof window !== 'undefined' && window.matchMedia('(prefers-color-scheme: dark)').matches;
   const ambientIsDarkMode = getInitialAmbientIsDarkMode(systemIsDarkMode);
-  const isDarkMode = resolveThemeIsDarkMode(initialThemeMode, systemIsDarkMode, ambientIsDarkMode);
+  const initialScope = getThemeScopeForPath();
+  const initialEffective = resolveScopedTheme(initialScope, {
+    readerThemeMode: initialThemeMode,
+    readerThemeColor: initialThemeColor,
+    libraryThemeMode: initialLibraryThemeMode,
+    libraryThemeColor: initialLibraryThemeColor,
+  });
+  const isDarkMode = resolveThemeIsDarkMode(
+    initialEffective.themeMode,
+    systemIsDarkMode,
+    ambientIsDarkMode,
+  );
   const themeCode = getThemeCode();
 
+  /**
+   * Recompute the active scope's pair after a change and paint it. Writes that
+   * land on the scope the user is NOT looking at resolve to the same effective
+   * values, so this is a no-op repaint for them — which is what keeps editing
+   * the library theme from repainting an open book (the rule the background
+   * texture scope already follows, #4743).
+   *
+   * `refreshThemeCode` is set only when the reader pair or the system/ambient
+   * flags moved. `themeCode` feeds the CSS injected into the book iframe, and
+   * handing it a fresh object identity re-runs the reader's style effects.
+   */
+  const applyActiveScope = (patch: Partial<ThemeState>, refreshThemeCode: boolean) => {
+    const next = { ...get(), ...patch };
+    const effective = resolveScopedTheme(next.themeScope, next);
+    const nextIsDarkMode = resolveThemeIsDarkMode(
+      effective.themeMode,
+      next.systemIsDarkMode,
+      next.ambientIsDarkMode,
+    );
+    applyDataTheme(effective.themeColor, nextIsDarkMode);
+    set({
+      ...patch,
+      themeMode: effective.themeMode,
+      themeColor: effective.themeColor,
+      isDarkMode: nextIsDarkMode,
+      ...(refreshThemeCode ? { themeCode: getThemeCode() } : {}),
+    });
+    return effective.themeMode;
+  };
+
   return {
-    themeMode: initialThemeMode,
-    themeColor: initialThemeColor,
+    themeMode: initialEffective.themeMode,
+    themeColor: initialEffective.themeColor,
+    themeScope: initialScope,
+    readerThemeMode: initialThemeMode,
+    readerThemeColor: initialThemeColor,
+    libraryThemeMode: initialLibraryThemeMode,
+    libraryThemeColor: initialLibraryThemeColor,
     systemIsDarkMode,
     ambientIsDarkMode,
     isDarkMode,
@@ -173,33 +331,80 @@ export const useThemeStore = create<ThemeState>((set, get) => {
     statusBarHeight: 24,
     systemUIAlwaysHidden: false,
     safeAreaInsets: { top: 0, right: 0, bottom: 0, left: 0 },
+    statusBarHiddenInsets: null,
+    statusBarShownInsets: null,
+    screenCornerRadius: 0,
+    isIPhoneDuo: false,
+    duoFold: null,
     isRoundedWindow: true,
     showSystemUI: () => set({ systemUIVisible: true }),
     dismissSystemUI: () => set({ systemUIVisible: false }),
     setStatusBarHeight: (height: number) => set({ statusBarHeight: height }),
     setSystemUIAlwaysHidden: (hidden: boolean) => set({ systemUIAlwaysHidden: hidden }),
     getIsDarkMode: () => get().isDarkMode,
-    setThemeMode: (mode) => {
-      if (typeof window !== 'undefined' && localStorage) {
-        localStorage.setItem('themeMode', mode);
-      }
-      const isDarkMode = resolveThemeIsDarkMode(
-        mode,
-        get().systemIsDarkMode,
-        get().ambientIsDarkMode,
-      );
-      applyDataTheme(get().themeColor, isDarkMode);
-      set({ themeMode: mode, isDarkMode });
-      set({ themeCode: getThemeCode() });
+    getScopedTheme: (scope) => resolveScopedTheme(scope, get()),
+    setThemeScope: (scope) => {
+      if (get().themeScope === scope) return;
+      const mode = applyActiveScope({ themeScope: scope }, false);
       syncAmbientLightSubscription(mode);
     },
+    // The quick toggles (library settings menu, reader view menu, reader color
+    // panel, command palette) route through here. While the library is still
+    // inheriting, a toggle from either page writes the shared reader pair so
+    // both pages move together exactly as they did before #5945 — only an
+    // explicit library edit in Settings → Theme decouples the two.
+    setThemeMode: (mode) => {
+      const { themeScope, libraryThemeMode } = get();
+      const target: ThemeScope =
+        themeScope === 'library' && libraryThemeMode !== null ? 'library' : 'reader';
+      get().setScopedThemeMode(target, mode);
+    },
     setThemeColor: (color) => {
+      const { themeScope, libraryThemeColor } = get();
+      const target: ThemeScope =
+        themeScope === 'library' && libraryThemeColor !== null ? 'library' : 'reader';
+      get().setScopedThemeColor(target, color);
+    },
+    setScopedThemeMode: (scope, mode) => {
+      const isReader = scope === 'reader';
       if (typeof window !== 'undefined' && localStorage) {
-        localStorage.setItem('themeColor', color);
+        localStorage.setItem(isReader ? 'themeMode' : LIBRARY_THEME_MODE_KEY, mode);
       }
-      applyDataTheme(color, get().isDarkMode);
-      set({ themeColor: color });
-      set({ themeCode: getThemeCode() });
+      const activeMode = applyActiveScope(
+        isReader ? { readerThemeMode: mode } : { libraryThemeMode: mode },
+        isReader,
+      );
+      syncAmbientLightSubscription(activeMode);
+    },
+    setScopedThemeColor: (scope, color) => {
+      const isReader = scope === 'reader';
+      if (typeof window !== 'undefined' && localStorage) {
+        localStorage.setItem(isReader ? 'themeColor' : LIBRARY_THEME_COLOR_KEY, color);
+      }
+      applyActiveScope(
+        isReader ? { readerThemeColor: color } : { libraryThemeColor: color },
+        isReader,
+      );
+    },
+    // "Reset to defaults" has to drop the library override too, otherwise a
+    // decoupled library keeps its old look and the reset looks broken.
+    resetThemeScopes: () => {
+      if (typeof window !== 'undefined' && localStorage) {
+        localStorage.setItem('themeMode', 'auto');
+        localStorage.setItem('themeColor', 'default');
+        localStorage.removeItem(LIBRARY_THEME_MODE_KEY);
+        localStorage.removeItem(LIBRARY_THEME_COLOR_KEY);
+      }
+      const activeMode = applyActiveScope(
+        {
+          readerThemeMode: 'auto',
+          readerThemeColor: 'default',
+          libraryThemeMode: null,
+          libraryThemeColor: null,
+        },
+        true,
+      );
+      syncAmbientLightSubscription(activeMode);
     },
     updateAppTheme: (color) => {
       if (isWebAppPlatform()) {
@@ -227,11 +432,7 @@ export const useThemeStore = create<ThemeState>((set, get) => {
       await appService.saveSettings(settings);
     },
     handleSystemThemeChange: (systemIsDarkMode) => {
-      const mode = get().themeMode;
-      const isDarkMode = resolveThemeIsDarkMode(mode, systemIsDarkMode, get().ambientIsDarkMode);
-      applyDataTheme(get().themeColor, isDarkMode);
-      set({ systemIsDarkMode, isDarkMode });
-      set({ themeCode: getThemeCode() });
+      applyActiveScope({ systemIsDarkMode }, true);
     },
     handleAmbientLightChange: (lux) => {
       if (get().themeMode !== 'ambient') return;
@@ -242,28 +443,63 @@ export const useThemeStore = create<ThemeState>((set, get) => {
         return;
       }
       persistAmbientIsDarkMode(nextAmbientIsDark);
-      applyDataTheme(get().themeColor, nextAmbientIsDark);
-      set({ ambientIsDarkMode: nextAmbientIsDark, isDarkMode: nextAmbientIsDark });
-      set({ themeCode: getThemeCode() });
+      applyActiveScope({ ambientIsDarkMode: nextAmbientIsDark }, true);
     },
     updateSafeAreaInsets: (insets) => {
       set({ safeAreaInsets: insets });
     },
+    recordStatusBarHiddenInsets: (insets) => {
+      const record = recordScreenInsets(get().statusBarHiddenInsets, insets);
+      if (record) set({ statusBarHiddenInsets: record });
+    },
+    recordStatusBarShownInsets: (insets) => {
+      const record = recordScreenInsets(get().statusBarShownInsets, insets);
+      if (record) set({ statusBarShownInsets: record });
+    },
+    updateScreenCornerRadius: (radius) => {
+      if (get().screenCornerRadius !== radius) set({ screenCornerRadius: radius });
+    },
+    setIsIPhoneDuo: (isIPhoneDuo) => {
+      if (get().isIPhoneDuo !== isIPhoneDuo) set({ isIPhoneDuo });
+    },
+    setDuoFold: (fold) => {
+      // Refetched on every resize and focus: keep the reference while nothing
+      // changed so the reader does not re-lay out the page.
+      if (JSON.stringify(get().duoFold) !== JSON.stringify(fold)) set({ duoFold: fold });
+    },
   };
 });
 
-export const loadDataTheme = () => {
+export const loadDataTheme = (scope: ThemeScope = getThemeScopeForPath()) => {
   if (typeof localStorage === 'undefined' || typeof document === 'undefined') return;
 
   const themeMode = localStorage.getItem('themeMode');
   const themeColor = localStorage.getItem('themeColor');
-  if (themeMode && themeColor) {
-    const systemIsDarkMode = window.matchMedia('(prefers-color-scheme: dark)').matches;
-    const ambientIsDarkMode = getInitialAmbientIsDarkMode(systemIsDarkMode);
-    const mode = isValidThemeMode(themeMode) ? themeMode : 'auto';
-    const isDarkMode = resolveThemeIsDarkMode(mode, systemIsDarkMode, ambientIsDarkMode);
-    applyDataTheme(themeColor, isDarkMode);
-  }
+  const libraryThemeMode = getInitialLibraryThemeMode();
+  const libraryThemeColor = getInitialLibraryThemeColor();
+  // Nothing configured at all: leave the attribute alone and let useTheme
+  // paint the default. A library-only override still counts as configured —
+  // decoupling the library writes only its own key, so a user who never
+  // touched the reader theme has no reader keys to gate on, and checking
+  // those alone would skip the early paint in exactly that case.
+  if (!(themeMode && themeColor) && !libraryThemeMode && !libraryThemeColor) return;
+
+  const systemIsDarkMode = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  const ambientIsDarkMode = getInitialAmbientIsDarkMode(systemIsDarkMode);
+  const effective = resolveScopedTheme(scope, {
+    // Via the same helpers the store initializes from, so an absent reader key
+    // resolves to the implicit default rather than a null in the attribute.
+    readerThemeMode: getInitialThemeMode(),
+    readerThemeColor: getInitialThemeColor(),
+    libraryThemeMode,
+    libraryThemeColor,
+  });
+  const isDarkMode = resolveThemeIsDarkMode(
+    effective.themeMode,
+    systemIsDarkMode,
+    ambientIsDarkMode,
+  );
+  applyDataTheme(effective.themeColor, isDarkMode);
 };
 
 export const initSystemThemeListener = (appService: AppService) => {

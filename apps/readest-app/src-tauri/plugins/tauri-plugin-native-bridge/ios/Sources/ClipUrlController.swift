@@ -21,6 +21,7 @@ class ClipUrlArgs: Decodable {
   // Interactive mode: show the page with a Cancel/Capture bar instead of
   // the opaque overlay so the user can sign in before capturing.
   let interactive: Bool?
+  let backgroundCapture: Bool?
   let signInHint: String?
   let captureLabel: String?
   let cancelLabel: String?
@@ -60,11 +61,10 @@ enum ClipUrlError: Error {
 
 /// Full-screen view controller that loads `options.url` in a WKWebView,
 /// shows a deliberate "Saving…" overlay over the article render so the
-/// user sees expected progress (not a website flashing by), and once
-/// `webView(_:didFinish:)` fires + a 3 s settle window passes — long
-/// enough for in-flight lazy-loaders / Cloudflare-style JS challenges
-/// to resolve — captures `document.documentElement.outerHTML` and
-/// hands it back via the completion handler.
+/// user sees expected progress (not a website flashing by), then waits
+/// for rendered text after `webView(_:didFinish:)` + a 3 s settle window.
+/// Captures `document.documentElement.outerHTML` within the load budget
+/// and hands it back via the completion handler.
 ///
 /// Mirrors the desktop `clip_url` flow shape: same Chrome UA, same
 /// fingerprint mask, same overlay (rendered via Swift here instead of
@@ -91,9 +91,11 @@ final class ClipUrlController: UIViewController, WKNavigationDelegate {
 
   private var webView: WKWebView!
   private var overlayView: UIView!
-  private var statusLabel: UILabel!
+  private var statusLabel: UILabel?
   private var didFinishOrFail = false
   private var captureFired = false
+  private var completed = false
+  private var contentWaitEnded = false
   private var timeoutWorkItem: DispatchWorkItem?
 
   init(args: ClipUrlArgs, completion: @escaping (Result<String, ClipUrlError>) -> Void) {
@@ -123,7 +125,7 @@ final class ClipUrlController: UIViewController, WKNavigationDelegate {
       setUpWebView(below: bar)
     } else {
       setUpWebView(below: nil)
-      setUpOverlay()
+      if args.backgroundCapture != true { setUpOverlay() }
     }
     startCapture()
   }
@@ -288,6 +290,21 @@ final class ClipUrlController: UIViewController, WKNavigationDelegate {
       status.leadingAnchor.constraint(greaterThanOrEqualTo: overlay.leadingAnchor, constant: 24),
       status.trailingAnchor.constraint(lessThanOrEqualTo: overlay.trailingAnchor, constant: -24),
     ])
+    let cancel = UIButton(type: .system)
+    cancel.setTitle(args.resolvedCancelLabel, for: .normal)
+    cancel.setTitleColor(fg, for: .normal)
+    cancel.addTarget(self, action: #selector(cancelTapped), for: .touchUpInside)
+    cancel.translatesAutoresizingMaskIntoConstraints = false
+    cancel.layer.borderWidth = 1
+    cancel.layer.borderColor = fg.cgColor
+    cancel.layer.cornerRadius = 6
+    overlay.addSubview(cancel)
+    NSLayoutConstraint.activate([
+      cancel.widthAnchor.constraint(greaterThanOrEqualToConstant: 96),
+      cancel.topAnchor.constraint(equalTo: status.bottomAnchor, constant: 16),
+      cancel.centerXAnchor.constraint(equalTo: overlay.centerXAnchor),
+      cancel.heightAnchor.constraint(greaterThanOrEqualToConstant: 44),
+    ])
     self.overlayView = overlay
   }
 
@@ -309,11 +326,20 @@ final class ClipUrlController: UIViewController, WKNavigationDelegate {
     // Interactive capture waits for the user's tap — no deadline.
     if interactiveMode { return }
 
-    // Hard timeout — fires even if `didFinish` never does (SPA, redirect
-    // chain, JS challenge that never resolves). Same 30 s budget as the
-    // desktop flow.
+    // Give client-rendered pages the remaining budget to produce content.
+    // At 27 s also allow short pages (including real login walls), leaving
+    // time for evaluation. Empty/loading documents still time out.
+    DispatchQueue.main.asyncAfter(
+      deadline: .now() + ClipUrlController.hardTimeoutSeconds - ClipUrlController.loadSettleSeconds
+    ) { [weak self] in
+      guard let self = self, !self.completed else { return }
+      self.contentWaitEnded = true
+      self.captureOuterHtml(requireReady: true)
+    }
+
+    // Keep the deadline active while a JavaScript evaluation is pending too.
     let work = DispatchWorkItem { [weak self] in
-      guard let self = self, !self.captureFired else { return }
+      guard let self = self, !self.completed else { return }
       clipLogger.warning("clip_url: hard timeout after \(ClipUrlController.hardTimeoutSeconds, privacy: .public)s")
       self.finish(.failure(.timedOut))
     }
@@ -328,13 +354,12 @@ final class ClipUrlController: UIViewController, WKNavigationDelegate {
     guard !interactiveMode else { return }
     guard !didFinishOrFail else { return }
     didFinishOrFail = true
-    statusLabel.text = args.resolvedCapturingStatus
-    // Settle then capture. Matches the 3 s post-load delay in the
-    // desktop init script — long enough for in-flight asset fetches
-    // and lazy-load IntersectionObservers to fire.
+    statusLabel?.text = args.resolvedCapturingStatus
+    // Navigation can finish before an SPA has rendered its article.
+    // Keep the usual settle delay, then wait for content within the budget.
     DispatchQueue.main.asyncAfter(deadline: .now() + ClipUrlController.loadSettleSeconds) {
       [weak self] in
-      self?.captureOuterHtml()
+      self?.captureOuterHtml(requireReady: true)
     }
   }
 
@@ -359,11 +384,21 @@ final class ClipUrlController: UIViewController, WKNavigationDelegate {
     finish(.failure(.loadFailed(error.localizedDescription)))
   }
 
-  private func captureOuterHtml() {
-    guard !captureFired else { return }
+  private func captureOuterHtml(requireReady: Bool = false) {
+    guard !captureFired && !completed else { return }
     captureFired = true
-    webView.evaluateJavaScript("document.documentElement.outerHTML") { [weak self] result, error in
-      guard let self = self else { return }
+    // Match the converter's 400-character quality floor while waiting.
+    // Manual capture and checks after 27 s still return short login pages.
+    let minTextChars = requireReady && !contentWaitEnded ? 400 : 0
+    webView.evaluateJavaScript("(function() { if (\(requireReady) && (document.readyState === 'loading' || !document.body || !document.body.innerText.trim() || document.body.innerText.trim().length < \(minTextChars))) return null; var root = document.documentElement.cloneNode(true); root.setAttribute('data-readest-url', location.href); return root.outerHTML; })()") { [weak self] result, error in
+      guard let self = self, !self.completed else { return }
+      if requireReady && error == nil && !(result is String) {
+        self.captureFired = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+          self?.captureOuterHtml(requireReady: true)
+        }
+        return
+      }
       if let html = result as? String, !html.isEmpty {
         clipLogger.log("clip_url: captured \(html.count, privacy: .public) chars")
         self.finish(.success(html))
@@ -375,6 +410,8 @@ final class ClipUrlController: UIViewController, WKNavigationDelegate {
   }
 
   private func finish(_ result: Result<String, ClipUrlError>) {
+    guard !completed else { return }
+    completed = true
     timeoutWorkItem?.cancel()
     timeoutWorkItem = nil
     // Stop the WebView before dismissing — otherwise its JS keeps
@@ -383,6 +420,13 @@ final class ClipUrlController: UIViewController, WKNavigationDelegate {
     webView?.stopLoading()
     webView?.navigationDelegate = nil
 
+    if args.backgroundCapture == true && !interactiveMode {
+      willMove(toParent: nil)
+      view.removeFromSuperview()
+      removeFromParent()
+      completion(result)
+      return
+    }
     dismiss(animated: true) { [completion] in
       completion(result)
     }

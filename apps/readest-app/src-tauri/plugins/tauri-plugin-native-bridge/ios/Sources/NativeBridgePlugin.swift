@@ -7,6 +7,7 @@ import StoreKit
 import SwiftRs
 import Tauri
 import UIKit
+import UIKit.UIGestureRecognizerSubclass
 import UniformTypeIdentifiers
 import WebKit
 import os
@@ -61,8 +62,13 @@ class LockScreenOrientationRequestArgs: Decodable {
   let orientation: String?
 }
 
+class SetScreenWakeLockRequestArgs: Decodable {
+  let enabled: Bool
+}
+
 class SetScreenBrightnessRequestArgs: Decodable {
   let brightness: Float?
+  let persist: Bool?
 }
 
 class CopyUriToPathRequestArgs: Decodable {
@@ -89,6 +95,7 @@ struct FetchProductsRequest: Decodable {
 
 struct PurchaseProductRequest: Decodable {
   let productId: String
+  let appAccountToken: String?
 }
 
 struct ProductData: Codable {
@@ -342,12 +349,86 @@ class PencilGestureHandler: NSObject, UIPencilInteractionDelegate {
   }
 }
 
+// WebKit suppresses DOM touchmove AND touchend near native selection handles
+// (311216@main, iPadOS 27). Observe the UIKit stream without recognizing or
+// preventing a gesture, so the reader can dwell at an edge and cancel on release.
+private final class SelectionTouchObserver: UIGestureRecognizer {
+  private weak var webView: WKWebView?
+  private var trackedTouch: UITouch?
+  private var lastMoveTime: TimeInterval = 0
+
+  init(webView: WKWebView) {
+    self.webView = webView
+    super.init(target: nil, action: nil)
+    cancelsTouchesInView = false
+    delaysTouchesBegan = false
+    delaysTouchesEnded = false
+    allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+  }
+
+  override func canPrevent(_ preventedGestureRecognizer: UIGestureRecognizer) -> Bool { false }
+  override func canBePrevented(by preventingGestureRecognizer: UIGestureRecognizer) -> Bool {
+    false
+  }
+
+  override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+    // A second finger is a pinch, not a selection-handle drag.
+    guard trackedTouch == nil, touches.count == 1, let touch = touches.first else {
+      if let touch = trackedTouch { forward("touchcancel", touch: touch) }
+      state = .failed
+      return
+    }
+    trackedTouch = touch
+    lastMoveTime = 0
+    forward("touchstart", touch: touch)
+  }
+
+  override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
+    guard let touch = trackedTouch, touches.contains(touch) else { return }
+    // Match Android's ~10/s bridge rate; start/end/cancel are never throttled.
+    guard touch.timestamp - lastMoveTime >= 0.1 else { return }
+    lastMoveTime = touch.timestamp
+    forward("touchmove", touch: touch)
+  }
+
+  override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
+    guard let touch = trackedTouch, touches.contains(touch) else { return }
+    forward("touchend", touch: touch)
+    state = .failed
+  }
+
+  override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
+    if let touch = trackedTouch { forward("touchcancel", touch: touch) }
+    state = .failed
+  }
+
+  override func reset() {
+    trackedTouch = nil
+    super.reset()
+  }
+
+  private func forward(_ type: String, touch: UITouch) {
+    guard let webView = webView else { return }
+    let point = touch.location(in: webView)
+    // The shared native-touch contract uses device pixels, not UIKit points.
+    let scale = webView.window?.screen.scale ?? UIScreen.main.scale
+    webView.evaluateJavaScript(
+      """
+      window.onNativeTouch?.({type: '\(type)', pointerId: 0,
+        x: \(point.x * scale), y: \(point.y * scale), pressure: \(touch.force),
+        pointerCount: 1, timestamp: \(touch.timestamp * 1000)});
+      """, completionHandler: nil)
+  }
+}
+
 class WebViewLifecycleManager: NSObject {
   private weak var webView: WKWebView?
   private var originalNavigationDelegate: WKNavigationDelegate?
   private var isMonitoring = false
   private var lastBackgroundTime: Date?
   private var backgroundTimeThreshold: TimeInterval = 180.0
+  /// Called when the page is lost or replaced by a new document.
+  var onDocumentChange: (() -> Void)?
 
   func startMonitoring(webView: WKWebView) {
     self.webView = webView
@@ -475,6 +556,7 @@ extension WebViewLifecycleManager: WKNavigationDelegate {
 
   func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
     logger.error("WebViewLifecycleManager: WebContent process TERMINATED!️")
+    onDocumentChange?()
     recoverWebView(webView, reason: "process_terminated")
 
     if let original = originalNavigationDelegate,
@@ -535,6 +617,7 @@ extension WebViewLifecycleManager: WKNavigationDelegate {
   }
 
   func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+    onDocumentChange?()
     if let original = originalNavigationDelegate,
       original.responds(to: #selector(webView(_:didCommit:)))
     {
@@ -569,12 +652,23 @@ extension WebViewLifecycleManager: WKNavigationDelegate {
 
 class NativeBridgePlugin: Plugin {
   private var webView: WKWebView?
+  // Native cover for the two-column page curl (#6106): a snapshot view of a
+  // region, placed as a sibling above the webview so `capture_webview_region`
+  // (which renders the webview's own layer tree) does not see it while the
+  // user keeps seeing the frozen pixels. Tokens keep a stale uncover from an
+  // interrupted turn from removing the next turn's cover.
+  private var turnCoverView: UIView?
+  private var turnCoverToken: Int = 0
+  private var nativePaper: NativePaperTurn?
   private var authSession: ASWebAuthenticationSession?
   private var currentOrientationMask: UIInterfaceOrientationMask = .all
   private var originalDelegate: UIApplicationDelegate?
   private var webViewLifecycleManager: WebViewLifecycleManager?
   private var pencilGestureHandler: PencilGestureHandler?
   private var traitChangeRegistered = false
+  // The in-app browser currently presented by `open_web_browser` (#5775);
+  // `set_web_browser_status` pushes import results into its banner.
+  private weak var activeWebBrowser: WebBrowserController?
 
   // Screen-brightness management. `UIScreen.main.brightness` is a *global*
   // device setting, not a per-window one: once the app writes to it, iOS
@@ -582,7 +676,9 @@ class NativeBridgePlugin: Plugin {
   // leaving the system stuck at the app's level until the user nudges it
   // manually (issue #4885). We remember the value that was there before the
   // first override so we can hand it back whenever the app leaves the
-  // foreground; on return the system value stands and the override is dropped.
+  // foreground; on return the override is re-applied over the fresh system
+  // value. A `persist` write (System Screen Brightness mode) is not an override:
+  // it becomes the system brightness and is never handed back (#6374).
   private var appDesiredBrightness: CGFloat?
   private var systemBrightnessBeforeOverride: CGFloat?
 
@@ -593,6 +689,7 @@ class NativeBridgePlugin: Plugin {
     // Suppress the iOS system text-selection edit menu so it never
     // covers Readest's annotation toolbar. See ContextMenuSuppressor.
     ContextMenuSuppressor.installIfNeeded()
+    webview.addGestureRecognizer(SelectionTouchObserver(webView: webview))
 
     // Register a WKScriptMessageHandler so JS can signal when its
     // share-extension hook has mounted. On `{type: 'ready'}` we run a
@@ -604,6 +701,7 @@ class NativeBridgePlugin: Plugin {
 
     webViewLifecycleManager = WebViewLifecycleManager()
     webViewLifecycleManager?.startMonitoring(webView: webview)
+    webViewLifecycleManager?.onDocumentChange = { [weak self] in self?.nativePaper?.reset() }
     logger.log("NativeBridgePlugin: WebView lifecycle monitoring activated")
 
     // Forward Apple Pencil double-tap / squeeze gestures as native keys for
@@ -613,6 +711,29 @@ class NativeBridgePlugin: Plugin {
     let pencilInteraction = UIPencilInteraction()
     pencilInteraction.delegate = pencilHandler
     webview.addInteraction(pencilInteraction)
+
+    // iPhone Duo: folding the inner display part way changes the folding
+    // region without resizing the web view, so tell JS to refetch it.
+    #if canImport(UIKit, _version: 9127.0.85)  // iOS 27.1 SDK: the hinge API
+    if NativeBridgePlugin.isIPhoneDuo, #available(iOS 27.1, *) {
+      let hingeInteraction = UIHingeInteraction { [weak self] _, update in
+        guard let self else { return }
+        let status = NativeBridgePlugin.hingeStatusName(update.hinge?.status)
+        let statusChanged = status != self.lastHingeStatus
+        self.lastHingeStatus = status
+        // The folding region can change with the angle inside one status, so
+        // forward those too, at most every 250ms plus one trailing update.
+        if statusChanged || Date().timeIntervalSince(self.lastHingeEvent) >= 0.25 {
+          self.sendHingeEvent()
+        } else if self.pendingHingeEvent == nil {
+          let event = DispatchWorkItem { [weak self] in self?.sendHingeEvent() }
+          self.pendingHingeEvent = event
+          DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: event)
+        }
+      }
+      webview.addInteraction(hingeInteraction)
+    }
+    #endif
 
     // The WKWebView never fires the `prefers-color-scheme` media query
     // `change` event while the app stays foregrounded, so observe the
@@ -671,10 +792,13 @@ class NativeBridgePlugin: Plugin {
   }
 
   @objc func appDidBecomeActive() {
-    // The system owns brightness across a background trip: drop our override and
-    // keep whatever brightness the system shows now.
-    appDesiredBrightness = nil
-    systemBrightnessBeforeOverride = nil
+    // Re-capture the system value (the user may have changed it in Control
+    // Center) and re-apply the override. Control Center only resigns active and
+    // never fires `visibilitychange`, so JS can't re-apply it here (#6374).
+    if let desired = appDesiredBrightness {
+      systemBrightnessBeforeOverride = UIScreen.main.brightness
+      UIScreen.main.brightness = desired
+    }
     if volumeKeyHandler != nil {
       activateVolumeKeyInterception()
     }
@@ -740,6 +864,8 @@ class NativeBridgePlugin: Plugin {
           "groupId": save.groupId,
           "groupName": save.groupName,
           "htmlFile": save.htmlFile,
+          "textFile": save.textFile,
+          "title": save.title,
           "addedAt": save.addedAt,
         ]
       }
@@ -969,21 +1095,61 @@ class NativeBridgePlugin: Plugin {
     let darkMode = args.darkMode
 
     DispatchQueue.main.async {
-      UIApplication.shared.setStatusBarHidden(!visible, with: .none)
-
-      let windows = UIApplication.shared.connectedScenes
-        .compactMap { $0 as? UIWindowScene }
-        .flatMap { $0.windows }
-
-      let keyWindow = windows.first(where: { $0.isKeyWindow }) ?? windows.first
-      if let keyWindow = keyWindow {
-        keyWindow.overrideUserInterfaceStyle = darkMode ? .dark : .light
-        keyWindow.layoutIfNeeded()
-      } else {
+      guard let keyWindow = self.appWindow() else {
         logger.error("No key window found")
+        invoke.resolve(["success": false, "error": "No key window found"])
+        return
+      }
+      keyWindow.overrideUserInterfaceStyle = darkMode ? .dark : .light
+      let before = keyWindow.safeAreaInsets
+      // Apps built with the iOS 27 SDK can no longer hide the status bar with
+      // UIApplication.setStatusBarHidden (SDK 26 builds still can), so hide it
+      // through the root view controller. tao's TaoUIViewController implements
+      // prefersStatusBarHidden and setPrefersStatusBarHidden:, which calls
+      // setNeedsStatusBarAppearanceUpdate. Needs
+      // UIViewControllerBasedStatusBarAppearance = YES in Info.plist.
+      let applied = self.setPrefersStatusBarHidden(!visible, on: keyWindow.rootViewController)
+      keyWindow.layoutIfNeeded()
+      // The safe area follows the status bar a moment later (iPhone Duo's side
+      // strip is an 84pt inset on the inner display). Resolve once it has, so
+      // a follow-up get_safe_area_insets reads the insets for the new state.
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+        let after = keyWindow.safeAreaInsets
+        logger.log(
+          "set_system_ui_visibility visible=\(visible) insets before=\(NSCoder.string(for: before), privacy: .public) after=\(NSCoder.string(for: after), privacy: .public)"
+        )
+        if applied {
+          invoke.resolve(["success": true])
+        } else {
+          invoke.resolve(["success": false, "error": "Root view controller cannot hide the status bar"])
+        }
       }
     }
-    invoke.resolve(["success": true])
+  }
+
+  /// The window that hosts the webview. It exists even before tao's window has
+  /// a UIWindowScene (a CarPlay-first launch), so prefer it over the scene
+  /// lookup, which is the fallback.
+  private func appWindow() -> UIWindow? {
+    if let window = webView?.window { return window }
+    let windows = UIApplication.shared.connectedScenes
+      .compactMap { $0 as? UIWindowScene }
+      .flatMap { $0.windows }
+    return windows.first(where: { $0.isKeyWindow }) ?? windows.first
+  }
+
+  /// Returns false when the view controller does not respond to tao's
+  /// `setPrefersStatusBarHidden:`, so the caller can report the failure.
+  private func setPrefersStatusBarHidden(_ hidden: Bool, on viewController: UIViewController?) -> Bool {
+    let selector = NSSelectorFromString("setPrefersStatusBarHidden:")
+    guard let viewController = viewController, viewController.responds(to: selector) else {
+      logger.error("Root view controller cannot hide the status bar: \(String(describing: viewController))")
+      return false
+    }
+    typealias Setter = @convention(c) (AnyObject, Selector, Bool) -> Void
+    let setter = unsafeBitCast(viewController.method(for: selector), to: Setter.self)
+    setter(viewController, selector, hidden)
+    return true
   }
 
   @objc public func get_sys_fonts_list(_ invoke: Invoke) throws {
@@ -1082,6 +1248,10 @@ class NativeBridgePlugin: Plugin {
             rootVC.setNeedsUpdateOfSupportedInterfaceOrientations()
           }
         }
+        // Release any iOS 26 lock first so it can't block this request.
+        if #available(iOS 26.0, *) {
+          OrientationLock.apply(.all, in: windowScene)
+        }
         if orientationMask == .all {
           windowScene.requestGeometryUpdate(.iOS(interfaceOrientations: .all)) { error in
             logger.error("Orientation update error: \(error.localizedDescription)")
@@ -1092,6 +1262,14 @@ class NativeBridgePlugin: Plugin {
         } else {
           windowScene.requestGeometryUpdate(.iOS(interfaceOrientations: orientationMask)) { error in
             logger.error("Orientation update error: \(error.localizedDescription)")
+            // Resizable scenes refuse the request; lock through the iOS 26
+            // preference instead, unless the reader has picked again since.
+            if #available(iOS 26.0, *) {
+              DispatchQueue.main.async {
+                guard self.currentOrientationMask == orientationMask else { return }
+                OrientationLock.apply(orientationMask, in: windowScene)
+              }
+            }
           }
         }
       }
@@ -1163,7 +1341,9 @@ class NativeBridgePlugin: Plugin {
           return
         }
 
-        StoreKitManager.shared.purchase(product: product) { result in
+        StoreKitManager.shared.purchase(
+          product: product, appAccountToken: args.appAccountToken
+        ) { result in
           switch result {
           case .success(let txn):
             let purchase = PurchaseData(
@@ -1209,6 +1389,16 @@ class NativeBridgePlugin: Plugin {
     }
   }
 
+  @objc public func set_screen_wake_lock(_ invoke: Invoke) {
+    guard let args = try? invoke.parseArgs(SetScreenWakeLockRequestArgs.self) else {
+      return invoke.reject("Failed to parse arguments")
+    }
+    DispatchQueue.main.async {
+      UIApplication.shared.isIdleTimerDisabled = args.enabled
+      invoke.resolve()
+    }
+  }
+
   @objc public func get_screen_brightness(_ invoke: Invoke) {
     let brightness = UIScreen.main.brightness
     invoke.resolve(["brightness": brightness])
@@ -1232,6 +1422,10 @@ class NativeBridgePlugin: Plugin {
         // Android's BRIGHTNESS_OVERRIDE_NONE. Restore the pre-override brightness
         // so iOS resumes ambient auto-brightness.
         self.releaseBrightnessControl()
+      } else if args.persist == true {
+        self.appDesiredBrightness = nil
+        self.systemBrightnessBeforeOverride = nil
+        UIScreen.main.brightness = CGFloat(brightness)
       } else {
         if self.systemBrightnessBeforeOverride == nil {
           self.systemBrightnessBeforeOverride = UIScreen.main.brightness
@@ -1340,16 +1534,101 @@ class NativeBridgePlugin: Plugin {
     }
   }
 
+  // The viewport size cannot identify the device, and UIKit's hinge API is
+  // only in the iOS 27.1 SDK, so iPhone Duo is recognized by its model.
+  private static let iPhoneDuoModelIdentifiers: Set<String> = ["iPhone19,4"]
+
+  private static let isIPhoneDuo: Bool = {
+    let identifier: String
+    if let simulated = ProcessInfo.processInfo.environment["SIMULATOR_MODEL_IDENTIFIER"] {
+      identifier = simulated
+    } else {
+      var systemInfo = utsname()
+      uname(&systemInfo)
+      identifier = withUnsafePointer(to: &systemInfo.machine) {
+        $0.withMemoryRebound(to: CChar.self, capacity: 1) { String(cString: $0) }
+      }
+    }
+    return iPhoneDuoModelIdentifiers.contains(identifier)
+  }()
+
+  #if canImport(UIKit, _version: 9127.0.85)
+  @available(iOS 27.1, *)
+  private static func hingeStatusName(_ status: UIHinge.Status?) -> String {
+    switch status {
+    case .closed: return "closed"
+    case .partiallyOpen: return "partial"
+    case .fullyOpen: return "open"
+    default: return "unknown"
+    }
+  }
+  #endif
+
+  private var lastHingeStatus = "unknown"
+  private var lastHingeEvent = Date.distantPast
+  // The trailing update, cancelled when an update is sent before it runs.
+  private var pendingHingeEvent: DispatchWorkItem?
+
+  private func sendHingeEvent() {
+    pendingHingeEvent?.cancel()
+    pendingHingeEvent = nil
+    lastHingeEvent = Date()
+    trigger("duo-fold-changed", data: ["status": lastHingeStatus])
+  }
+
+  // The iPhone Duo folding region in window points (CSS px in the full-window
+  // web view), or nil off the Duo, before iOS 27.1, or on the cover display.
+  // Inactive regions are reported too, so the page knows where the crease
+  // is while the display is flat.
+  private func foldState(in window: UIWindow) -> [String: Any]? {
+    #if canImport(UIKit, _version: 9127.0.85)
+    guard NativeBridgePlugin.isIPhoneDuo, #available(iOS 27.1, *) else { return nil }
+    let regions = window.reservedRegions(kind: .division, options: .includeInactive)
+    guard let region = regions.first(where: { $0.isActive }) ?? regions.first else {
+      return ["status": lastHingeStatus]
+    }
+    return [
+      "status": lastHingeStatus,
+      "regionActive": region.isActive,
+      "region": [
+        "x": region.frame.origin.x,
+        "y": region.frame.origin.y,
+        "width": region.frame.size.width,
+        "height": region.frame.size.height
+      ]
+    ]
+    #else
+    return nil
+    #endif
+  }
+
   @objc public func get_safe_area_insets(_ invoke: Invoke) {
     DispatchQueue.main.async {
-      if let window = UIApplication.shared.windows.first {
+      if let window = self.appWindow() {
         let insets = window.safeAreaInsets
-        invoke.resolve([
+        // Rounded screen corners are not part of the safe area; report the
+        // bottom radius so the reader footer can keep clear of the curve. The
+        // window's own effective radius is 0, but a window-sized child with a
+        // container-concentric configuration resolves to the display radius.
+        var bottomCornerRadius: CGFloat = 0
+        if #available(iOS 26.0, *) {
+          let probe = UIView(frame: window.bounds)
+          probe.cornerConfiguration = .corners(radius: .containerConcentric())
+          window.addSubview(probe)
+          bottomCornerRadius = probe.effectiveRadius(corner: [.bottomLeft, .bottomRight])
+          probe.removeFromSuperview()
+        }
+        var response: [String: Any] = [
           "top": insets.top,
           "left": insets.left,
           "bottom": insets.bottom,
-          "right": insets.right
-        ])
+          "right": insets.right,
+          "bottomCornerRadius": bottomCornerRadius,
+          "isIPhoneDuo": NativeBridgePlugin.isIPhoneDuo,
+          "statusBarHidden": window.rootViewController?.prefersStatusBarHidden ?? false
+        ]
+        if let fold = self.foldState(in: window) { response["fold"] = fold }
+        invoke.resolve(response)
       } else {
         invoke.resolve([
           "error": "No window found",
@@ -1571,9 +1850,22 @@ class NativeBridgePlugin: Plugin {
       // dictionary glance. On iOS 15+ we use a half-detent sheet
       // presentation: medium height by default, but the user can
       // drag-to-expand to full if they want more room. iPad keeps
-      // the form sheet (a native floating panel) since half-screen
-      // sheets look out of place on tablet-class screens.
-      if UIDevice.current.userInterfaceIdiom == .pad {
+      // the compact form sheet unless the user opts into full screen.
+      var lookupVC: UIViewController = dictVC
+      if args.fullScreen == true {
+        // The dictionary's view is transparent, and presenting it directly
+        // full-screen can lose its light appearance on iPadOS. Keep it in
+        // the window hierarchy with an opaque, theme-aware container.
+        let container = UIViewController()
+        container.modalPresentationStyle = .overFullScreen
+        container.view.backgroundColor = .systemBackground
+        container.addChild(dictVC)
+        dictVC.view.frame = container.view.bounds
+        dictVC.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        container.view.addSubview(dictVC.view)
+        dictVC.didMove(toParent: container)
+        lookupVC = container
+      } else if UIDevice.current.userInterfaceIdiom == .pad {
         dictVC.modalPresentationStyle = .formSheet
       } else if #available(iOS 15.0, *) {
         dictVC.modalPresentationStyle = .pageSheet
@@ -1594,7 +1886,7 @@ class NativeBridgePlugin: Plugin {
         // the full screen.
         dictVC.modalPresentationStyle = .formSheet
       }
-      presenter.present(dictVC, animated: true) {
+      presenter.present(lookupVC, animated: true) {
         invoke.resolve(["success": true])
       }
     }
@@ -1632,14 +1924,127 @@ class NativeBridgePlugin: Plugin {
           invoke.reject(err.message)
         }
       }
+      if args.backgroundCapture == true && args.interactive != true {
+        presenter.addChild(controller)
+        controller.view.frame = presenter.view.bounds
+        controller.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        controller.view.isUserInteractionEnabled = false
+        controller.view.accessibilityElementsHidden = true
+        presenter.view.insertSubview(controller.view, at: 0)
+        controller.didMove(toParent: presenter)
+      } else {
+        presenter.present(controller, animated: true)
+      }
+    }
+  }
+
+  /// Present the in-app browser (#5775). Resolves `{ openBookHash? }` when
+  /// the user closes it; downloads are forwarded as `web-browser-download`
+  /// plugin events while it is open. See `WebBrowserController.swift`.
+  @objc public func open_web_browser(_ invoke: Invoke) {
+    let args: WebBrowserArgs
+    do {
+      args = try invoke.parseArgs(WebBrowserArgs.self)
+    } catch {
+      invoke.reject(error.localizedDescription)
+      return
+    }
+    guard let url = URL(string: args.url), let scheme = url.scheme?.lowercased(),
+      scheme == "http" || scheme == "https"
+    else {
+      invoke.reject("Invalid URL")
+      return
+    }
+    DispatchQueue.main.async {
+      guard let presenter = topmostViewController() else {
+        invoke.reject("Could not find a view controller to present from")
+        return
+      }
+      let controller = WebBrowserController(args: args)
+      controller.onDownload = { [weak self] event in
+        var data: JSObject = [
+          "url": event.url, "path": event.path, "filename": event.filename,
+          "success": event.success,
+        ]
+        if let error = event.error { data["error"] = error }
+        self?.trigger("web-browser-download", data: data)
+      }
+      controller.onFinish = { [weak self] hash, page, image in
+        self?.activeWebBrowser = nil
+        var ret = JSObject()
+        if let hash = hash { ret["openBookHash"] = hash }
+        if let page = page { ret["page"] = ["url": page.url, "html": page.html] }
+        if let image = image { ret["image"] = ["url": image.url, "pageUrl": image.pageUrl] }
+        invoke.resolve(ret)
+      }
+      self.activeWebBrowser = controller
       presenter.present(controller, animated: true)
     }
   }
 
-  /// Read + delete a page-HTML file the Share Extension captured from
-  /// the user's signed-in Safari tab (App Group `SharedClips/`). Resolves
-  /// `{ html }`, or `{}` when the file is missing/unreadable — the JS
-  /// caller falls back to the `clip_url` re-fetch.
+  /// Native-only exchange; session cookies never reach the frontend.
+  @objc public func web_browser_cookies(_ invoke: Invoke) {
+    struct Args: Decodable { let url: String; let setCookies: [String] }
+    let args: Args
+    do { args = try invoke.parseArgs(Args.self) }
+    catch { invoke.reject(error.localizedDescription); return }
+    guard let url = URL(string: args.url), let host = url.host,
+      url.scheme == "https" || url.scheme == "http" else { invoke.reject("Invalid URL"); return }
+    func matchesDomain(_ domain: String) -> Bool {
+      if domain.hasPrefix(".") {
+        return host == String(domain.dropFirst()) || host.hasSuffix(domain)
+      }
+      return domain == host
+    }
+    DispatchQueue.main.async {
+      let store = WKWebsiteDataStore.default().httpCookieStore
+      let group = DispatchGroup()
+      for header in args.setCookies {
+        for cookie in HTTPCookie.cookies(withResponseHeaderFields: ["Set-Cookie": header], for: url) where matchesDomain(cookie.domain) {
+          group.enter()
+          store.setCookie(cookie) { group.leave() }
+        }
+      }
+      group.notify(queue: .main) {
+        store.getAllCookies { cookies in
+          let matching = cookies.filter { cookie in
+            let path = cookie.path
+            let requestPath = url.path.isEmpty ? "/" : url.path
+            return matchesDomain(cookie.domain) && (!cookie.isSecure || url.scheme == "https")
+              && (cookie.expiresDate == nil || cookie.expiresDate! > Date())
+              && (requestPath == path || (requestPath.hasPrefix(path) && (path.hasSuffix("/") || requestPath.dropFirst(path.count).hasPrefix("/"))))
+          }.sorted { $0.path.count > $1.path.count }
+          invoke.resolve(["cookies": matching.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")])
+        }
+      }
+    }
+  }
+
+  /// Push an import status (importing / added / failed / unsupported) into
+  /// the open browser's banner. No-op when no browser is presented.
+  @objc public func set_web_browser_status(_ invoke: Invoke) {
+    let args: WebBrowserStatusArgs
+    do {
+      args = try invoke.parseArgs(WebBrowserStatusArgs.self)
+    } catch {
+      invoke.reject(error.localizedDescription)
+      return
+    }
+    DispatchQueue.main.async {
+      self.activeWebBrowser?.setStatus(
+        state: args.state, filename: args.filename, bookHash: args.bookHash)
+    }
+    // Acknowledge off the main queue, as `NativeBridgePlugin.kt` does. Resolving
+    // from inside the hop deadlocks any caller that is itself on the main thread
+    // (`run_mobile_plugin` blocks it), which the iOS watchdog kills after 10s.
+    invoke.resolve()
+  }
+
+  /// Read + delete a file the Share Extension wrote to App Group
+  /// `SharedClips/`: page HTML captured from the user's signed-in Safari
+  /// tab, or shared text. Resolves `{ html }` with the file's text, or `{}`
+  /// when the file is missing/unreadable — for HTML the JS caller falls
+  /// back to the `clip_url` re-fetch.
   @objc public func read_share_clip_html(_ invoke: Invoke) {
     let args: ReadShareClipHtmlArgs
     do {
@@ -1781,16 +2186,30 @@ class NativeBridgePlugin: Plugin {
     invoke.resolve(["success": false])
   }
 
-  @objc public func update_reading_widget(_ invoke: Invoke) {
+  // iOS has no e-ink panel to drive, so the deep refresh is never supported.
+  @objc public func is_eink_refresh_supported(_ invoke: Invoke) {
+    invoke.resolve(["supported": false])
+  }
+
+  @objc public func update_bookshelf_widget(_ invoke: Invoke) {
     guard let args = try? invoke.parseArgs(UpdateReadingWidgetRequestArgs.self) else {
       return invoke.reject("Failed to parse arguments")
     }
+    // The iOS widget shows books only; group tiles are an Android feature.
+    let books = args.items.compactMap { item -> UpdateReadingWidgetBookArgs? in
+      guard item.type == "book", let hash = item.hash, let coverPath = item.coverPath else {
+        return nil
+      }
+      return UpdateReadingWidgetBookArgs(
+        hash: hash, title: item.title ?? "", author: item.author ?? "",
+        percent: item.percent ?? 0, coverPath: coverPath)
+    }
     DispatchQueue.global(qos: .utility).async {
-      for book in args.books {
+      for book in books {
         ReadingWidgetWriter.writeThumbnail(hash: book.hash, sourcePath: book.coverPath)
       }
       let snapshot = ReadingWidgetWriter.Snapshot(
-        books: args.books.map {
+        books: books.map {
           .init(hash: $0.hash, title: $0.title, author: $0.author, percent: $0.percent)
         },
         sectionTitle: args.sectionTitle,
@@ -1799,6 +2218,17 @@ class NativeBridgePlugin: Plugin {
       ReadingWidgetWriter.write(snapshot: snapshot)
       invoke.resolve()
     }
+  }
+
+  // iOS has no per-instance configurable widget yet (one default snapshot,
+  // written above); these two resolve as no-ops so a caller gets a clean
+  // empty result instead of a bridge "unknown command" failure.
+  @objc public func get_bookshelf_widget_instances(_ invoke: Invoke) {
+    invoke.resolve(["instances": [] as [Any]])
+  }
+
+  @objc public func set_bookshelf_widget_catalog(_ invoke: Invoke) {
+    invoke.resolve()
   }
 
   /// Snapshot a region of the webview for the mesh page-curl texture
@@ -1839,6 +2269,73 @@ class NativeBridgePlugin: Plugin {
           invoke.resolve(["data": data.base64EncodedString()])
         }
       }
+    }
+  }
+
+  /// Freeze the on-screen pixels of a region of the webview (CSS px of the
+  /// JS viewport) behind a snapshot of what is currently presented there,
+  /// for the two-column page curl (#6106). The snapshot view is a sibling
+  /// above the webview: `takeSnapshot` renders the webview's own layer tree,
+  /// so the JS side can expose the incoming column underneath, capture it
+  /// with `capture_webview_region`, and restore its overlay — all while the
+  /// user still sees the frozen old pixels. Resolves a token for
+  /// `uncover_webview_region`.
+  @objc public func cover_webview_region(_ invoke: Invoke) {
+    guard let args = try? invoke.parseArgs(CaptureWebviewRegionArgs.self) else {
+      return invoke.reject("Failed to parse arguments")
+    }
+    DispatchQueue.main.async { [weak self] in
+      guard let self, let webView = self.webView, let container = webView.superview else {
+        return invoke.reject("WebView not available")
+      }
+      let rect = CGRect(x: args.x, y: args.y, width: args.width, height: args.height)
+      guard
+        let cover = webView.resizableSnapshotView(
+          from: rect, afterScreenUpdates: false, withCapInsets: .zero)
+      else {
+        return invoke.reject("Snapshot view unavailable")
+      }
+      self.turnCoverView?.removeFromSuperview()
+      cover.frame = webView.convert(rect, to: container)
+      cover.isUserInteractionEnabled = false
+      container.addSubview(cover)
+      self.turnCoverToken += 1
+      self.turnCoverView = cover
+      invoke.resolve(["token": self.turnCoverToken])
+    }
+  }
+
+  /// Native paper curl; see NativePaperTurn. Only page identities, gesture
+  /// data and acknowledgements cross this command, never page pixels.
+  @objc public func paper_curl(_ invoke: Invoke) {
+    guard let args = try? invoke.parseArgs(NativePaperArgs.self) else {
+      return invoke.reject("Failed to parse arguments")
+    }
+    DispatchQueue.main.async { [weak self] in
+      guard let self, let webView = self.webView else {
+        return invoke.reject("WebView not available")
+      }
+      let paper = self.nativePaper ?? NativePaperTurn(webView: webView)
+      self.nativePaper = paper
+      paper.command(args) { result, error in
+        if let error { invoke.reject(error) } else { invoke.resolve(result ?? [:]) }
+      }
+    }
+  }
+
+  /// Remove the cover put up by `cover_webview_region`. A token from an
+  /// earlier, already replaced cover is ignored.
+  @objc public func uncover_webview_region(_ invoke: Invoke) {
+    guard let args = try? invoke.parseArgs(UncoverWebviewRegionArgs.self) else {
+      return invoke.reject("Failed to parse arguments")
+    }
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return invoke.resolve() }
+      if args.token == self.turnCoverToken {
+        self.turnCoverView?.removeFromSuperview()
+        self.turnCoverView = nil
+      }
+      invoke.resolve()
     }
   }
 }
@@ -2068,6 +2565,7 @@ class SecureItemGetArgs: Decodable {
 
 class ShowLookupPopoverArgs: Decodable {
   let word: String
+  let fullScreen: Bool?
 }
 
 struct UpdateReadingWidgetBookArgs: Decodable {
@@ -2077,8 +2575,18 @@ struct UpdateReadingWidgetBookArgs: Decodable {
   let percent: Int
   let coverPath: String
 }
+// One grid tile from JS: a "book" carries the book fields, a "group" other
+// fields this platform ignores.
+struct UpdateReadingWidgetItemArgs: Decodable {
+  let type: String
+  let hash: String?
+  let title: String?
+  let author: String?
+  let percent: Int?
+  let coverPath: String?
+}
 struct UpdateReadingWidgetRequestArgs: Decodable {
-  let books: [UpdateReadingWidgetBookArgs]
+  let items: [UpdateReadingWidgetItemArgs]
   let sectionTitle: String
   let emptyTitle: String
 }
@@ -2088,6 +2596,10 @@ struct CaptureWebviewRegionArgs: Decodable {
   let y: Double
   let width: Double
   let height: Double
+}
+
+struct UncoverWebviewRegionArgs: Decodable {
+  let token: Int
 }
 
 @_cdecl("init_plugin_native_bridge")

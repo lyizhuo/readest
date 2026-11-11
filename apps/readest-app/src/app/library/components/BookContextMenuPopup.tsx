@@ -89,11 +89,11 @@ const BookContextMenuPopup: React.FC<BookContextMenuPopupProps> = ({
       <Overlay onDismiss={onClose} className='z-0' />
       <div
         ref={menuRef}
-        className={clsx('absolute z-[1] w-max', !placement && 'invisible')}
+        className={clsx('no-context-menu absolute z-[1] w-max', !placement && 'invisible')}
         style={{ left: placement?.left ?? 0, top: placement?.top ?? 0 }}
       >
         <Menu
-          className='dropdown-content no-triangle bg-base-100 rounded-box !relative z-[1] !mt-0 p-2 shadow'
+          className='dropdown-content no-triangle bg-base-100 rounded-box relative! z-[1] mt-0! p-2 shadow-sm'
           onCancel={onClose}
         >
           {items.map(({ text, action }) => (

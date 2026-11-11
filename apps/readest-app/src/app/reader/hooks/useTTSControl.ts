@@ -4,6 +4,8 @@ import { useAuth } from '@/context/AuthContext';
 import { useThemeStore } from '@/store/themeStore';
 import { useBookDataStore } from '@/store/bookDataStore';
 import { useReaderStore } from '@/store/readerStore';
+import { getEnabledCustomTTSServices } from '@/store/customTTSStore';
+import { useSettingsStore } from '@/store/settingsStore';
 import { useBookProgress } from '@/store/readerProgressStore';
 import { useProofreadStore } from '@/store/proofreadStore';
 import { TransformContext } from '@/services/transformers/types';
@@ -16,21 +18,26 @@ import {
   TTSVoicesGroup,
 } from '@/services/tts';
 import { DEFAULT_SENTENCE_GAP_SEC } from '@/services/tts/EdgeTTSClient';
-import { DEFAULT_PARAGRAPH_GAP_SEC } from '@/services/tts/TTSController';
+import { DEFAULT_PARAGRAPH_GAP_SEC, TTSLoopState } from '@/services/tts/TTSController';
+import { scaleGapForRate } from '@/services/tts/gap';
 import { eventDispatcher } from '@/utils/event';
 import { genSSMLRaw, parseSSMLLang } from '@/utils/ssml';
 import { throttle } from '@/utils/throttle';
 import { isCfiInLocation } from '@/utils/cfi';
 import { getLocale } from '@/utils/misc';
+import { getPDFSpeechLang } from '@/utils/lang';
 import { estimateTTSTime } from '@/utils/ttsTime';
 import { pageBreakFraction } from '@/utils/ttsPageFollow';
 import { getTextSubRange, rangeTextExcludingInert } from '@/services/tts/wordHighlight';
 import { releaseUnblockAudio, ttsMediaBridge, unblockAudio } from '@/services/tts/ttsMediaBridge';
+import { ttsDownloadManager } from '@/services/tts/ttsDownloadManager';
 import {
+  asTTSController,
   getBookHashFromKey,
   ttsSessionManager,
   TTS_STOP_AT_CHAPTER_END,
 } from '@/services/tts/TTSSessionManager';
+import { getAnnotationOverlayColor } from '../utils/annotatorUtil';
 
 interface UseTTSControlProps {
   bookKey: string;
@@ -42,9 +49,29 @@ interface UseTTSControlProps {
 // coarse enough to cost nothing next to the audio clock it reads.
 const PAGE_FOLLOW_INTERVAL_MS = 200;
 
+// Cadence of the buffering probe. Fast enough that a spinner appears with the
+// stall rather than after it, slow enough to cost nothing over a long session.
+const TTS_BUFFERING_POLL_MS = 400;
+
+// Following the voice turns the page and focuses the spoken text inside the
+// book's iframe, which takes the caret (and an IME composition) out of a note
+// being typed and closes its popup (#6837). The view holds still while a note
+// editor has focus; the next mark catches up once it loses focus.
+const isTypingNote = () => !!document.activeElement?.hasAttribute('data-note-editor');
+
+// Text the book hides is still read aloud: a display:none long description
+// next to a figure, or screen-reader text off the left edge. It has no box on
+// the page, and foliate settles a box-less anchor on the section start (#7153),
+// so the view holds still until the voice reaches text that is shown. Same
+// test as the rect foliate's scrollToAnchor picks.
+const isRendered = (range: Range) =>
+  Array.from(range.getClientRects()).some(
+    (r) => r.width > 0 && r.height > 0 && r.x >= 0 && r.y >= 0,
+  );
+
 export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProps) => {
   const _ = useTranslation();
-  const { appService } = useEnv();
+  const { appService, envConfig } = useEnv();
   const { user } = useAuth();
   const { isDarkMode } = useThemeStore();
   const getBookData = useBookDataStore((s) => s.getBookData);
@@ -56,9 +83,15 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
   const { getMergedRules } = useProofreadStore();
 
   const [ttsLang, setTtsLang] = useState<string>('en');
+  const [ttsSectionIndex, setTtsSectionIndex] = useState<number | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
   const [showIndicator, setShowIndicator] = useState(false);
+  // The engine has taken an utterance but no audio is out yet: synthesis,
+  // network, decode, or a recording still loading. Polled, because unlike a
+  // sentence boundary it has no event of its own — and cheap enough to poll,
+  // being two property reads whose result usually does not change.
+  const [buffering, setBuffering] = useState(false);
   const [showBackToCurrentTTSLocation, setShowBackToCurrentTTSLocation] = useState(false);
 
   const [timeoutOption, setTimeoutOption] = useState(0);
@@ -70,11 +103,31 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
   const previousSectionLabelRef = useRef<string | undefined>(undefined);
   const ttsControllerRef = useRef<TTSController | null>(null);
   const isStartingTTSRef = useRef(false);
+  // Each start takes a generation; stopping moves it on, so a start still
+  // initializing when the user turns read aloud off is cancelled (and never
+  // blocks the next start).
+  const startGenerationRef = useRef(0);
   // Last broadcast playback state, so a follower engaging mid-session can be
   // replayed the current state on demand (see handleTTSSyncRequest).
   const playbackStateRef = useRef<'playing' | 'paused' | 'stopped'>('stopped');
   const [ttsController, setTtsController] = useState<TTSController | null>(null);
   const [ttsClientsInited, setTtsClientsInitialized] = useState(false);
+  // Whether the transport steps by recording time and audiobook chapter
+  // (paired audiobook) rather than by sentence and paragraph. State, not a
+  // per-render read of the controller: an adopted session flips
+  // ttsClientsInited before its attach resolves, and the mini player would
+  // otherwise keep that first render's sentence labels.
+  const [audioTransport, setAudioTransport] = useState(false);
+  // Both flags read the active client's capabilities, which change with the
+  // voice (a book's own narrator is a voice), so they are state rather than a
+  // render-time probe: switching voices has to redraw the player.
+  const [supportsLyrics, setSupportsLyrics] = useState(false);
+  const [loopState, setLoopState] = useState<TTSLoopState>('off');
+  const syncClientCapabilities = useCallback(() => {
+    const controller = ttsControllerRef.current;
+    setAudioTransport(controller?.usesAudioTransport() ?? false);
+    setSupportsLyrics(controller?.supportsLyrics() ?? false);
+  }, []);
 
   // Broadcast playback transitions on the app-wide bus so consumers that
   // can't read the hook-local isPlaying flag (RSVP, paragraph mode) can react.
@@ -197,8 +250,7 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
           // close all funnel through this cleanup).
           ttsSessionManager.detach(bookHash);
         } else {
-          controller.shutdown();
-          ttsSessionManager.release(bookHash);
+          void ttsSessionManager.stopController(bookHash, controller, 'user');
         }
         ttsControllerRef.current = null;
       }
@@ -210,8 +262,19 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
   // by another book) must reconcile this reader's UI when it is mounted.
   useEffect(() => {
     const onSessionChanged = (e: Event) => {
-      const { reason } = (e as CustomEvent<{ reason: string }>).detail;
-      if (reason !== 'stopped' || !ttsControllerRef.current) return;
+      const { reason, session } = (
+        e as CustomEvent<{
+          reason: string;
+          session: { controller: TTSController } | null;
+        }>
+      ).detail;
+      if (
+        reason !== 'stopped' ||
+        !ttsControllerRef.current ||
+        session?.controller !== ttsControllerRef.current
+      ) {
+        return;
+      }
       ttsControllerRef.current = null;
       setTtsController(null);
       setIsPlaying(false);
@@ -246,8 +309,11 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
   useEffect(() => {
     const bookHash = getBookHashFromKey(bookKey);
     const session = ttsSessionManager.getSessionByHash(bookHash);
-    if (!session || session.controller.terminated) return;
-    if (ttsControllerRef.current === session.controller) return;
+    // TTS only: the reader adopts a live session by attaching its own view to
+    // the controller, which no other playback source has.
+    const sessionController = asTTSController(session?.controller);
+    if (!sessionController || sessionController.terminated) return;
+    if (ttsControllerRef.current === sessionController) return;
     const primaryKey = useReaderStore
       .getState()
       .bookKeys.find((k) => getBookHashFromKey(k) === bookHash);
@@ -257,10 +323,13 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
     const tryAdopt = async (): Promise<boolean> => {
       if (cancelled || isStartingTTSRef.current) return false;
       const view = getView(bookKey);
-      if (!view) return false;
+      // A remount under the same key (back from another route) still holds the
+      // previous, detached view until the new one opens: highlights drawn
+      // there never show.
+      if (!view?.isConnected) return false;
       isStartingTTSRef.current = true;
       try {
-        const controller = session.controller;
+        const controller = sessionController;
         ttsControllerRef.current = controller;
         setTtsController(controller);
         // Indicator on at adoption START so it never flickers in after the
@@ -291,6 +360,9 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
             getSectionLabel: () => getProgress(bookKey)?.sectionLabel,
           });
         }
+        controller.setSkipInlineAnnotations(
+          getViewSettings(bookKey)?.ttsSkipInlineAnnotations ?? false,
+        );
         await controller.attachView(view, {
           bookKey,
           preprocessCallback: preprocessSSMLForTTS,
@@ -298,6 +370,7 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
         });
         const speakingLang = controller.getSpeakingLang();
         if (speakingLang) setTtsLang(speakingLang);
+        syncClientCapabilities();
       } catch (err) {
         console.warn('TTS session adoption failed:', err);
       } finally {
@@ -323,10 +396,20 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
 
   // Controller event listeners (re-registered when ttsController changes)
   useEffect(() => {
-    if (!ttsController || !bookKey) return;
+    if (!ttsController || !bookKey) {
+      setTtsSectionIndex(null);
+      return;
+    }
     const handleNeedAuth = () => {
       eventDispatcher.dispatch('toast', {
         message: _('Please log in to use advanced TTS features'),
+        type: 'error',
+        timeout: 5000,
+      });
+    };
+    const handleQuotaExceeded = () => {
+      eventDispatcher.dispatch('toast', {
+        message: _('Daily TTS limit reached. Upgrade your plan or try again tomorrow.'),
         type: 'error',
         timeout: 5000,
       });
@@ -389,6 +472,7 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
         }
         const contents = currentView.renderer.getContents();
         if (contents.some(({ doc }) => (doc.getSelection()?.toString().length ?? 0) > 0)) return;
+        if (isTypingNote()) return;
 
         const progress = controller.getSentenceProgress();
         if (progress === null) {
@@ -408,7 +492,9 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
     };
 
     const handleHighlightMark = (e: Event) => {
-      const { cfi, preview } = (e as CustomEvent<{ cfi: string; preview?: boolean }>).detail;
+      const { cfi, sentenceCfi, preview } = (
+        e as CustomEvent<{ cfi: string; sentenceCfi?: string; preview?: boolean }>
+      ).detail;
       const view = getView(bookKey);
       const progress = getProgress(bookKey);
       const viewSettings = getViewSettings(bookKey);
@@ -423,6 +509,7 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
       if (!preview) {
         viewSettings.ttsLocation = cfi;
         setViewSettings(bookKey, viewSettings);
+        if (isTypingNote()) return;
       }
 
       const hlContents = view.renderer.getContents();
@@ -439,6 +526,7 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
 
       const { anchor, index: ttsSectionIndex } = view.resolveCFI(cfi);
       if (viewSectionIndex !== ttsSectionIndex) {
+        if (!preview && !followingTTSLocationRef.current) return;
         // TTS crossed into a new section before the view caught up. The
         // `await onSectionChange` path in TTSController fires renderer.goTo
         // via handleSectionChange, but the new paginator's #goTo can resolve
@@ -469,10 +557,17 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
       // The cfi may not resolve to a range in this doc (stale/cross-realm doc,
       // detached node). A null range would crash scrollToAnchor (foliate reads
       // range.startContainer) or getBoundingClientRect below (READEST-21).
-      if (!range) return;
+      if (!range || !isRendered(range)) return;
       if (!view.renderer.scrolled) {
         view.renderer.scrollToAnchor?.(range);
-        followSentenceAcrossPages(range);
+        // Page-follow measures where the page cuts the whole sounding sentence.
+        // A chapter-only pairing highlights a one-character reading dot, so
+        // follow its separate full-sentence range when the mark carries one.
+        const followRange =
+          sentenceCfi && sentenceCfi !== cfi
+            ? (view.resolveCFI(sentenceCfi).anchor(doc) ?? range)
+            : range;
+        followSentenceAcrossPages(followRange);
       } else {
         const rect = range.getBoundingClientRect();
         const { start, end, sideProp } = view.renderer;
@@ -483,7 +578,9 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
         const showFooter = viewSettings.showFooter;
         const headerScrollOverlap = showHeader ? viewSettings.marginTopPx : 0;
         const footerScrollOverlap = showFooter ? viewSettings.marginBottomPx : 0;
-        const scrollingOverlap = viewSettings.scrollingOverlap;
+        // Overlap only applies to fixed-layout scrolling (see viewPagination).
+        const scrollingOverlap =
+          view.book.rendition?.layout === 'pre-paginated' ? viewSettings.scrollingOverlap : 0;
         const outOfView =
           rangeBottom > end - footerScrollOverlap - scrollingOverlap ||
           rangeTop < start + headerScrollOverlap + scrollingOverlap;
@@ -500,7 +597,7 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
     const handleHighlightWord = (e: Event) => {
       const { cfi } = (e as CustomEvent<{ cfi: string }>).detail;
       const view = getView(bookKey);
-      if (!cfi || !view || !followingTTSLocationRef.current) return;
+      if (!cfi || !view || !followingTTSLocationRef.current || isTypingNote()) return;
 
       const hlContents = view.renderer.getContents();
       const hlPrimaryIdx = view.renderer.primaryIndex;
@@ -518,7 +615,7 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
 
       const wordRange = anchor(doc);
       const visibleRange = getProgress(bookKey)?.range as Range | undefined;
-      if (!wordRange || !visibleRange) return;
+      if (!wordRange || !visibleRange || !isRendered(wordRange)) return;
 
       try {
         const ahead = wordRange.compareBoundaryPoints(Range.END_TO_START, visibleRange) > 0;
@@ -563,18 +660,30 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
       }
     };
 
+    const handleSectionIndexChange = (e: Event) => {
+      const { sectionIndex } = (e as CustomEvent<{ sectionIndex: number }>).detail;
+      setTtsSectionIndex(sectionIndex);
+    };
+
     ttsController.addEventListener('tts-need-auth', handleNeedAuth);
+    ttsController.addEventListener('tts-quota-exceeded', handleQuotaExceeded);
     ttsController.addEventListener('tts-highlight-mark', handleHighlightMark);
     ttsController.addEventListener('tts-highlight-word', handleHighlightWord);
     ttsController.addEventListener('tts-position', handlePosition);
     ttsController.addEventListener('tts-state-change', handleStateChange);
+    ttsController.addEventListener('tts-section-change', handleSectionIndexChange);
+    // The controller may have initialized its section before this effect was
+    // registered, so hydrate from the same canonical source as the event.
+    setTtsSectionIndex(ttsController.getSectionIndex());
     return () => {
       stopPageFollow();
       ttsController.removeEventListener('tts-need-auth', handleNeedAuth);
+      ttsController.removeEventListener('tts-quota-exceeded', handleQuotaExceeded);
       ttsController.removeEventListener('tts-highlight-mark', handleHighlightMark);
       ttsController.removeEventListener('tts-highlight-word', handleHighlightWord);
       ttsController.removeEventListener('tts-position', handlePosition);
       ttsController.removeEventListener('tts-state-change', handleStateChange);
+      ttsController.removeEventListener('tts-section-change', handleSectionIndexChange);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ttsController, bookKey]);
@@ -586,6 +695,8 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
   useEffect(() => {
     const ttsController = ttsControllerRef.current;
     if (!ttsController) return;
+    // A page turn can render a section afresh, without the A-B tint.
+    ttsController.drawLoopRange();
 
     const viewSettings = getViewSettings(bookKey);
     const ttsLocation = viewSettings?.ttsLocation;
@@ -597,7 +708,14 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
     // sentence's ttsLocation (a sentence spanning a page break), so the word
     // position is the correct reference — otherwise the back-to-TTS button
     // wrongly appears after the view follows the word onto the next page.
-    const highlightCfi = ttsController.getCurrentHighlightCfi() ?? ttsLocation;
+    const highlightCfi =
+      ttsController.getCurrentPlaybackCfi() ??
+      ttsController.getCurrentHighlightCfi() ??
+      ttsLocation;
+    if (highlightCfi !== ttsLocation) {
+      viewSettings.ttsLocation = highlightCfi;
+      setViewSettings(bookKey, viewSettings);
+    }
     // ...and a sentence that straddles a page break keeps its start cfi on the
     // page behind once the view follows the voice, so a recording — which has no
     // word cfi to fall back on — needs the layout asked directly.
@@ -627,7 +745,8 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
   const handleBackToCurrentTTSLocation = () => {
     const view = getView(bookKey);
     const viewSettings = getViewSettings(bookKey);
-    const ttsLocation = viewSettings?.ttsLocation;
+    const ttsLocation =
+      ttsControllerRef.current?.getCurrentPlaybackCfi() ?? viewSettings?.ttsLocation;
     if (!view || !ttsLocation) return;
 
     const resolved = view.resolveNavigation(ttsLocation);
@@ -703,7 +822,7 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
   // Section change callback
   const handleSectionChange = useCallback(
     async (sectionIndex: number) => {
-      if (!followingTTSLocationRef.current) return;
+      if (!followingTTSLocationRef.current || isTypingNote()) return;
       const view = getView(bookKey);
       const sections = view?.book.sections;
       if (!sections || sectionIndex < 0 || sectionIndex >= sections.length) return;
@@ -718,32 +837,56 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
 
   // TTS highlight options
   const getTTSHighlightOptions = useCallback(
-    (ttsHighlightOptions: TTSHighlightOptions, isEink: boolean) => {
-      const einkBgColor = isDarkMode ? '#000000' : '#ffffff';
-      const color = isEink ? einkBgColor : ttsHighlightOptions.color;
-      return {
-        ...ttsHighlightOptions,
-        color,
-      };
-    },
+    (ttsHighlightOptions: TTSHighlightOptions, isBwEink: boolean) => ({
+      ...ttsHighlightOptions,
+      color: getAnnotationOverlayColor(ttsHighlightOptions.style, ttsHighlightOptions.color, {
+        isBwEink,
+        isDarkMode,
+      }),
+    }),
     [isDarkMode],
   );
 
   useEffect(() => {
     const ttsHighlightOptions = viewSettings?.ttsHighlightOptions;
     if (ttsControllerRef.current && ttsHighlightOptions) {
+      ttsControllerRef.current.sentenceTint = !viewSettings!.isEink;
       ttsControllerRef.current.updateHighlightOptions(
-        getTTSHighlightOptions(ttsHighlightOptions, viewSettings!.isEink),
+        getTTSHighlightOptions(
+          ttsHighlightOptions,
+          viewSettings!.isEink && !viewSettings!.isColorEink,
+        ),
       );
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [viewSettings?.ttsHighlightOptions, viewSettings?.isEink, getTTSHighlightOptions]);
+  }, [
+    viewSettings?.ttsHighlightOptions,
+    viewSettings?.isEink,
+    viewSettings?.isColorEink,
+    getTTSHighlightOptions,
+  ]);
 
   useEffect(() => {
     if (ttsControllerRef.current && viewSettings?.ttsHighlightGranularity) {
       ttsControllerRef.current.setHighlightGranularity(viewSettings.ttsHighlightGranularity);
     }
   }, [viewSettings?.ttsHighlightGranularity]);
+
+  // Keyed on the controller too, so a new or adopted session picks it up.
+  useEffect(() => {
+    if (!ttsController) return;
+    ttsController.pauseAfterSentence = viewSettings?.ttsPauseAfterSentence ?? false;
+  }, [ttsController, viewSettings?.ttsPauseAfterSentence]);
+
+  useEffect(() => {
+    setLoopState(ttsController?.loopState ?? 'off');
+  }, [ttsController]);
+
+  useEffect(() => {
+    ttsControllerRef.current?.setSkipInlineAnnotations(
+      viewSettings?.ttsSkipInlineAnnotations ?? false,
+    );
+  }, [viewSettings?.ttsSkipInlineAnnotations]);
 
   // handleStop (defined before handleTTSSpeak/handleTTSStop which reference it)
   const handleStop = useCallback(
@@ -755,6 +898,9 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
       // must never block or skip these resets if it hangs or throws, which was
       // observed with iOS system TTS (Edge TTS was unaffected). See #4676.
       ttsControllerRef.current = null;
+      // Cancels a start still initializing, and lets the next one through.
+      startGenerationRef.current++;
+      isStartingTTSRef.current = false;
       setTtsController(null);
       setIsPlaying(false);
       emitPlaybackState('stopped');
@@ -766,23 +912,14 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
       getView(bookKey)?.deselect();
       releaseUnblockAudio();
 
-      // Tear down the controller, the lock-screen media session, and the
-      // background-audio session best-effort and IN PARALLEL. The controller's
-      // own shutdown can stall on iOS system TTS, and it must NOT gate the media
-      // session / background-audio teardown — otherwise the lock-screen Now
-      // Playing keeps running after TTS is disabled (Edge TTS was unaffected
-      // because it never hits the stalling native path). See #4676.
-      await Promise.all([
-        ttsController
-          ? Promise.resolve()
-              .then(() => ttsController.shutdown())
-              .catch((error) => console.warn('TTS shutdown failed:', error))
-          : Promise.resolve(),
-        Promise.resolve()
-          .then(() => ttsMediaBridge.unbind())
-          .catch(() => {}),
-      ]);
-      ttsSessionManager.release(getBookHashFromKey(bookKey));
+      // Unbind immediately: controller shutdown can stall on iOS system TTS,
+      // but lock-screen Now Playing must still disappear at once (#4676).
+      // The manager owns the joinable teardown so deletion cannot race its
+      // still-open cache database.
+      ttsMediaBridge.unbind();
+      if (ttsController) {
+        await ttsSessionManager.stopController(getBookHashFromKey(bookKey), ttsController, 'user');
+      }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [appService],
@@ -797,6 +934,7 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
     // end up creating two TTSController instances that speak simultaneously.
     if (isStartingTTSRef.current) return;
     isStartingTTSRef.current = true;
+    const generation = ++startGenerationRef.current;
 
     try {
       const view = getView(bookKey);
@@ -838,8 +976,6 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
         }
       }
 
-      const primaryLang = bookData.book.primaryLanguage;
-
       if (ttsControllerRef.current) {
         ttsControllerRef.current.stop();
         ttsControllerRef.current = null;
@@ -859,6 +995,8 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
         // .playback/.spokenAudio). The old call set .mixWithOthers, which
         // disqualifies the app from Now Playing and fought the claim.
         setTtsClientsInitialized(false);
+        setAudioTransport(false);
+        setSupportsLyrics(false);
 
         // Show the mini player immediately, in the "playing" state: client
         // init below can take a while and the session is conceptually already
@@ -872,10 +1010,13 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
           preprocessSSMLForTTS,
           handleSectionChange,
         );
+        ttsController.setSkipInlineAnnotations(viewSettings.ttsSkipInlineAnnotations ?? false);
+        ttsController.setCustomTTSServices(getEnabledCustomTTSServices);
         // The constructor takes the view directly (attachView, which also binds
         // this, only runs on the background-session reattach path), so set the
         // book key here or the per-book audio cache never gets a hash to open.
         ttsController.bookKey = bookKey;
+        ttsController.pairedAudiobook = bookData.config?.audiobook;
         ttsControllerRef.current = ttsController;
         setTtsController(ttsController);
         ttsSessionManager.claim(bookKey, ttsController, {
@@ -904,9 +1045,31 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
         // own narration or a synthesized voice.
         ttsController.useNarration = viewSettings.ttsUseNarration ?? true;
         await ttsController.init();
+        // Turned off while the engines initialized: never touch the view a
+        // newer session may own.
+        if (startGenerationRef.current !== generation) {
+          void ttsController.shutdown();
+          return;
+        }
         await ttsController.initViewTTS(ttsFromIndex);
+        if (startGenerationRef.current !== generation) {
+          void ttsController.shutdown();
+          return;
+        }
+        const speechSection = view.renderer.getContents().find((x) => x.index === ttsFromIndex);
+        const primaryLang =
+          bookData.book.format === 'PDF'
+            ? getPDFSpeechLang(
+                bookData.book.primaryLanguage,
+                speechSection?.doc.body?.textContent || '',
+              )
+            : bookData.book.primaryLanguage;
+        ttsController.sentenceTint = !viewSettings.isEink;
         ttsController.updateHighlightOptions(
-          getTTSHighlightOptions(viewSettings.ttsHighlightOptions, viewSettings.isEink),
+          getTTSHighlightOptions(
+            viewSettings.ttsHighlightOptions,
+            viewSettings.isEink && !viewSettings.isColorEink,
+          ),
         );
         ttsController.setHighlightGranularity(viewSettings.ttsHighlightGranularity ?? 'word');
         // A recording has no audio for arbitrary text: it only exists as the
@@ -920,9 +1083,9 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
           speakSelection && !narrateSelection
             ? genSSMLRaw(ttsSpeakRange!.toString().trim())
             : narrateSelection
-              ? view.tts?.from(ttsSpeakRange!)
+              ? ttsController.startFromRange(ttsSpeakRange!)
               : ttsFromRange
-                ? view.tts?.from(ttsFromRange)
+                ? ttsController.startFromRange(ttsFromRange)
                 : view.tts?.start();
         if (ssml) {
           const lang = parseSSMLLang(ssml, primaryLang) || 'en';
@@ -944,25 +1107,34 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
           setIsPlaying(false);
         }
         setTtsClientsInitialized(true);
+        syncClientCapabilities();
         setTTSEnabled(bookKey, true);
       } catch (error) {
+        // A start the user cancelled must not touch the session after it.
+        if (startGenerationRef.current !== generation) return;
+        // The full player may already be open (it opens before init): close
+        // it with the mini player rather than leave dead controls up.
+        onRequestHidePanel?.();
         setShowIndicator(false);
         setIsPlaying(false);
         eventDispatcher.dispatch('toast', {
-          message: _('TTS not supported for this document'),
+          message: _('TTS not available for this page'),
           type: 'error',
         });
         console.error(error);
       }
     } finally {
-      isStartingTTSRef.current = false;
+      if (startGenerationRef.current === generation) isStartingTTSRef.current = false;
     }
   };
 
   const handleTTSStop = async (event: CustomEvent) => {
     const { bookKey: ttsBookKey } = event.detail;
-    if (ttsControllerRef.current && bookKey === ttsBookKey) {
-      handleStop(bookKey);
+    if (bookKey !== ttsBookKey) return;
+    if (ttsControllerRef.current) {
+      await handleStop(bookKey);
+    } else {
+      await ttsSessionManager.stopBook(getBookHashFromKey(bookKey), 'user');
     }
   };
 
@@ -1006,6 +1178,45 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
 
   const handleSupportsPlaybackInfo = useCallback(() => {
     return ttsControllerRef.current?.supportsPlaybackInfo() ?? false;
+  }, []);
+
+  // Lyric view (#5755). getLyrics builds the section's line list once per
+  // chapter; the state probe is polled, so it stays a plain read.
+  const handleGetLyrics = useCallback(async () => {
+    return (await ttsControllerRef.current?.getLyrics()) ?? null;
+  }, []);
+
+  const handleGetLyricActiveIndex = useCallback(() => {
+    return ttsControllerRef.current?.getCurrentLyricIndex() ?? -1;
+  }, []);
+
+  // Only while a session exists; an idle reader polls nothing.
+  useEffect(() => {
+    if (!showIndicator) {
+      setBuffering(false);
+      return;
+    }
+    const poll = () => {
+      // Optional call on purpose: this runs in an effect, and a purely
+      // cosmetic ring must never be able to throw the reader subtree down if a
+      // session hands back something that is not a full controller.
+      const next = ttsControllerRef.current?.isBuffering?.() ?? false;
+      setBuffering((prev) => (prev === next ? prev : next));
+    };
+    poll();
+    const interval = setInterval(poll, TTS_BUFFERING_POLL_MS);
+    return () => clearInterval(interval);
+  }, [showIndicator]);
+
+  const handleGetLyricPage = useCallback(async (index: number) => {
+    return (await ttsControllerRef.current?.getLyricPage(index)) ?? null;
+  }, []);
+
+  // The lyric play button means "read from here", so this both moves and plays.
+  const handlePlayFromLyric = useCallback(async (index: number) => {
+    const ttsController = ttsControllerRef.current;
+    if (!ttsController) return;
+    await ttsController.seekToLyric(index);
   }, []);
 
   // Stable handle for the download/chapters surface (reads the cache and
@@ -1053,6 +1264,16 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
     }
   }, []);
 
+  const handleGetLyricLoopRange = useCallback(
+    () => ttsControllerRef.current?.getLyricLoopRange() ?? null,
+    [],
+  );
+
+  const handleToggleLoop = useCallback(() => {
+    const ttsController = ttsControllerRef.current;
+    if (ttsController) setLoopState(ttsController.toggleLoopPoint());
+  }, []);
+
   const handlePause = useCallback(async () => {
     const ttsController = ttsControllerRef.current;
     if (ttsController) {
@@ -1064,6 +1285,35 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // The pauses between sentences and between paragraphs are derived from the
+  // playback rate, so every entry point that changes the rate has to re-derive
+  // them or they stay scaled for the previous one. They all funnel through
+  // handleSetRate, which makes this the single owner: scaling the gap here AND
+  // again at schedule time gave base/rate^1.6 (#5750).
+  const applyRateScaledGaps = useCallback(
+    (rate: number) => {
+      const sentenceGap = scaleGapForRate(DEFAULT_SENTENCE_GAP_SEC, rate);
+      const paragraphGap = scaleGapForRate(DEFAULT_PARAGRAPH_GAP_SEC, rate);
+      // Live: both are read at schedule time, so neither needs a restart.
+      ttsControllerRef.current?.setSentenceGap(sentenceGap);
+      ttsControllerRef.current?.setParagraphGap(paragraphGap);
+      const viewSettings = getViewSettings(bookKey);
+      if (viewSettings) {
+        viewSettings.ttsSentenceGap = sentenceGap;
+        viewSettings.ttsParagraphGap = paragraphGap;
+        setViewSettings(bookKey, viewSettings);
+      }
+      // Read the store fresh at call time: a `settings` captured at render goes
+      // stale if anything else persisted settings since this hook mounted.
+      const { settings, setSettings, saveSettings } = useSettingsStore.getState();
+      settings.globalViewSettings.ttsSentenceGap = sentenceGap;
+      settings.globalViewSettings.ttsParagraphGap = paragraphGap;
+      setSettings(settings);
+      saveSettings(envConfig, settings);
+    },
+    [bookKey, envConfig, getViewSettings, setViewSettings],
+  );
+
   // Rate/voice/timeout/bar controls
   // rate range: 0.5 - 3, 1.0 is normal speed.
   // Short throttle: live AVPlayer rate changes are cheap; the old 3s window
@@ -1072,6 +1322,11 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const handleSetRate = useCallback(
     throttle(async (rate: number) => {
+      // Before the controller check: the rate is persisted whether or not a
+      // session is running (the RSVP overlay can set it with Read Aloud
+      // stopped), so the pauses have to follow it either way or the next
+      // session starts with pauses scaled for the old rate.
+      applyRateScaledGaps(rate);
       const ttsController = ttsControllerRef.current;
       if (!ttsController) return;
       // Native MO / Edge AVPlayer can change rate without tearing down the
@@ -1095,30 +1350,24 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
     [],
   );
 
-  // Inter-sentence gap: read live at schedule time by the controller, so
-  // changing it must not stop/restart playback like handleSetRate does.
-  const handleSetSentenceGap = useCallback((sec: number) => {
-    ttsControllerRef.current?.setSentenceGap(sec);
-  }, []);
-
-  // Paragraph gap: applies to every TTS client (not Edge-only), read live by
-  // the controller when auto-advancing, so no stop/restart here either.
-  const handleSetParagraphGap = useCallback((sec: number) => {
-    ttsControllerRef.current?.setParagraphGap(sec);
-  }, []);
-
   // eslint-disable-next-line react-hooks/exhaustive-deps
+  // `resume`: read on with the new voice even though reading is stopped (a
+  // voice preview stopped it).
   const handleSetVoice = useCallback(
-    throttle(async (voice: string, lang: string) => {
+    throttle(async (voice: string, lang: string, resume?: boolean) => {
       const ttsController = ttsControllerRef.current;
       if (ttsController) {
-        if (ttsController.state === 'playing') {
+        if (ttsController.state === 'playing' || resume) {
           await ttsController.stop();
           await ttsController.setVoice(voice, lang);
           await ttsController.start();
         } else {
           await ttsController.setVoice(voice, lang);
         }
+        syncClientCapabilities();
+        // Audio is cached per voice: a running download of this book starts
+        // over with the new one instead of finishing the old voice's.
+        ttsDownloadManager.restartBook(getBookHashFromKey(bookKey));
       }
     }, 3000),
     [],
@@ -1169,6 +1418,7 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
     isPlaying,
     isPaused,
     ttsLang,
+    ttsSectionIndex,
     ttsClientsInited,
     isTTSActive: ttsController !== null,
     showIndicator,
@@ -1181,10 +1431,11 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
     handleTogglePlay,
     handleBackward,
     handleForward,
+    handleToggleLoop,
+    handleGetLyricLoopRange,
+    loopState,
     handlePause,
     handleSetRate,
-    handleSetSentenceGap,
-    handleSetParagraphGap,
     handleSetVoice,
     handleGetVoices,
     handleGetVoiceId,
@@ -1194,6 +1445,13 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
     handleSeekPreview,
     handleGetPlaybackInfo,
     handleSupportsPlaybackInfo,
+    handleGetLyrics,
+    handleGetLyricActiveIndex,
+    handleGetLyricPage,
+    handlePlayFromLyric,
+    audioTransport,
+    supportsLyrics,
+    buffering,
     refreshTtsLang,
     getController,
   };

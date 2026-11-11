@@ -54,6 +54,30 @@ describe('settingsAdapter', () => {
     expect([...SETTINGS_DICTIONARY_FIELDS].sort()).toEqual(whitelistedDictPaths.slice().sort());
   });
 
+  test('round-trips context dictionary instructions and output limits, including resets', () => {
+    for (const options of [
+      {
+        contextPromptId: 'custom',
+        contextSystemPrompt: 'Explain the era.',
+        contextMaxOutputTokens: 4096,
+      },
+      { contextPromptId: 'default', contextSystemPrompt: '', contextMaxOutputTokens: 0 },
+    ]) {
+      const fields = settingsAdapter.pack({
+        name: 'singleton',
+        patch: {
+          dictionarySettings: { providerOrder: [], providerEnabled: {}, ...options },
+        },
+      });
+      expect(fields['dictionarySettings.contextPromptId']).toBe(options.contextPromptId);
+      expect(fields['dictionarySettings.contextSystemPrompt']).toBe(options.contextSystemPrompt);
+      expect(fields['dictionarySettings.contextMaxOutputTokens']).toBe(
+        options.contextMaxOutputTokens,
+      );
+      expect(settingsAdapter.unpack(fields).patch.dictionarySettings).toMatchObject(options);
+    }
+  });
+
   test('declares no `binary` capability — bundled metadata only', () => {
     expect(settingsAdapter.binary).toBeUndefined();
   });
@@ -90,6 +114,35 @@ describe('settingsAdapter', () => {
     };
     const fields = settingsAdapter.pack(record);
     expect(fields['kosync.serverUrl']).toBe('https://kosync.example');
+  });
+
+  test('pack/unpack round-trips Notion connection fields and drops local sync state', () => {
+    const record: SettingsRemoteRecord = {
+      name: 'singleton',
+      patch: {
+        notion: {
+          enabled: true,
+          accessToken: 'notion-token',
+          databaseId: 'notion-database-id',
+          lastSyncedAt: 123,
+          includeChapterHeading: false,
+        },
+      } as Partial<SystemSettings>,
+    };
+
+    const fields = settingsAdapter.pack(record);
+    expect(fields['notion.databaseId']).toBe('notion-database-id');
+    expect(fields['notion.accessToken']).toBe('notion-token');
+    expect(fields['notion.enabled']).toBeUndefined();
+    expect(fields['notion.lastSyncedAt']).toBeUndefined();
+    expect(fields['notion.includeChapterHeading']).toBeUndefined();
+
+    const out = settingsAdapter.unpack(fields);
+    expect(out.patch.notion?.databaseId).toBe('notion-database-id');
+    expect(out.patch.notion?.accessToken).toBe('notion-token');
+    expect(out.patch.notion?.enabled).toBeUndefined();
+    expect(out.patch.notion?.lastSyncedAt).toBeUndefined();
+    expect(out.patch.notion?.includeChapterHeading).toBeUndefined();
   });
 
   test('pack ∘ unpack round-trips WebDAV connection fields, dropping per-device state', () => {
@@ -269,7 +322,7 @@ describe('settingsAdapter', () => {
     expect(settingsAdapter.encryptedFields).toContain('bookorbit.customHeaders');
   });
 
-  test('declares encryptedFields covering kosync / bookorbit / readwise / hardcover / webdav / s3 credentials only (not serverUrl / endpoint)', () => {
+  test('declares encryptedFields covering kosync / bookorbit / grimmory / readwise / hardcover / webdav / s3 credentials only (not serverUrl / endpoint)', () => {
     expect(settingsAdapter.encryptedFields).toEqual([
       'kosync.username',
       'kosync.userkey',
@@ -279,8 +332,12 @@ describe('settingsAdapter', () => {
       'bookorbit.userkey',
       'bookorbit.password',
       'bookorbit.customHeaders',
+      'grimmory.username',
+      'grimmory.password',
+      'grimmory.customHeaders',
       'readwise.accessToken',
       'hardcover.accessToken',
+      'notion.accessToken',
       'webdav.username',
       'webdav.password',
       's3.accessKeyId',
