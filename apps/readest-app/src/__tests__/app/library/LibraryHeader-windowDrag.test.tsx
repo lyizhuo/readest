@@ -3,9 +3,6 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import LibraryHeader from '@/app/library/components/LibraryHeader';
 
-// Fork: the Reading Archive header entry uses next/navigation's useRouter.
-vi.mock('next/navigation', () => ({ useRouter: () => ({ push: vi.fn() }) }));
-
 const startDragging = vi.fn().mockResolvedValue(undefined);
 
 vi.mock('@/context/EnvContext', () => ({
