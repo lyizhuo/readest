@@ -2,9 +2,14 @@
 # push to GHCR. The server deploys with `docker compose pull && up -d`.
 #
 # Fork-specific deployment file. Triggered on:
-#   - push to main (rolling `latest` + `main` tags)
-#   - push of a v* tag (immutable release tag, e.g. v1.0.0)
-#   - manual workflow_dispatch
+#   - push to main            -> `latest` + `sha-<short>`
+#   - push to feature/archive -> `archive` + `sha-<short>`
+#   - push of a v* tag        -> `<tag>` + `sha-<short>`
+#   - manual workflow_dispatch (any ref; same tag rules as a branch push)
+#
+# The server deploys the `archive` tag until the archive feature lands on main
+# (see docker/docker-compose.client.yaml); `latest` stays the upstream-shaped
+# main build.
 #
 # NEXT_PUBLIC_* build args are public-by-design values (same values the
 # browser receives); runtime overrides live in the container env on the
@@ -15,7 +20,7 @@ name: build-and-push
 
 on:
   push:
-    branches: [main]
+    branches: [main, feature/archive]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -32,6 +37,24 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 0
+
+      - name: Compute image tags
+        id: tags
+        run: |
+          set -euo pipefail
+          ref="${{ github.ref_name }}"
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            tag="$ref"
+          elif [ "$ref" = "main" ]; then
+            tag="latest"
+          elif [ "$ref" = "feature/archive" ]; then
+            tag="archive"
+          else
+            # Branch names may contain `/`, which is not a legal Docker tag.
+            tag="$(printf '%s' "$ref" | tr '/' '-')"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -60,7 +83,7 @@ jobs:
             NEXT_PUBLIC_STORAGE_FIXED_QUOTA=10737418240
             NEXT_PUBLIC_TRANSLATION_FIXED_QUOTA=1000000
           tags: |
-            ghcr.io/${{ github.repository_owner }}/readest-client:latest
-            ghcr.io/${{ github.repository_owner }}/readest-client:${{ github.ref_name }}
+            ghcr.io/${{ github.repository_owner }}/readest-client:${{ steps.tags.outputs.tag }}
+            ghcr.io/${{ github.repository_owner }}/readest-client:${{ steps.tags.outputs.sha_tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
