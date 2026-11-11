@@ -9,6 +9,9 @@ import {
 } from '@/app/library/utils/searchHistory';
 import type { LibrarySearchTarget } from '@/types/book';
 
+// Fork: the Reading Archive header entry uses next/navigation's useRouter.
+vi.mock('next/navigation', () => ({ useRouter: () => ({ push: vi.fn() }) }));
+
 vi.mock('@/context/EnvContext', () => ({ useEnv: () => ({ appService: null }) }));
 vi.mock('@/hooks/useTranslation', () => ({
   useTranslation: () => (key: string, values?: Record<string, string>) =>

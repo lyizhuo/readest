@@ -5,7 +5,6 @@ import React, { useEffect, useRef, useState } from 'react';
 import { useEnv } from '@/context/EnvContext';
 import { useSettingsStore } from '@/store/settingsStore';
 import { useTranslation } from '@/hooks/useTranslation';
-import { saveSysSettings } from '@/helpers/settings';
 import { DEFAULT_EXPORT_TEMPLATE_MD } from '@/features/archive/export/template';
 import { syncNow } from '@/features/archive/sync/archiveFileSync';
 import { ArchiveDb } from '@/features/archive/db/archiveDb';
@@ -18,8 +17,16 @@ import { SectionTitle, SettingsSwitchRow } from './primitives';
 const ArchivePanel: React.FC = () => {
   const _ = useTranslation();
   const { envConfig, appService } = useEnv();
-  const { settings, setSettings } = useSettingsStore();
+  const { settings, setSettings, saveSettings } = useSettingsStore();
   const archive = settings.archive ?? { enabled: true, dailyGoalMinutes: 60 };
+
+  // Persist through the settings store instead of helpers/settings: that helper
+  // pulls the reader/TTS graph into every SettingsDialog test.
+  const saveArchive = (patch: Partial<typeof archive>) => {
+    const next = { ...settings, archive: { ...archive, ...patch } };
+    setSettings(next);
+    void saveSettings(envConfig, next);
+  };
 
   const [enabled, setEnabled] = useState(archive.enabled);
   const [dailyGoalMinutes, setDailyGoalMinutes] = useState(archive.dailyGoalMinutes);
@@ -67,23 +74,20 @@ const ArchivePanel: React.FC = () => {
   const toggleEnabled = () => {
     const next = !enabled;
     setEnabled(next);
-    void saveSysSettings(envConfig, 'archive', { ...archive, enabled: next });
-    setSettings({ ...settings, archive: { ...archive, enabled: next } });
+    saveArchive({ enabled: next });
   };
 
   const changeGoal = (delta: number) => {
     const next = Math.min(1440, Math.max(0, dailyGoalMinutes + delta));
     if (next === dailyGoalMinutes) return;
     setDailyGoalMinutes(next);
-    void saveSysSettings(envConfig, 'archive', { ...archive, dailyGoalMinutes: next });
-    setSettings({ ...settings, archive: { ...archive, dailyGoalMinutes: next } });
+    saveArchive({ dailyGoalMinutes: next });
   };
 
   const toggleAutoSync = () => {
     const next = !autoSync;
     setAutoSync(next);
-    void saveSysSettings(envConfig, 'archive', { ...archive, autoSync: next });
-    setSettings({ ...settings, archive: { ...archive, autoSync: next } });
+    saveArchive({ autoSync: next });
   };
 
   const runSyncNow = async () => {
