@@ -1,0 +1,104 @@
+# Build the readest web client (production-stage) on a native arm64 runner and
+# push to GHCR. The server deploys with `docker compose pull && up -d`.
+#
+# Fork-specific deployment file. Triggered on:
+#   - push to main            -> `latest` + `sha-<short>`
+#   - push to feature/archive -> `archive` + `sha-<short>`
+#   - push of a v* tag        -> `<tag>` + `sha-<short>`
+#   - manual workflow_dispatch (any ref; same tag rules as a branch push)
+#
+# The server deploys `latest` from main (see docker/docker-compose.client.yaml);
+# `archive` is published for branch testing before a merge.
+#
+# Migrations: main and tag builds run the `migrate` job first, which upgrades
+# the hosted Supabase schema from docker/volumes/db/migrations before the image
+# is built. feature/archive builds skip it: they are testing tags, not the
+# deployed image.
+#
+# NEXT_PUBLIC_* build args are public-by-design values (same values the
+# browser receives); runtime overrides live in the container env on the
+# server (see docker/docker-compose.client.yaml), so changing them needs no
+# rebuild.
+
+name: build-and-push
+
+on:
+  push:
+    branches: [main, feature/archive]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  migrate:
+    # Only main and tags may touch the shared database.
+    if: github.ref_name == 'main' || github.ref_type == 'tag'
+    uses: ./.github/workflows/migrate-supabase.yml
+    secrets:
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+
+  build:
+    # Run after a successful migration; still run when migrate was skipped
+    # (feature/archive), but never when it failed or was cancelled.
+    needs: migrate
+    if: always() && (needs.migrate.result == 'success' || needs.migrate.result == 'skipped')
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Compute image tags
+        id: tags
+        run: |
+          set -euo pipefail
+          ref="${{ github.ref_name }}"
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            tag="$ref"
+          elif [ "$ref" = "main" ]; then
+            tag="latest"
+          elif [ "$ref" = "feature/archive" ]; then
+            tag="archive"
+          else
+            # Branch names may contain `/`, which is not a legal Docker tag.
+            tag="$(printf '%s' "$ref" | tr '/' '-')"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          target: production-stage
+          push: true
+          platforms: linux/arm64
+          build-args: |
+            NEXT_PUBLIC_APP_PLATFORM=web
+            NEXT_PUBLIC_SUPABASE_URL=https://fiwgjtjwpzpkuhxzvwmp.supabase.co
+            NEXT_PUBLIC_SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZpd2dqdGp3cHpwa3VoeHp2d21wIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODY3Njc4MTAsImV4cCI6MjEwMjM0MzgxMH0.pM4OK8-mgtlM3ag7wiTdfCrCAD6X76Cbom_-l4Ko6zU
+            NEXT_PUBLIC_API_BASE_URL=https://read.620602.xyz
+            NEXT_PUBLIC_OBJECT_STORAGE_TYPE=s3
+            NEXT_PUBLIC_STORAGE_FIXED_QUOTA=10737418240
+            NEXT_PUBLIC_TRANSLATION_FIXED_QUOTA=1000000
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/readest-client:${{ steps.tags.outputs.tag }}
+            ghcr.io/${{ github.repository_owner }}/readest-client:${{ steps.tags.outputs.sha_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
