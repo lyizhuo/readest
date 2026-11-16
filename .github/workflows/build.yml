@@ -7,9 +7,13 @@
 #   - push of a v* tag        -> `<tag>` + `sha-<short>`
 #   - manual workflow_dispatch (any ref; same tag rules as a branch push)
 #
-# The server deploys the `archive` tag until the archive feature lands on main
-# (see docker/docker-compose.client.yaml); `latest` stays the upstream-shaped
-# main build.
+# The server deploys `latest` from main (see docker/docker-compose.client.yaml);
+# `archive` is published for branch testing before a merge.
+#
+# Migrations: main and tag builds run the `migrate` job first, which upgrades
+# the hosted Supabase schema from docker/volumes/db/migrations before the image
+# is built. feature/archive builds skip it: they are testing tags, not the
+# deployed image.
 #
 # NEXT_PUBLIC_* build args are public-by-design values (same values the
 # browser receives); runtime overrides live in the container env on the
@@ -29,7 +33,18 @@ permissions:
   packages: write
 
 jobs:
+  migrate:
+    # Only main and tags may touch the shared database.
+    if: github.ref_name == 'main' || github.ref_type == 'tag'
+    uses: ./.github/workflows/migrate-supabase.yml
+    secrets:
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+
   build:
+    # Run after a successful migration; still run when migrate was skipped
+    # (feature/archive), but never when it failed or was cancelled.
+    needs: migrate
+    if: always() && (needs.migrate.result == 'success' || needs.migrate.result == 'skipped')
     runs-on: ubuntu-24.04-arm
     steps:
       - name: Checkout (with submodules)

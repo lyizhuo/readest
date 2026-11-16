@@ -1,0 +1,76 @@
+# Applies pending Readest schema migrations (docker/volumes/db/migrations) to
+# the hosted Supabase database.
+#
+# Called by build.yml before the image build, and runnable on its own from the
+# Actions tab when you need to upgrade the database without building an image.
+#
+# Requires the repository secret SUPABASE_DB_URL: Supabase Dashboard ->
+# Project Settings -> Database -> Connection string -> Session pooler. It is
+# the database password, not the anon/service_role key. The Session pooler is
+# IPv4; the direct db.<ref>.supabase.co host may be IPv6-only, which GitHub
+# runners do not have.
+#
+# On the first run against a database with no readest_meta.migrations ledger,
+# `baseline` marks everything up to that file as already applied. Supported
+# baselines are 018_add_metadata_updated_at.sql, 022_add_group_updated_at.sql
+# and 033_add_book_notes_crosspoint.sql. This fork's hosted database was built
+# at 018, so the default is 018_add_metadata_updated_at.sql.
+#
+# The workflow_dispatch path refuses non-main refs: a feature branch must not
+# mutate the shared production database.
+
+name: migrate-supabase
+
+on:
+  workflow_call:
+    inputs:
+      baseline:
+        description: 'Last migration already reflected in the database (used only when the ledger is empty)'
+        type: string
+        required: false
+        default: '018_add_metadata_updated_at.sql'
+    secrets:
+      SUPABASE_DB_URL:
+        required: true
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: 'Last migration already reflected in the database (used only when the ledger is empty)'
+        type: string
+        required: false
+        default: '018_add_metadata_updated_at.sql'
+
+permissions:
+  contents: read
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    # Serialize migrations: two pushes must never ALTER the same schema at once.
+    concurrency:
+      group: supabase-schema-migrations
+      cancel-in-progress: false
+    steps:
+      - name: Refuse non-main refs
+        if: github.ref_name != 'main' && github.ref_type != 'tag'
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          echo "::error::Refusing to migrate the production database from $REF. Run this workflow on main or a tag."
+          exit 1
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Ensure PostgreSQL client
+        run: |
+          if ! command -v psql >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y postgresql-client
+          fi
+
+      - name: Apply pending migrations
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          MIGRATION_BASELINE: ${{ inputs.baseline }}
+        run: bash .github/scripts/apply-migrations.sh
