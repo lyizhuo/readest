@@ -35,7 +35,7 @@ const SideBar = ({}) => {
     useSidebarStore();
   const { isSearchBarVisible, setSearchBarVisible } = useSidebarStore();
   const searchNavState = sideBarBookKey ? getSearchNavState(sideBarBookKey) : null;
-  const { searchResults = null } = searchNavState || {};
+  const { searchResults = null, searchTerm = '' } = searchNavState || {};
   const { getView, getViewSettings } = useReaderStore();
   const isMobile = window.innerWidth < 640;
   const [isFullHeightInMobile, setIsFullHeightInMobile] = useState(isMobile);
@@ -82,9 +82,19 @@ const SideBar = ({}) => {
     (data) => setIsFullHeightInMobile(data.clientY < 44),
   );
 
+  const isEink =
+    (sideBarBookKey ? getViewSettings(sideBarBookKey)?.isEink : undefined) ??
+    settings.globalViewSettings?.isEink;
+
+  useEffect(() => {
+    if (isSideBarVisible) updateAppTheme(isEink ? 'base-100' : 'base-200');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isSideBarVisible, isEink]);
+
+  // Only a visibility change resets the color: an e-ink change while hidden
+  // must not repaint over an open notebook.
   useEffect(() => {
     if (isSideBarVisible) {
-      updateAppTheme('base-200');
       overlayRef.current = document.querySelector('.overlay') as HTMLDivElement | null;
     } else {
       updateAppTheme('base-100');
@@ -128,6 +138,15 @@ const SideBar = ({}) => {
     setTimeout(() => {
       setSideBarVisible(true);
       setSearchBarVisible(true);
+      // The iframe-forwarded keydown path is consumed by the first listener
+      // whose action returns anything other than false, so the book-level
+      // shortcut's own null-term 'search-term' dispatch may never run. Emit
+      // it here as well: the event is idempotent, and SearchBar depends on it
+      // to focus and select the existing term on a repeated Ctrl+F.
+      eventDispatcher.dispatch('search-term', {
+        term: null,
+        bookKey: useSidebarStore.getState().sideBarBookKey,
+      });
     }, 100);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -168,7 +187,7 @@ const SideBar = ({}) => {
 
   const handleSearchResultClick = (cfi: string) => {
     onNavigateEvent();
-    getView(sideBarBookKey)?.goTo(cfi);
+    getView(sideBarBookKey)?.goTo(cfi, { focus: true, step: true });
   };
 
   const bookData = useBookData(sideBarBookKey);
@@ -201,7 +220,8 @@ const SideBar = ({}) => {
           viewSettings?.isEink ? 'bg-base-100' : 'bg-base-200',
           appService?.hasRoundedWindow && 'rounded-window-top-left rounded-window-bottom-left',
           isSideBarPinned ? 'z-20' : 'z-[45] shadow-2xl',
-          !isSideBarPinned && viewSettings?.isEink && 'border-base-content border-e',
+          // Physical edge: the sidebar sits on the left whatever the book's `dir`.
+          viewSettings?.isEink && 'border-base-content border-r',
         )}
         role='navigation'
         aria-label={_('Sidebar')}
@@ -285,7 +305,7 @@ const SideBar = ({}) => {
             <BookCard book={book} />
           </div>
         </div>
-        {isSearchBarVisible && !isAnnotationsTab && searchResults ? (
+        {isSearchBarVisible && !isAnnotationsTab && searchResults && searchTerm ? (
           <SearchResults
             bookKey={sideBarBookKey!}
             results={searchResults}

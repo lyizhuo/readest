@@ -1,4 +1,4 @@
-import { BookDoc } from '@/libs/document';
+import { BookDoc, TOCItem } from '@/libs/document';
 import { BookNote, BookSearchConfig, BookSearchResult } from '@/types/book';
 import { TTSGranularity } from '@/services/tts';
 import { TTS } from 'foliate-js/tts.js';
@@ -57,7 +57,11 @@ export interface Renderer extends HTMLElement {
   nextSection?: () => Promise<void>;
   prevSection?: () => Promise<void>;
   render?: () => Promise<void>;
-  goTo: (params: { index: number; anchor?: number | RangeAnchor }) => Promise<void>;
+  goTo: (params: {
+    index: number;
+    anchor?: number | RangeAnchor;
+    focus?: boolean;
+  }) => Promise<void>;
   setStyles?: (css: string) => void;
   primaryIndex: number;
   getContents: () => {
@@ -68,7 +72,8 @@ export interface Renderer extends HTMLElement {
     // absent on foliate builds older than the #133 squash (1a1cf1d).
     contentPages?: number;
   }[];
-  scrollToAnchor?: (anchor: number | Range, reason?: string, smooth?: boolean) => void;
+  scrollToAnchor?: (anchor: number | Range | Element, reason?: string, smooth?: boolean) => void;
+  focusView?: () => void;
   addEventListener: (
     type: string,
     listener: EventListener,
@@ -96,11 +101,20 @@ export interface Renderer extends HTMLElement {
   destroy: () => void;
 }
 
+// A CFI, an href, a section index, or a fraction of the book.
+type GoToTarget = string | number | { fraction: number };
+
 export interface FoliateView extends HTMLElement {
   open: (book: BookDoc) => Promise<void>;
   close: () => void;
   init: (options: { lastLocation: string }) => void;
-  goTo: (target: string | number) => void;
+  // `focus` moves focus to the destination: only for a navigation the user
+  // asked for (a TOC entry, a bookmark, a search result), never for one that
+  // runs on its own (restoring the position, sync, read aloud).
+  // `step`: one jump in a run the reader makes in a row (search results,
+  // annotations, the progress slider). A run keeps one history entry, so Back
+  // returns to where it started (see wrappedFoliateView).
+  goTo: (target: GoToTarget, options?: { focus?: boolean; step?: boolean }) => void;
   goToFraction: (fraction: number) => void;
   getSectionFractions: () => number[];
   prev: (distance?: number) => Promise<void>;
@@ -111,6 +125,11 @@ export interface FoliateView extends HTMLElement {
   goLeft: () => void;
   goRight: () => void;
   getCFI: (index: number, range?: Range) => string;
+  // The TOC entry and the book's printed page (page-list) a range is in.
+  getProgressOf: (
+    index: number,
+    range: Range,
+  ) => { tocItem?: TOCItem | null; pageItem?: TOCItem | null };
   getCFIProgress: (cfi: string) => Promise<{
     fraction: number;
     section: { current: number; total: number };
@@ -118,7 +137,7 @@ export interface FoliateView extends HTMLElement {
     time: { section: number; total: number };
   } | null>;
   resolveCFI: (cfi: string) => { index: number; anchor: RangeAnchor };
-  resolveNavigation: (cfiOrHrefOrIndex: string | number) => { index: number; anchor?: RangeAnchor };
+  resolveNavigation: (cfiOrHrefOrIndex: GoToTarget) => { index: number; anchor?: RangeAnchor };
   addAnnotation: (
     note: BookNote & { value?: string },
     remove?: boolean,
@@ -136,7 +155,7 @@ export interface FoliateView extends HTMLElement {
   tts: ViewTTS | null;
   // The most recent relocate location, set synchronously by foliate on every
   // relocate — fresher than the rAF-debounced readerStore progress.
-  lastLocation?: { cfi?: string; range?: Range | null };
+  lastLocation?: { cfi?: string; range?: Range | null; tocItem?: TOCItem | null };
   isFixedLayout: boolean;
   language: {
     locale?: LocaleWithTextInfo;
@@ -144,12 +163,13 @@ export interface FoliateView extends HTMLElement {
     canonical?: string;
     direction?: string;
   };
-  history: {
+  history: EventTarget & {
     canGoBack: boolean;
     canGoForward: boolean;
     back: () => void;
     forward: () => void;
     clear: () => void;
+    replaceState: (state: GoToTarget) => void;
   };
   renderer: Renderer;
 }
@@ -166,17 +186,60 @@ export const wrappedFoliateView = (originalView: FoliateView): FoliateView => {
   };
 
   const originalGoTo = originalView.goTo.bind(originalView);
+  // A run of steps (search hits, annotations, slider moves) moves the entry its
+  // first step pushed instead of pushing one per step, so Back returns to where
+  // reading was, not to the previous step. The run goes on only while the
+  // reader stays where its last step landed: a page turn or any other
+  // navigation starts a new one.
+  let runCfi: string | undefined;
+  let runFrom: string | undefined;
+  const stepTo = async (target: GoToTarget, focus?: boolean) => {
+    try {
+      const resolved = await originalView.resolveNavigation(target);
+      await originalView.renderer.goTo(focus ? { ...resolved, focus } : resolved);
+      originalView.history.replaceState(target);
+      return resolved;
+    } catch (e) {
+      console.error(`Could not go to ${target}`, e);
+      return undefined;
+    }
+  };
   // The FoliateView interface declares goTo as (href: string) => void, but
   // Foliate's runtime implementation returns a Promise. Returning a Promise
   // here is compatible with the void return type in TypeScript and lets callers
   // that know about the promise (e.g. tests, async handlers) await completion.
-  originalView.goTo = (target: string | number): Promise<void> => {
+  originalView.goTo = (
+    target: GoToTarget,
+    options?: { focus?: boolean; step?: boolean },
+  ): Promise<unknown> => {
     // Cross-section jumps can take seconds (the target section's images block
     // its iframe load); surface start/end so the viewer can show a spinner.
     originalView.dispatchEvent(new CustomEvent('navigate-start'));
-    return Promise.resolve(originalGoTo(target)).finally(() => {
-      originalView.dispatchEvent(new CustomEvent('navigate-end'));
-    });
+    const from = originalView.lastLocation;
+    const continues = options?.step && !!from?.cfi && from.cfi === runCfi;
+    return Promise.resolve(
+      continues ? stepTo(target, options.focus) : originalGoTo(target, options),
+    )
+      .then((resolved) => {
+        const to = originalView.lastLocation;
+        const asked = options?.focus || options?.step;
+        if (asked && from?.cfi && to?.cfi && from.cfi !== to.cfi) {
+          if (options.step && !continues) runFrom = from.tocItem?.label;
+          runCfi = options.step ? to.cfi : undefined;
+          originalView.dispatchEvent(
+            new CustomEvent('reader-jump', {
+              detail: {
+                from: options.step ? runFrom : from.tocItem?.label,
+                to: to.tocItem?.label,
+              },
+            }),
+          );
+        }
+        return resolved;
+      })
+      .finally(() => {
+        originalView.dispatchEvent(new CustomEvent('navigate-end'));
+      });
   };
 
   return originalView;

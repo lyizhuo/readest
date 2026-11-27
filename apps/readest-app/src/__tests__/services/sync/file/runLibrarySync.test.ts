@@ -20,6 +20,12 @@ const pushBookFile = vi.fn().mockResolvedValue({ uploaded: true });
 const pushBookCover = vi.fn().mockResolvedValue({ uploaded: true });
 const downloadBookFile = vi.fn().mockResolvedValue(true);
 
+const { syncFonts, downloadFont } = vi.hoisted(() => ({
+  syncFonts: vi.fn(async () => {}),
+  downloadFont: vi.fn(async () => true),
+}));
+vi.mock('@/services/sync/file/fonts', () => ({ syncFonts, downloadFont }));
+
 vi.mock('@/services/sync/file/providerRegistry', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/services/sync/file/providerRegistry')>();
   return {
@@ -66,9 +72,13 @@ import {
   getReadyFileSyncBackends,
   runFileBookDownload,
   runFileBookUpload,
+  runFileFontDownload,
   runFileLibrarySyncPass,
 } from '@/services/sync/file/runLibrarySync';
+import { useCustomFontStore } from '@/store/customFontStore';
+import { createFileSyncProvider } from '@/services/sync/file/providerRegistry';
 import type { Book } from '@/types/book';
+import type { CustomFont } from '@/styles/fonts';
 
 const makeBook = (hash: string): Book => ({
   hash,
@@ -118,6 +128,7 @@ describe('runFileLibrarySyncPass', () => {
 
   beforeEach(() => {
     syncLibrary.mockReset().mockResolvedValue(syncResult({ booksSynced: 1 }));
+    syncFonts.mockClear();
     useSettingsStore.getState().setSettings(multiProviderSettings);
     useLibraryStore.setState({ library: [makeBook('h1')], libraryLoaded: true });
     useFileSyncStore.setState({ byKind: {}, activeKind: null, lastErrorByKind: {} });
@@ -198,6 +209,31 @@ describe('runFileLibrarySyncPass', () => {
     expect(result?.booksSynced).toBe(3);
     expect(useFileSyncStore.getState().lastErrorByKind.webdav).toBe('token expired');
     expect(useFileSyncStore.getState().lastErrorByKind.gdrive).toBeNull();
+  });
+
+  test('syncs custom fonts on every backend after its library pass (#7793)', async () => {
+    await runFileLibrarySyncPass(envConfig, translationFn);
+    expect(syncFonts).toHaveBeenCalledTimes(2);
+    expect(syncFonts.mock.calls.map((call) => (call as unknown[])[2])).toEqual([
+      'silent',
+      'silent',
+    ]);
+  });
+
+  test('a failed font pass leaves the library result alone', async () => {
+    syncFonts.mockRejectedValueOnce(new Error('font upload failed'));
+    const result = await runFileLibrarySyncPass(envConfig, translationFn);
+    expect(result?.booksSynced).toBe(2);
+    expect(useFileSyncStore.getState().lastErrorByKind.webdav).toBeNull();
+  });
+
+  test('skips custom font sync on a backend whose syncFonts is false', async () => {
+    useSettingsStore.getState().setSettings({
+      ...multiProviderSettings,
+      webdav: { ...multiProviderSettings.webdav, syncFonts: false },
+    } as SystemSettings);
+    await runFileLibrarySyncPass(envConfig, translationFn);
+    expect(syncFonts).toHaveBeenCalledTimes(1);
   });
 
   test('returns null when every backend fails', async () => {
@@ -283,6 +319,73 @@ describe('runFileBookDownload', () => {
     expect(await runFileBookDownload(envConfig, book)).toBe(true);
     expect(book.downloadedAt).toBeTruthy();
     expect(book.coverDownloadedAt).toBeTruthy();
+  });
+});
+
+describe('runFileFontDownload', () => {
+  const activateFontByContentId = vi.fn(async () => {});
+  const font = {
+    id: 'b1',
+    name: 'Inter Regular',
+    contentId: 'c1',
+    bundleDir: 'b1',
+    path: 'b1/Inter-Regular.ttf',
+    unavailable: true,
+  } as CustomFont;
+
+  beforeEach(() => {
+    downloadFont.mockReset();
+    activateFontByContentId.mockClear();
+    useCustomFontStore.setState({ activateFontByContentId });
+    useSettingsStore.getState().setSettings(multiProviderSettings);
+    setCachedUserPlan('pro');
+  });
+
+  test('downloads from the first backend holding the font, then mounts it', async () => {
+    downloadFont.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    expect(await runFileFontDownload(envConfig, font)).toBe(true);
+    expect(downloadFont).toHaveBeenCalledTimes(2);
+    expect(activateFontByContentId).toHaveBeenCalledWith(envConfig, 'c1');
+  });
+
+  test('fails when no backend holds the font', async () => {
+    downloadFont.mockResolvedValue(false);
+    expect(await runFileFontDownload(envConfig, font)).toBe(false);
+    expect(activateFontByContentId).not.toHaveBeenCalled();
+  });
+
+  test('skips backends whose syncFonts is false', async () => {
+    useSettingsStore.getState().setSettings({
+      ...multiProviderSettings,
+      webdav: { ...multiProviderSettings.webdav, syncFonts: false },
+    } as SystemSettings);
+    downloadFont.mockResolvedValueOnce(true);
+    expect(await runFileFontDownload(envConfig, font)).toBe(true);
+    expect(downloadFont).toHaveBeenCalledTimes(1);
+    expect(activateFontByContentId).toHaveBeenCalledWith(envConfig, 'c1');
+  });
+
+  test('returns false when every enabled backend has syncFonts set to false', async () => {
+    useSettingsStore.getState().setSettings({
+      ...multiProviderSettings,
+      webdav: { ...multiProviderSettings.webdav, syncFonts: false },
+      googleDrive: { ...multiProviderSettings.googleDrive, syncFonts: false },
+    } as SystemSettings);
+    expect(await runFileFontDownload(envConfig, font)).toBe(false);
+    expect(downloadFont).not.toHaveBeenCalled();
+    expect(activateFontByContentId).not.toHaveBeenCalled();
+  });
+
+  test('with syncFontsOff, tries only the backends whose syncFonts is false (#7965)', async () => {
+    useSettingsStore.getState().setSettings({
+      ...multiProviderSettings,
+      webdav: { ...multiProviderSettings.webdav, syncFonts: false },
+    } as SystemSettings);
+    vi.mocked(createFileSyncProvider).mockClear();
+    downloadFont.mockResolvedValue(true);
+    expect(await runFileFontDownload(envConfig, font, true)).toBe(true);
+    expect(vi.mocked(createFileSyncProvider).mock.calls.map(([kind]) => kind)).toEqual(['webdav']);
+    expect(activateFontByContentId).toHaveBeenCalledWith(envConfig, 'c1');
   });
 });
 

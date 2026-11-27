@@ -529,7 +529,8 @@ const ViewMenu: React.FC<ViewMenuProps> = ({
         shortcut='Shift+A'
         Icon={viewState?.autoScrollEnabled ? MdCheck : undefined}
         onClick={toggleAutoScroll}
-        disabled={!isScrolledMode}
+        // Paginated reflowable pages are wiped in (#7575).
+        disabled={!isScrolledMode && bookData.isFixedLayout}
       />
 
       {bookData.book?.format === 'PDF' && appService?.supportsCanvasContext2DFilter && (

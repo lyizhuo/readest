@@ -43,6 +43,19 @@ export const getHeaderBandGeometry = (topInset: number, marginTopPx: number) => 
 };
 
 /**
+ * Where the vertical side header (right) and footer (left) sit: the 32px of the
+ * side margin next to the text, as Double Border lays them out, or the whole
+ * margin when it is narrower (#7912). The margin is the header band turned on
+ * its side, so the text edge keeps FoliateViewer's 16px side floor and a wide
+ * margin never pulls the chrome into the side safe area.
+ */
+export const getVerticalChromeBand = (sideInset: number, sideMarginPx: number) => {
+  const band = getHeaderBandGeometry(sideInset, sideMarginPx);
+  const width = Math.min(band.height, 32);
+  return { offset: band.bottom - width, width };
+};
+
+/**
  * Height (px) of the header bar's hover trigger — the invisible strip along the
  * top of the book cell that reveals the toolbar.
  *
@@ -219,18 +232,13 @@ export interface PopupBounds {
  * The rect a popup is clamped to, and the origin its points must be shifted by.
  *
  * `getPosition`/`getPopupPosition` return points relative to the rect's
- * top-left, but popups render relative to the book cell. Off the Duo the rect
- * is the raw cell (main's behaviour, no shift). On iPhone Duo it is the cell's
- * safe region, so a popup never sits under the status strip, and `origin` is
- * the safe region's offset inside the cell: shift the results by it with
+ * top-left, but popups render relative to the book cell. The rect is the
+ * cell's safe region, so a popup never sits under the Dynamic Island, a
+ * cutout or iPhone Duo's status strip (#6307, #7389), and `origin` is the safe
+ * region's offset inside the cell: shift the results by it with
  * {@link offsetPosition} to get back to cell coordinates.
  */
-export const getPopupBounds = (
-  cellRect: Rect,
-  insets: Insets,
-  isIPhoneDuo: boolean,
-): PopupBounds => {
-  if (!isIPhoneDuo) return { rect: cellRect, origin: { x: 0, y: 0 } };
+export const getPopupBounds = (cellRect: Rect, insets: Insets): PopupBounds => {
   const left = cellRect.left + insets.left;
   const top = cellRect.top + insets.top;
   return {

@@ -283,6 +283,13 @@ pub(crate) async fn anki_list_decks<R: Runtime>(
 }
 
 #[command]
+pub(crate) async fn anki_list_note_types<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<AnkiListNoteTypesResponse> {
+    app.native_bridge().anki_list_note_types()
+}
+
+#[command]
 pub(crate) async fn anki_read_deck<R: Runtime>(
     app: AppHandle<R>,
     payload: AnkiReadDeckRequest,
@@ -304,6 +311,27 @@ pub(crate) async fn anki_update_tags<R: Runtime>(
     payload: AnkiUpdateTagsRequest,
 ) -> Result<AnkiUpdateTagsResponse> {
     app.native_bridge().anki_update_tags(payload)
+}
+
+#[command]
+pub(crate) async fn anki_note_type<R: Runtime>(app: AppHandle<R>) -> Result<AnkiNoteTypeResponse> {
+    app.native_bridge().anki_note_type()
+}
+
+#[command]
+pub(crate) async fn anki_upgrade_note_type<R: Runtime>(
+    app: AppHandle<R>,
+    payload: AnkiUpgradeNoteTypeRequest,
+) -> Result<AnkiUpdateTagsResponse> {
+    app.native_bridge().anki_upgrade_note_type(payload)
+}
+
+#[command]
+pub(crate) async fn anki_set_entries<R: Runtime>(
+    app: AppHandle<R>,
+    payload: AnkiSetEntriesRequest,
+) -> Result<AnkiUpdateTagsResponse> {
+    app.native_bridge().anki_set_entries(payload)
 }
 
 #[command]
@@ -552,4 +580,34 @@ pub(crate) async fn icloud_ensure_downloaded<R: Runtime>(
     payload: ICloudEnsureDownloadedRequest,
 ) -> Result<ICloudEnsureDownloadedResponse> {
     app.native_bridge().icloud_ensure_downloaded(payload)
+}
+
+#[command]
+pub(crate) async fn on_device_llm_status<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<OnDeviceLlmStatusResponse> {
+    app.native_bridge().on_device_llm_status()
+}
+
+/// The bridge call waits for the whole answer (seconds), so it runs on a
+/// blocking thread: on an async worker, a few overlapping requests could stall
+/// every other command, `on_device_llm_cancel` included.
+#[command]
+pub(crate) async fn on_device_llm_generate<R: Runtime>(
+    app: AppHandle<R>,
+    payload: OnDeviceLlmGenerateRequest,
+) -> Result<OnDeviceLlmGenerateResponse> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.native_bridge().on_device_llm_generate(payload)
+    })
+    .await
+    .map_err(|err| crate::Error::NativeBridgeError(err.to_string()))?
+}
+
+#[command]
+pub(crate) async fn on_device_llm_cancel<R: Runtime>(
+    app: AppHandle<R>,
+    payload: OnDeviceLlmCancelRequest,
+) -> Result<()> {
+    app.native_bridge().on_device_llm_cancel(payload)
 }

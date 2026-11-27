@@ -7,7 +7,11 @@ import { useReaderStore } from '@/store/readerStore';
 import { useBookProgressValue } from '@/store/readerProgressStore';
 import { useTranslation } from '@/hooks/useTranslation';
 import { eventDispatcher } from '@/utils/event';
-import { getHeaderBandGeometry, getMarginalInlinePadding } from '@/utils/insets';
+import {
+  getHeaderBandGeometry,
+  getMarginalInlinePadding,
+  getVerticalChromeBand,
+} from '@/utils/insets';
 import { getBookDataAttributes } from '@/utils/book';
 import {
   getChromeChip,
@@ -61,6 +65,7 @@ const SectionInfo: React.FC<SectionInfoProps> = ({
   // into the notch instead of collapsing it (#5303).
   const band = getHeaderBandGeometry(topInset, viewSettings.marginTopPx);
   const maskHeight = Math.min(topInset, band.bottom);
+  const sideBand = getVerticalChromeBand(gridInsets.right, contentInsets.right - gridInsets.right);
 
   // The header band is reserved margin except for a fixed-layout book in
   // scrolled mode, where FoliateViewer pins scrollTop to 0 and the pages run
@@ -128,7 +133,7 @@ const SectionInfo: React.FC<SectionInfoProps> = ({
             : blended
               ? 'text-white/75 mix-blend-difference font-light'
               : 'text-base-content font-light',
-          isVertical ? 'writing-vertical-rl max-h-[85%]' : 'top-0',
+          isVertical ? 'writing-vertical-rl max-h-[85%] leading-tight' : 'top-0',
           hidden && 'invisible',
         )}
         role='none'
@@ -140,12 +145,12 @@ const SectionInfo: React.FC<SectionInfoProps> = ({
           ...(textColor ? { color: textColor } : {}),
           ...(isVertical
             ? {
-                top: `${(contentInsets.top - gridInsets.top) * 1.5}px`,
-                bottom: `${(contentInsets.bottom - gridInsets.bottom) * 1.5}px`,
+                top: `${gridInsets.top + (contentInsets.top - gridInsets.top) * 1.5}px`,
+                bottom: `${gridInsets.bottom + (contentInsets.bottom - gridInsets.bottom) * 1.5}px`,
                 right: showDoubleBorder
                   ? `calc(${contentInsets.right}px)`
-                  : `calc(${Math.max(0, contentInsets.right - 32)}px)`,
-                width: showDoubleBorder ? '32px' : `${contentInsets.right}px`,
+                  : `calc(${sideBand.offset}px)`,
+                width: showDoubleBorder ? '32px' : `${sideBand.width}px`,
               }
             : {
                 top: `${band.top}px`,

@@ -14,7 +14,9 @@ import { useSettingsStore } from '@/store/settingsStore';
 import { useEnsureSettingsLoaded } from '@/hooks/useEnsureSettingsLoaded';
 import { useTranslation } from '@/hooks/useTranslation';
 import { useTrafficLightStore } from '@/store/trafficLightStore';
+import { useReaderStore } from '@/store/readerStore';
 import { getBaseUrl, isTauriAppPlatform } from '@/services/environment';
+import type { Session } from '@supabase/supabase-js';
 import { onOpenUrl } from '@tauri-apps/plugin-deep-link';
 import { start, cancel, onUrl, onInvalidUrl } from '@fabianlars/tauri-plugin-oauth';
 import { openUrl } from '@tauri-apps/plugin-opener';
@@ -22,11 +24,14 @@ import { invoke } from '@tauri-apps/api/core';
 import { handleAuthCallback, parseOAuthCallbackUrl } from '@/helpers/auth';
 import { getUserProfilePlan } from '@/utils/access';
 import { getHorizontalInsetStyle } from '@/utils/insets';
+import { checkSignInDeviceLimit, hasDeviceLimit, signOutSyncDevice } from '@/libs/syncDevices';
+import type { SyncDevice, SyncDevicesResponse } from '@/utils/syncDevices';
 import { getAppleIdAuth, Scope } from './utils/appleIdAuth';
 import { authWithCustomTab, authWithSafari } from './utils/nativeAuth';
 import WindowButtons from '@/components/WindowButtons';
 import type { OAuthProvider } from './components/ProviderLogin';
 import AuthPanel from './components/AuthPanel';
+import DeviceLimitPanel from './components/DeviceLimitPanel';
 
 interface SingleInstancePayload {
   args: string[];
@@ -36,6 +41,10 @@ interface SingleInstancePayload {
 const WEB_AUTH_CALLBACK = `${getBaseUrl()}/auth/callback`;
 const DEEPLINK_CALLBACK = 'readest://auth-callback';
 const USE_APPLE_SIGN_IN = process.env['NEXT_PUBLIC_USE_APPLE_SIGN_IN'] === 'true';
+
+// A book stays open in the reader beneath while the login page sits over it
+// (the reader keeps its books when a page opens on top, #6607).
+const isReaderBeneath = () => Object.keys(useReaderStore.getState().viewStates).length > 0;
 
 export default function AuthPage() {
   const _ = useTranslation();
@@ -49,6 +58,28 @@ export default function AuthPage() {
   const [isMounted, setIsMounted] = useState(false);
   const isOAuthServerRunning = useRef(false);
   const useCustomeOAuth = useRef(false);
+  // Go Back waits for a save: a second press meanwhile must not go back
+  // twice, and a sign-in that has already left takes precedence.
+  const isLeaving = useRef(false);
+  const signedInAndLeft = useRef(false);
+  // A sign-in over the Free plan's device limit: the session exists, but this
+  // device isn't signed in until another one signs out.
+  const [heldSignIn, setHeldSignIn] = useState<(SyncDevicesResponse & { session: Session }) | null>(
+    null,
+  );
+  // A Free plan sign-in whose device check is running, or that is held.
+  const pendingSignIn = useRef(false);
+  // Counts abandoned sign-ins (Cancel, Go Back, sign-out, leaving the page), so
+  // a device check, device sign-out or link callback that answers afterwards
+  // can't sign in or hold the session they ended.
+  const abandonedSignIns = useRef(0);
+  // The newest session this page heard of: a device check answers only for
+  // it, and a held sign-in finishes with it, after a token refresh too.
+  const latestSession = useRef<Session | null>(null);
+  // Where a held deep-link sign-in goes once let in, as the callback would
+  // have gone under the limit: the recovery form for a password reset link.
+  // Kept when the link arrives, since the device list can show first.
+  const heldDestination = useRef<string | null>(null);
 
   const headerRef = useRef<HTMLDivElement>(null);
 
@@ -174,13 +205,23 @@ export default function AuthPage() {
       if (getUserProfilePlan(accessToken) === 'free') {
         nextPath = '/user';
       }
+      heldDestination.current = type === 'recovery' ? '/auth/recovery' : nextPath;
+      const attempt = abandonedSignIns.current;
+      const isLive = () => attempt === abandonedSignIns.current;
       handleAuthCallback({
         accessToken,
         refreshToken,
         type,
         next: nextPath,
-        login,
-        navigate: router.push,
+        // A link abandoned while its own device check ran doesn't sign in.
+        login: (token, user) => {
+          if (isLive()) login(token, user);
+        },
+        navigate: (path) => {
+          if (isLive()) router.push(path);
+        },
+        // This page hears the session too, and lists the devices.
+        onDeviceLimit: () => {},
       });
     }
   };
@@ -230,26 +271,48 @@ export default function AuthPage() {
     }
   };
 
-  const handleGoBack = () => {
+  const endSignIn = () => {
+    abandonedSignIns.current += 1;
+    latestSession.current = null;
+    pendingSignIn.current = false;
+    heldDestination.current = null;
+    setHeldSignIn(null);
+  };
+
+  const abandonSignIn = () => {
+    endSignIn();
+    void supabase.auth.signOut({ scope: 'local' });
+  };
+
+  const handleGoBack = async () => {
+    if (isLeaving.current) return;
+    isLeaving.current = true;
+    if (pendingSignIn.current) abandonSignIn();
     // Keep login false to avoid infinite loop to redirect to the login page.
+    // Leave only once it is saved: the library reads settings from disk when it
+    // mounts, and an unfinished write opened this page once more (#7726).
     // On a cold load the store is still an empty object, so read through to
     // disk first: persisting that would overwrite the real settings file with
     // a lone `keepLogin`. Building a new object rather than mutating in place
     // also keeps the settingsStore subscriber's identity check meaningful.
-    void (async () => {
-      try {
-        const appService = await envConfig.getAppService();
-        const current = settingsLoaded ? settings : await appService.loadSettings();
-        const next = { ...current, keepLogin: false };
-        setSettings(next);
-        await saveSettings(envConfig, next);
-      } catch (error) {
-        console.error('Failed to clear keepLogin:', error);
-      }
-    })();
+    try {
+      const appService = await envConfig.getAppService();
+      const current = settingsLoaded ? settings : await appService.loadSettings();
+      const next = { ...current, keepLogin: false };
+      setSettings(next);
+      await saveSettings(envConfig, next);
+    } catch (error) {
+      console.error('Failed to clear keepLogin:', error);
+    }
+    isLeaving.current = false;
+    if (signedInAndLeft.current) return;
     const redirectTo = new URLSearchParams(window.location.search).get('redirect');
-    if (redirectTo) {
-      router.push(redirectTo);
+    // Go back to the reader rather than pushing the redirect over /auth: a
+    // pushed entry leaves /auth in the history, and the reader's Android back
+    // key reopens the login page from it (#7567). Replace when nothing is open
+    // beneath, e.g. a cold-loaded /auth?redirect=...
+    if (redirectTo && !isReaderBeneath()) {
+      router.replace(redirectTo);
     } else {
       router.back();
     }
@@ -274,23 +337,77 @@ export default function AuthPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const finishSignIn = (session: Session, destination: string | null = null) => {
+    // A check still running for it has nothing left to decide.
+    latestSession.current = null;
+    heldDestination.current = null;
+    pendingSignIn.current = false;
+    setHeldSignIn(null);
+    login(session.access_token, session.user);
+    // AuthProvider never published a sign-in that was held, so keep the
+    // refresh token here, which an offline launch needs to stay signed in.
+    localStorage.setItem('refresh_token', session.refresh_token);
+    const redirectTo = new URLSearchParams(window.location.search).get('redirect');
+    const lastRedirectAtKey = 'lastRedirectAt';
+    const lastRedirectAt = parseInt(localStorage.getItem(lastRedirectAtKey) || '0', 10);
+    const now = Date.now();
+    localStorage.setItem(lastRedirectAtKey, now.toString());
+    if (now - lastRedirectAt > 3000) {
+      signedInAndLeft.current = true;
+      // Same as handleGoBack: never leave /auth on the history stack.
+      if (destination) {
+        router.replace(destination);
+      } else if (redirectTo && isReaderBeneath()) {
+        router.back();
+      } else {
+        router.replace(redirectTo ?? '/library');
+      }
+    }
+  };
+
+  const handleSignOutDevice = async (device: SyncDevice) => {
+    if (!heldSignIn) return;
+    const attempt = abandonedSignIns.current;
+    const next = await signOutSyncDevice(heldSignIn.session.access_token, device.id);
+    // The answer is for the account that asked, refreshed or not.
+    const session = latestSession.current;
+    if (attempt !== abandonedSignIns.current || session?.user.id !== heldSignIn.session.user.id) {
+      return;
+    }
+    if (next.blocked) {
+      setHeldSignIn({ ...next, session });
+    } else {
+      finishSignIn(session, heldDestination.current);
+    }
+  };
+
   useEffect(() => {
     const { data: subscription } = supabase.auth.onAuthStateChange((_event, session) => {
-      if (session?.access_token && session.user) {
-        login(session.access_token, session.user);
-        const redirectTo = new URLSearchParams(window.location.search).get('redirect');
-        const lastRedirectAtKey = 'lastRedirectAt';
-        const lastRedirectAt = parseInt(localStorage.getItem(lastRedirectAtKey) || '0', 10);
-        const now = Date.now();
-        localStorage.setItem(lastRedirectAtKey, now.toString());
-        if (now - lastRedirectAt > 3000) {
-          router.push(redirectTo ?? '/library');
-        }
+      if (!session?.access_token || !session.user) {
+        endSignIn();
+        return;
       }
+      latestSession.current = session;
+      // Paid plans have no device limit: sign in at once, as before.
+      if (!hasDeviceLimit(session.access_token)) {
+        finishSignIn(session);
+        return;
+      }
+      pendingSignIn.current = true;
+      const attempt = abandonedSignIns.current;
+      void checkSignInDeviceLimit(session.access_token).then((blocked) => {
+        if (attempt !== abandonedSignIns.current || latestSession.current !== session) return;
+        if (!blocked) {
+          finishSignIn(session);
+          return;
+        }
+        setHeldSignIn({ ...blocked, session });
+      });
     });
 
     return () => {
       subscription?.subscription.unsubscribe();
+      abandonedSignIns.current += 1;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [router]);
@@ -323,7 +440,7 @@ export default function AuthPage() {
         <div
           ref={headerRef}
           className={clsx(
-            'fixed z-10 flex w-full items-center justify-between py-2 pe-6 ps-4',
+            'fixed z-30 flex w-full items-center justify-between py-2 pe-6 ps-4',
             appService?.hasTrafficLight && 'pt-11',
           )}
           style={{
@@ -365,30 +482,51 @@ export default function AuthPage() {
             appService?.hasTrafficLight ? 'mt-24' : 'mt-16',
           )}
         >
-          <AuthPanel
-            supabaseClient={supabase}
-            magicLink={true}
-            redirectTo={getTauriRedirectTo(false)}
-            onProviderSignIn={tauriProviderSignIn}
-          />
+          {heldSignIn ? (
+            <DeviceLimitPanel
+              devices={heldSignIn.devices}
+              limit={heldSignIn.limit ?? 0}
+              onSignOut={handleSignOutDevice}
+              onCancel={abandonSignIn}
+            />
+          ) : (
+            <AuthPanel
+              supabaseClient={supabase}
+              magicLink={true}
+              redirectTo={getTauriRedirectTo(false)}
+              onProviderSignIn={tauriProviderSignIn}
+            />
+          )}
         </div>
       </div>
     </div>
   ) : (
     <div className='bg-base-100 flex min-h-screen flex-col items-center overflow-y-auto px-6 pb-12 pt-20'>
+      {appService?.appPlatform === 'web' && appService.hasSafeAreaInset && (
+        <div className='bg-base-100 fixed inset-x-0 top-0 z-10 h-20' />
+      )}
       <button
         aria-label={_('Go Back')}
         onClick={handleGoBack}
-        className='btn btn-ghost fixed start-6 top-6 h-8 min-h-8 w-8 p-0'
+        className='btn btn-ghost fixed start-6 top-6 z-20 h-8 min-h-8 w-8 p-0'
       >
         <IoArrowBack className='text-base-content' />
       </button>
-      <AuthPanel
-        supabaseClient={supabase}
-        magicLink={true}
-        redirectTo={getWebRedirectTo()}
-        onProviderSignIn={webProviderSignIn}
-      />
+      {heldSignIn ? (
+        <DeviceLimitPanel
+          devices={heldSignIn.devices}
+          limit={heldSignIn.limit ?? 0}
+          onSignOut={handleSignOutDevice}
+          onCancel={abandonSignIn}
+        />
+      ) : (
+        <AuthPanel
+          supabaseClient={supabase}
+          magicLink={true}
+          redirectTo={getWebRedirectTo()}
+          onProviderSignIn={webProviderSignIn}
+        />
+      )}
     </div>
   );
 }

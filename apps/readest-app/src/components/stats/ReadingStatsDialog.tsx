@@ -1,12 +1,18 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { MdCalendarMonth } from 'react-icons/md';
+import { MdCalendarMonth, MdChecklist, MdMenuBook } from 'react-icons/md';
 import Dialog from '@/components/Dialog';
 import { useEnv } from '@/context/EnvContext';
 import { useAuth } from '@/context/AuthContext';
 import { useTranslation } from '@/hooks/useTranslation';
 import { StatisticsDb } from '@/services/statistics/statisticsDb';
 import { isSyncCategoryEnabled } from '@/services/sync/syncCategories';
-import { getDailySeconds, getStreaks, toDateKey } from '@/services/statistics/readingStats';
+import {
+  getDailyReadingSpeeds,
+  getDailySeconds,
+  getStreaks,
+  toDateKey,
+} from '@/services/statistics/readingStats';
+import type { ReadingSpeed } from '@/types/statistics';
 import { BoxedList, NavigationRow, SettingsRow } from '@/components/settings/primitives';
 import SubPageHeader from '@/components/settings/SubPageHeader';
 import { formatDuration } from '@/utils/duration';
@@ -14,6 +20,8 @@ import { getLocale } from '@/utils/misc';
 import ReadingTimeChart from './ReadingTimeChart';
 import ReadingHeatmap from './ReadingHeatmap';
 import ReadingCalendar from './ReadingCalendar';
+import BookStatsList from './BookStatsList';
+import { formatReadingSpeed } from './formatReadingSpeed';
 
 export const setReadingStatsDialogVisible = (visible: boolean) => {
   const dialog = document.getElementById('reading_stats_window');
@@ -29,45 +37,69 @@ interface ReadingStats {
   db: StatisticsDb;
   daily: Map<string, number>;
   totals: { seconds: number; books: number; pages: number };
+  /** Speeds by date key, for the day the statistics were read. */
+  dailySpeed: Map<string, ReadingSpeed[]>;
+  totalSpeed: ReadingSpeed[];
 }
+
+const readStats = async (db: StatisticsDb): Promise<ReadingStats> => {
+  const today = new Date();
+  const dayStart = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
+  const dayEnd = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1).getTime();
+  const [quarters, totals, samples, totalSpeed] = await Promise.all([
+    db.getQuarterHourDurations(),
+    db.getReadingTotals(),
+    db.getReadingSpeedSamples(dayStart, dayEnd),
+    db.getReadingSpeedTotals(),
+  ]);
+  const dailySpeed = getDailyReadingSpeeds(samples, dayStart, dayEnd);
+  return { db, daily: getDailySeconds(quarters), totals, dailySpeed, totalSpeed };
+};
+
+/** A sub-page of the dialog, or null for the statistics themselves. */
+type StatsPage = 'calendar' | 'books' | null;
+
+const PAGE_ENTRY: Record<NonNullable<StatsPage>, string> = {
+  calendar: 'stats.readingCalendar',
+  books: 'stats.books',
+};
 
 interface ReadingStatsContentProps {
-  showCalendar: boolean;
-  onShowCalendar: (visible: boolean) => void;
+  page: StatsPage;
+  onPage: (page: StatsPage) => void;
 }
 
-const ReadingStatsContent: React.FC<ReadingStatsContentProps> = ({
-  showCalendar,
-  onShowCalendar,
-}) => {
+const ReadingStatsContent: React.FC<ReadingStatsContentProps> = ({ page, onPage }) => {
   const _ = useTranslation();
   const { appService } = useEnv();
   const { user } = useAuth();
   const [stats, setStats] = useState<ReadingStats | null>(null);
   const [failed, setFailed] = useState(false);
+  // Statistics by Book is checking entries to merge or delete (#7812).
+  const [selecting, setSelecting] = useState(false);
   const contentRef = useRef<HTMLDivElement>(null);
-  const shownCalendar = useRef(showCalendar);
+  const shownPage = useRef(page);
 
-  // Move focus only on navigation, not when the dialog first renders.
+  // Move focus only on navigation, not when the dialog first renders: into a
+  // sub-page's heading, or back to the row that opened it.
   useEffect(() => {
-    if (shownCalendar.current === showCalendar) return;
-    shownCalendar.current = showCalendar;
+    const previous = shownPage.current;
+    if (previous === page) return;
+    shownPage.current = page;
+    setSelecting(false);
     const target = contentRef.current?.querySelector<HTMLElement>(
-      showCalendar ? '[data-calendar-heading]' : '[data-setting-id="stats.readingCalendar"]',
+      page ? '[data-subpage-heading]' : `[data-setting-id="${PAGE_ENTRY[previous!]}"]`,
     );
     target?.focus();
-    if (showCalendar) target?.scrollIntoView?.({ block: 'start' });
-  }, [showCalendar]);
+    if (page) target?.scrollIntoView?.({ block: 'start' });
+  }, [page]);
 
   useEffect(() => {
     if (!appService) return;
     let cancelled = false;
     const load = async (db: StatisticsDb) => {
-      const [quarters, totals] = await Promise.all([
-        db.getQuarterHourDurations(),
-        db.getReadingTotals(),
-      ]);
-      if (!cancelled) setStats({ db, daily: getDailySeconds(quarters), totals });
+      const loaded = await readStats(db);
+      if (!cancelled) setStats(loaded);
     };
     StatisticsDb.open(appService)
       .then(async (db) => {
@@ -109,21 +141,72 @@ const ReadingStatsContent: React.FC<ReadingStatsContentProps> = ({
   const streaks = getStreaks(daily);
   const time = (seconds: number) => formatDuration(Math.floor(seconds / 60), _);
   const days = (count: number) => _('{{count}} days', { count });
+  const speed = (speeds: ReadingSpeed[]) => formatReadingSpeed(speeds, getLocale(), _) ?? '—';
+  // A speed rarely fits beside its label on a phone: it then moves below the
+  // label instead of squeezing it, since long words can't break (#7892).
+  const speedRow = 'flex-wrap py-3';
 
-  if (showCalendar) {
+  if (page === 'calendar') {
     return (
       <div ref={contentRef} className='pb-6'>
-        <div tabIndex={-1} data-calendar-heading className='outline-hidden'>
+        <div tabIndex={-1} data-subpage-heading className='outline-hidden'>
           <SubPageHeader
             parentLabel={_('Reading Statistics')}
             currentLabel={_('Reading Calendar')}
             description={_('See which books you read each day and for how long')}
-            onBack={() => onShowCalendar(false)}
+            onBack={() => onPage(null)}
           />
         </div>
         <BoxedList innerClassName='px-2! py-3'>
           <ReadingCalendar db={stats.db} daily={daily} />
         </BoxedList>
+      </div>
+    );
+  }
+
+  if (page === 'books') {
+    return (
+      <div ref={contentRef} className='pb-6'>
+        <div tabIndex={-1} data-subpage-heading className='outline-hidden'>
+          <SubPageHeader
+            parentLabel={_('Reading Statistics')}
+            currentLabel={_('Statistics by Book')}
+            description={_('Each book’s reading time, most recently read first')}
+            onBack={() => onPage(null)}
+            rightSlot={
+              totals.books > 0 && (
+                <button
+                  type='button'
+                  className='btn btn-ghost btn-sm text-base-content -me-4 gap-2 px-3'
+                  title={selecting ? undefined : _('Select')}
+                  aria-label={selecting ? undefined : _('Select')}
+                  onClick={() => setSelecting((v) => !v)}
+                >
+                  {selecting ? (
+                    _('Cancel')
+                  ) : (
+                    <>
+                      <MdChecklist className='h-5 w-5 min-[800px]:h-4 min-[800px]:w-4' />
+                      {/* Icon only on narrow screens, so the breadcrumb stays readable. */}
+                      <span className='hidden min-[800px]:inline'>{_('Select')}</span>
+                    </>
+                  )}
+                </button>
+              )
+            }
+          />
+        </div>
+        <BookStatsList
+          db={stats.db}
+          selecting={selecting}
+          onSelectingDone={() => setSelecting(false)}
+          reloadKey={stats}
+          onChange={() =>
+            void readStats(stats.db)
+              .then(setStats)
+              .catch(() => {})
+          }
+        />
       </div>
     );
   }
@@ -140,14 +223,19 @@ const ReadingStatsContent: React.FC<ReadingStatsContentProps> = ({
         <NavigationRow
           title={_('Reading Calendar')}
           icon={MdCalendarMonth}
-          onClick={() => onShowCalendar(true)}
-          data-setting-id='stats.readingCalendar'
+          onClick={() => onPage('calendar')}
+          data-setting-id={PAGE_ENTRY.calendar}
           className='pe-0 text-start'
         />
       </BoxedList>
       <BoxedList title={_('Overview')}>
         <SettingsRow label={_('Today')}>
           <span className='tabular-nums'>{time(daily.get(toDateKey(new Date())) ?? 0)}</span>
+        </SettingsRow>
+        <SettingsRow label={_('Reading Speed Today')} className={speedRow}>
+          <span dir='auto' className='ms-auto text-end tabular-nums'>
+            {speed(stats.dailySpeed.get(toDateKey(new Date())) ?? [])}
+          </span>
         </SettingsRow>
         <SettingsRow label={_('Current Streak')}>
           <span className='tabular-nums'>{days(streaks.current)}</span>
@@ -160,12 +248,24 @@ const ReadingStatsContent: React.FC<ReadingStatsContentProps> = ({
         <SettingsRow label={_('Reading Time')}>
           <span className='tabular-nums'>{time(totals.seconds)}</span>
         </SettingsRow>
+        <SettingsRow label={_('Reading Speed')} className={speedRow}>
+          <span dir='auto' className='ms-auto text-end tabular-nums'>
+            {speed(stats.totalSpeed)}
+          </span>
+        </SettingsRow>
         <SettingsRow label={_('Books')}>
           <span className='tabular-nums'>{totals.books.toLocaleString(getLocale())}</span>
         </SettingsRow>
         <SettingsRow label={_('Pages')}>
           <span className='tabular-nums'>{totals.pages.toLocaleString(getLocale())}</span>
         </SettingsRow>
+        <NavigationRow
+          title={_('Statistics by Book')}
+          icon={MdMenuBook}
+          onClick={() => onPage('books')}
+          data-setting-id={PAGE_ENTRY.books}
+          className='pe-0 text-start'
+        />
       </BoxedList>
     </div>
   );
@@ -174,12 +274,12 @@ const ReadingStatsContent: React.FC<ReadingStatsContentProps> = ({
 export const ReadingStatsDialog: React.FC = () => {
   const _ = useTranslation();
   const [isOpen, setIsOpen] = useState(false);
-  const [showCalendar, setShowCalendar] = useState(false);
+  const [page, setPage] = useState<StatsPage>(null);
 
   useEffect(() => {
     const handleCustomEvent = (event: CustomEvent) => {
       setIsOpen(event.detail.visible);
-      setShowCalendar(false);
+      setPage(null);
     };
 
     const el = document.getElementById('reading_stats_window');
@@ -200,14 +300,12 @@ export const ReadingStatsDialog: React.FC = () => {
       isOpen={isOpen}
       title={_('Reading Statistics')}
       onClose={() => setIsOpen(false)}
-      onBack={showCalendar ? () => setShowCalendar(false) : undefined}
+      onBack={page ? () => setPage(null) : undefined}
       useOverlayScroll
       boxClassName='sm:h-[85%]! sm:w-[560px]! sm:max-w-(--breakpoint-sm)!'
       contentClassName='px-4! sm:px-6!'
     >
-      {isOpen && (
-        <ReadingStatsContent showCalendar={showCalendar} onShowCalendar={setShowCalendar} />
-      )}
+      {isOpen && <ReadingStatsContent page={page} onPage={setPage} />}
     </Dialog>
   );
 };

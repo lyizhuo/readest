@@ -131,6 +131,20 @@ const migrations: Record<SchemaType, MigrationEntry[]> = {
   // and text search now comes from the per-book library-search schema below.
   // Future Reedy schema keeps embeddings only, with chunks defined as
   // locator ranges into search_sections.
+  xray: [
+    {
+      name: '2026112401_xray_batches',
+      sql: `
+        CREATE TABLE IF NOT EXISTS xray_batches (
+          book_hash TEXT NOT NULL,
+          position INTEGER NOT NULL,
+          end_cfi TEXT NOT NULL,
+          payload TEXT NOT NULL,
+          PRIMARY KEY (book_hash, position)
+        );
+      `,
+    },
+  ],
   statistics: [
     {
       name: '2026061501_statistics_koreader_schema',
@@ -192,6 +206,19 @@ const migrations: Record<SchemaType, MigrationEntry[]> = {
 
         CREATE TABLE IF NOT EXISTS readest_stat_sync_state (
           key text PRIMARY KEY, value integer NOT NULL DEFAULT 0
+        );
+      `,
+    },
+    {
+      name: '2026111901_statistics_reading_speed',
+      sql: `
+        CREATE TABLE IF NOT EXISTS readest_reading_speed (
+          start_time_ms integer NOT NULL,
+          book_md5 text NOT NULL,
+          unit text NOT NULL CHECK (unit IN ('characters', 'words')),
+          count integer NOT NULL CHECK (count > 0),
+          duration_ms integer NOT NULL CHECK (duration_ms > 0),
+          PRIMARY KEY (start_time_ms, book_md5, unit)
         );
       `,
     },

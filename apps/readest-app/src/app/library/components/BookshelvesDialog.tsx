@@ -528,6 +528,7 @@ export function BookshelvesEditor({
           coverFit={shelf.coverFit || 'crop'}
           skeuomorphicCovers={shelf.skeuomorphicCovers}
           showPageCount={shelf.showPageCount}
+          coverOnly={!!shelf.coverOnly && mode === 'grid'}
           isSelectMode={false}
           itemSelected={false}
           transferProgress={null}
@@ -716,6 +717,22 @@ export function BookshelvesEditor({
                 label={_('Skeuomorphic covers')}
                 checked={!!selected.skeuomorphicCovers}
                 onChange={() => update({ skeuomorphicCovers: !selected.skeuomorphicCovers })}
+              />
+              <SettingsSwitchRow
+                label={_('Plain placeholder covers')}
+                checked={!!selected.plainPlaceholderCovers}
+                // Off clears the key: older app versions reject a definition carrying it.
+                onChange={() =>
+                  update({
+                    plainPlaceholderCovers: selected.plainPlaceholderCovers ? undefined : true,
+                  })
+                }
+              />
+              <SettingsSwitchRow
+                label={_('Cover only')}
+                checked={!!selected.coverOnly}
+                // Off clears the key: older app versions reject a definition carrying it.
+                onChange={() => update({ coverOnly: selected.coverOnly ? undefined : true })}
               />
               <SettingsSwitchRow
                 label={_('Show page count')}
@@ -1044,7 +1061,7 @@ export default function BookshelvesDialog() {
             type='button'
             aria-label={_('Close')}
             onClick={() => void close()}
-            className='bg-base-300/65 btn btn-ghost btn-circle mt-[1.125rem] hidden h-6 min-h-6 w-6 shrink-0 focus:outline-hidden sm:flex'
+            className='bg-base-300/65 eink:bg-transparent btn btn-ghost btn-circle mt-[1.125rem] hidden h-6 min-h-6 w-6 shrink-0 focus:outline-hidden sm:flex'
           >
             <MdClose aria-hidden className='h-4 w-4' />
           </button>

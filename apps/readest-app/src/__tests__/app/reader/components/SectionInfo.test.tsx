@@ -257,3 +257,70 @@ describe('SectionInfo book metadata data attributes (#5776)', () => {
     expect(info.hasAttribute('data-book-series-index')).toBe(false);
   });
 });
+
+describe('SectionInfo vertical safe-area and 0px margin floor (#7389)', () => {
+  it('anchors the vertical section title within gridInsets.top and gridInsets.bottom plus 1.5x margins', () => {
+    const { container } = render(
+      <SectionInfo
+        {...baseProps}
+        isVertical
+        gridInsets={{ top: 59, right: 0, bottom: 34, left: 0 }}
+        contentInsets={{ top: 75, right: 0, bottom: 50, left: 0 }}
+      />,
+    );
+    const info = container.querySelector('.sectioninfo') as HTMLElement;
+    expect(info.style.top).toBe('83px');
+    expect(info.style.bottom).toBe('58px');
+    expect(info.style.right).toBe('calc(0px)');
+    expect(info.style.width).toBe('16px');
+  });
+
+  it('keeps the 1.5x vertical margins and 16px width floor when gridInsets and right margin are zero', () => {
+    const { container } = render(
+      <SectionInfo
+        {...baseProps}
+        isVertical
+        gridInsets={{ top: 0, right: 0, bottom: 0, left: 0 }}
+        contentInsets={{ top: 16, right: 0, bottom: 16, left: 0 }}
+      />,
+    );
+    const info = container.querySelector('.sectioninfo') as HTMLElement;
+    expect(info.style.top).toBe('24px');
+    expect(info.style.bottom).toBe('24px');
+    expect(info.style.right).toBe('calc(0px)');
+    expect(info.style.width).toBe('16px');
+  });
+});
+
+// The vertical title takes the 32px of the right margin next to the text, as
+// under Double Border, or the whole margin when it is narrower. The text's
+// right edge is max(16, contentInsets.right) in from the cell's right.
+describe('SectionInfo vertical band at large side margins (#7912)', () => {
+  const renderVertical = (gridRight: number, contentRight: number) =>
+    render(
+      <SectionInfo
+        {...baseProps}
+        isVertical
+        gridInsets={{ top: 0, right: gridRight, bottom: 0, left: 0 }}
+        contentInsets={{ top: 16, right: contentRight, bottom: 16, left: 0 }}
+      />,
+    ).container.querySelector('.sectioninfo') as HTMLElement;
+
+  it('sits against the text in a 144px right margin instead of over it', () => {
+    const info = renderVertical(0, 144);
+    expect(info.style.right).toBe('calc(112px)');
+    expect(info.style.width).toBe('32px');
+  });
+
+  it('fills a right margin of 32px or less', () => {
+    const info = renderVertical(0, 32);
+    expect(info.style.right).toBe('calc(0px)');
+    expect(info.style.width).toBe('32px');
+  });
+
+  it('sits between a right safe-area inset and the text', () => {
+    const info = renderVertical(47, 63);
+    expect(info.style.right).toBe('calc(47px)');
+    expect(info.style.width).toBe('16px');
+  });
+});

@@ -157,6 +157,81 @@ describe('iframeEventHandlers click gestures', () => {
     frame.remove();
   });
 
+  describe("a tap the book's own script handles is not a page turn (#7769)", () => {
+    // A Go book's diagram shows its replay controls when tapped, then steps
+    // through moves with buttons and a slider; Allow JavaScript runs them.
+    // Taps each target 100ms apart, inside the double-click window.
+    const tapIn = async (setup: (doc: Document) => Element | Element[]) => {
+      const { handleClick, handleMousedown, handleMouseup } = await importHandlers();
+      const frame = document.createElement('iframe');
+      document.body.appendChild(frame);
+      const doc = frame.contentDocument!;
+      const targets = [setup(doc)].flat();
+      doc.addEventListener('click', (event) =>
+        handleClick('book-1', { current: false }, false, false, event),
+      );
+      for (const target of targets) {
+        handleMousedown('book-1', mouseEvent({ target }));
+        handleMouseup('book-1', mouseEvent({ target }));
+        target.dispatchEvent(
+          new MouseEvent('click', { bubbles: true, cancelable: true, detail: 1 }),
+        );
+        vi.advanceTimersByTime(100);
+      }
+      vi.advanceTimersByTime(300);
+      frame.remove();
+      return postedTypes(postSpy);
+    };
+
+    test('a click the script cancels does not post iframe-single-click', async () => {
+      const types = await tapIn((doc) => {
+        doc.body.innerHTML = '<svg><rect width="100" height="100"></rect></svg>';
+        const rect = doc.querySelector('rect')!;
+        rect.addEventListener('click', (event) => event.preventDefault());
+        return rect;
+      });
+      expect(types).not.toContain('iframe-single-click');
+    });
+
+    test.each([
+      '<input type="range">',
+      '<button>＞</button>',
+      '<select></select>',
+      '<textarea></textarea>',
+    ])('a click on the book control %s does not post iframe-single-click', async (html) => {
+      const types = await tapIn((doc) => {
+        doc.body.innerHTML = `<div class="replay">${html}</div>`;
+        return doc.querySelector('.replay')!.firstElementChild!;
+      });
+      expect(types).not.toContain('iframe-single-click');
+    });
+
+    test("a click on a label's text does not post iframe-single-click", async () => {
+      const types = await tapIn((doc) => {
+        doc.body.innerHTML =
+          '<input type="checkbox" id="choice"><label for="choice"><span>Choose</span></label>';
+        return doc.querySelector('span')!;
+      });
+      expect(types).not.toContain('iframe-single-click');
+    });
+
+    test('a control tapped right after the text cancels the pending page turn', async () => {
+      const types = await tapIn((doc) => {
+        doc.body.innerHTML = '<p>text</p><button>＞</button>';
+        return [doc.querySelector('p')!, doc.querySelector('button')!];
+      });
+      expect(types).not.toContain('iframe-single-click');
+    });
+
+    test('a click on the diagram the script leaves alone still turns the page', async () => {
+      const types = await tapIn((doc) => {
+        doc.body.innerHTML = '<p>text</p>';
+        return doc.querySelector('p')!;
+      });
+      expect(types).toContain('iframe-single-click');
+    });
+  });
+
   test('iframe shortcuts are consumed synchronously or fall back to reader events', async () => {
     const { eventDispatcher } = await import('@/utils/event');
     const dispatchSpy = vi
@@ -212,6 +287,74 @@ describe('iframeEventHandlers click gestures', () => {
         return message.type === 'iframe-mouseup' && message.button === 4;
       }),
     ).toBe(true);
+  });
+
+  // #7732: a key typed in the book while a dialog is open (focus was taken
+  // from it) must not turn the page behind the dialog.
+  // A modal shows it is open with the `open` attribute, or with daisyUI's
+  // `modal-open` class (the passphrase prompt, the app lock dialog).
+  test.each([
+    'open',
+    'modal-open',
+  ])('keys typed in the book do nothing while a dialog is open (%s)', async (how) => {
+    const { eventDispatcher } = await import('@/utils/event');
+    const dispatchSpy = vi.spyOn(eventDispatcher, 'dispatchSync');
+    const { handleKeydown } = await importHandlers();
+    const dialog = document.createElement('dialog');
+    if (how === 'open') dialog.setAttribute('open', '');
+    else dialog.className = 'modal modal-open';
+    document.body.appendChild(dialog);
+    const keyEvent = {
+      key: 'ArrowRight',
+      code: 'ArrowRight',
+      ctrlKey: false,
+      shiftKey: false,
+      altKey: false,
+      metaKey: false,
+      repeat: false,
+      target: null,
+      getModifierState: () => false,
+      preventDefault: vi.fn(),
+      stopImmediatePropagation: vi.fn(),
+    } as unknown as KeyboardEvent;
+    try {
+      handleKeydown('book-1', keyEvent);
+    } finally {
+      dialog.remove();
+    }
+    expect(dispatchSpy).not.toHaveBeenCalled();
+    expect(postedTypes(postSpy)).not.toContain('iframe-keydown');
+
+    handleKeydown('book-1', keyEvent);
+    expect(postedTypes(postSpy)).toContain('iframe-keydown');
+  });
+
+  // A popup over the book (the instant dictionary) is closed by Escape typed
+  // in the book: only a modal dialog takes the book's keys away.
+  test('keys typed in the book still reach a popup over it', async () => {
+    const { handleKeydown } = await importHandlers();
+    const popup = document.createElement('div');
+    popup.className = 'popup-container';
+    popup.setAttribute('data-capture-blocking-overlay', 'true');
+    document.body.appendChild(popup);
+    try {
+      handleKeydown('book-1', {
+        key: 'Escape',
+        code: 'Escape',
+        ctrlKey: false,
+        shiftKey: false,
+        altKey: false,
+        metaKey: false,
+        repeat: false,
+        target: null,
+        getModifierState: () => false,
+        preventDefault: vi.fn(),
+        stopImmediatePropagation: vi.fn(),
+      } as unknown as KeyboardEvent);
+    } finally {
+      popup.remove();
+    }
+    expect(postedTypes(postSpy)).toContain('iframe-keydown');
   });
 });
 

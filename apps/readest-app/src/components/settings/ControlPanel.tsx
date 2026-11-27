@@ -1,4 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { MdOutlineScreenRotation } from 'react-icons/md';
+import { IoPhoneLandscapeOutline, IoPhonePortraitOutline } from 'react-icons/io5';
 import { invoke } from '@tauri-apps/api/core';
 import { useEnv } from '@/context/EnvContext';
 import { useReaderStore } from '@/store/readerStore';
@@ -9,6 +11,7 @@ import { useResetViewSettings } from '@/hooks/useResetSettings';
 import { useEinkMode } from '@/hooks/useEinkMode';
 import { getStyles } from '@/utils/style';
 import { getMaxInlineSize } from '@/utils/config';
+import { lockScreenOrientation } from '@/utils/bridge';
 import { saveSysSettings, saveViewSettings } from '@/helpers/settings';
 import { ImageViewerGesture, PageTurnStyle } from '@/types/book';
 import { SettingsPanelPanelProp } from './SettingsDialog';
@@ -74,6 +77,7 @@ const ControlPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterRes
     viewSettings.keepSelectionAfterLookup,
   );
   const [copyToNotebook, setCopyToNotebook] = useState(viewSettings.copyToNotebook);
+  const [copyWithCitation, setCopyWithCitation] = useState(viewSettings.copyWithCitation);
   const [showToolbarCustomizer, setShowToolbarCustomizer] = useState(false);
   const [showKeyboardShortcuts, setShowKeyboardShortcuts] = useState(false);
   const [animated, setAnimated] = useState(viewSettings.animated);
@@ -92,6 +96,7 @@ const ControlPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterRes
   const [swipeBrightnessGesture, setSwipeBrightnessGesture] = useState(
     settings.swipeBrightnessGesture,
   );
+  const [screenOrientation, setScreenOrientation] = useState(viewSettings.screenOrientation);
   const [screenWakeLock, setScreenWakeLock] = useState(settings.screenWakeLock);
   const [autohideCursor, setAutohideCursor] = useState(settings.autohideCursor);
   const [gamepadEnabled, setGamepadEnabled] = useState(settings.gamepadEnabled);
@@ -202,6 +207,7 @@ const ControlPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterRes
       enableAnnotationQuickActions: setEnableAnnotationQuickActions,
       keepSelectionAfterLookup: setKeepSelectionAfterLookup,
       copyToNotebook: setCopyToNotebook,
+      copyWithCitation: setCopyWithCitation,
     });
     saveViewSettings(
       envConfig,
@@ -411,6 +417,14 @@ const ControlPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterRes
   }, [swipeBrightnessGesture]);
 
   useEffect(() => {
+    saveViewSettings(envConfig, bookKey, 'screenOrientation', screenOrientation, false, false);
+    if (appService?.isMobileApp) {
+      lockScreenOrientation({ orientation: screenOrientation });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [screenOrientation]);
+
+  useEffect(() => {
     if (screenWakeLock === settings.screenWakeLock) return;
     saveSysSettings(envConfig, 'screenWakeLock', screenWakeLock);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -477,6 +491,11 @@ const ControlPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterRes
     saveViewSettings(envConfig, bookKey, 'copyToNotebook', copyToNotebook, false, false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [copyToNotebook]);
+
+  useEffect(() => {
+    saveViewSettings(envConfig, bookKey, 'copyWithCitation', copyWithCitation, false, false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [copyWithCitation]);
 
   const toggleAutoCheckUpdates = () => {
     const newValue = !isAutoCheckUpdates;
@@ -695,6 +714,12 @@ const ControlPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterRes
           onChange={() => setCopyToNotebook(!copyToNotebook)}
           data-setting-id='settings.control.copyToNotebook'
         />
+        <SettingsSwitchRow
+          label={_('Copy with Citation')}
+          checked={copyWithCitation}
+          onChange={() => setCopyWithCitation(!copyWithCitation)}
+          data-setting-id='settings.control.copyWithCitation'
+        />
         <NavigationRow
           title={_('Customize Toolbar')}
           onClick={() => setShowToolbarCustomizer(true)}
@@ -762,6 +787,36 @@ const ControlPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterRes
           onChange={() => setHideBookshelfPageButtons(!hideBookshelfPageButtons)}
           data-setting-id='settings.control.hideBookshelfPageButtons'
         />
+        {appService?.hasOrientationLock && (
+          <SettingsRow label={_('Orientation')}>
+            <div className='flex gap-4'>
+              <div className='lg:tooltip lg:tooltip-bottom' data-tip={_('Auto')}>
+                <button
+                  className={`btn btn-ghost btn-circle btn-sm ${screenOrientation === 'auto' ? 'btn-active bg-base-300 eink-bordered' : ''}`}
+                  onClick={() => setScreenOrientation('auto')}
+                >
+                  <MdOutlineScreenRotation />
+                </button>
+              </div>
+              <div className='lg:tooltip lg:tooltip-bottom' data-tip={_('Portrait')}>
+                <button
+                  className={`btn btn-ghost btn-circle btn-sm ${screenOrientation === 'portrait' ? 'btn-active bg-base-300 eink-bordered' : ''}`}
+                  onClick={() => setScreenOrientation('portrait')}
+                >
+                  <IoPhonePortraitOutline />
+                </button>
+              </div>
+              <div className='lg:tooltip lg:tooltip-bottom' data-tip={_('Landscape')}>
+                <button
+                  className={`btn btn-ghost btn-circle btn-sm ${screenOrientation === 'landscape' ? 'btn-active bg-base-300 eink-bordered' : ''}`}
+                  onClick={() => setScreenOrientation('landscape')}
+                >
+                  <IoPhoneLandscapeOutline />
+                </button>
+              </div>
+            </div>
+          </SettingsRow>
+        )}
         {appService?.isMobileApp && (
           <SettingsSwitchRow
             label={_('Always Show Status Bar')}
@@ -788,7 +843,6 @@ const ControlPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterRes
         )}
         <SettingsSwitchRow
           label={_('Keep Screen Awake')}
-          description={_('Only while reading')}
           checked={screenWakeLock}
           onChange={() => setScreenWakeLock(!screenWakeLock)}
           data-setting-id='settings.control.screenWakeLock'
@@ -796,7 +850,6 @@ const ControlPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterRes
         {!appService?.isMobile && (
           <SettingsSwitchRow
             label={_('Auto-hide Cursor')}
-            description={_('After a moment of inactivity')}
             checked={autohideCursor}
             onChange={() => setAutohideCursor(!autohideCursor)}
             data-setting-id='settings.control.autohideCursor'
@@ -804,14 +857,12 @@ const ControlPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterRes
         )}
         <SettingsSwitchRow
           label={_('Reverse Mouse Wheel')}
-          description={_('Scroll up for the next page')}
           checked={reverseWheelPaging}
           onChange={() => setReverseWheelPaging(!reverseWheelPaging)}
           data-setting-id='settings.control.reverseWheelPaging'
         />
         <SettingsSwitchRow
           label={_('Gamepad Support')}
-          description={_('Navigate with a connected controller')}
           checked={gamepadEnabled}
           onChange={() => setGamepadEnabled(!gamepadEnabled)}
           data-setting-id='settings.control.gamepadEnabled'

@@ -28,7 +28,6 @@ import { useAppRouter } from '@/hooks/useAppRouter';
 import { useEnv } from '@/context/EnvContext';
 import { useAuth } from '@/context/AuthContext';
 import { useTranslation } from '@/hooks/useTranslation';
-import { useKeyDownActions } from '@/hooks/useKeyDownActions';
 import { useQuotaStats } from '@/hooks/useQuotaStats';
 import { useSettingsStore } from '@/store/settingsStore';
 import { useCustomOPDSStore } from '@/store/customOPDSStore';
@@ -180,6 +179,13 @@ const IntegrationsPanel: React.FC = () => {
     : undefined;
 
   const [subPage, setSubPage] = useState<SubPage>(null);
+  // Signed out goes straight to sign-in: /user would show "Loading profile..."
+  // before bouncing to /auth (#7755).
+  const openPremiumProvider = (page: SubPage) => {
+    if (isCloudSyncPremium) setSubPage(page);
+    else if (user) navigateToProfile(router);
+    else navigateToLogin(router);
+  };
   const flowConnectors = useFlowConnectors();
   const flowState = useFlowState();
 
@@ -197,20 +203,6 @@ const IntegrationsPanel: React.FC = () => {
   useEffect(() => {
     void useABSServerStore.getState().loadABSServers(envConfig);
   }, [envConfig]);
-
-  // Android Back / Esc: when any integrations sub-page (KOSync, WebDAV,
-  // Readwise, Hardcover, OPDS, Send-to-Readest) is open, intercept and
-  // step back to the integrations list instead of letting <Dialog>'s
-  // listener close the whole Settings dialog. The hook registers its
-  // sync `native-key-down` listener *after* <Dialog>'s, and
-  // `dispatchSync` walks listeners LIFO — so this one claims Back first
-  // when enabled and `return true` consumes the event. When subPage is
-  // null the hook is disabled and Back falls through to close the dialog
-  // as before.
-  useKeyDownActions({
-    enabled: subPage !== null,
-    onCancel: () => setSubPage(null),
-  });
 
   const toggleDiscordPresence = () => {
     const discordRichPresenceEnabled = !settings.discordRichPresenceEnabled;
@@ -816,9 +808,7 @@ const IntegrationsPanel: React.FC = () => {
                   isEnabled: !!settings.googleDrive?.enabled,
                 })}
                 onToggle={(next) => toggleCloudProvider('gdrive', next)}
-                onOpen={() =>
-                  isCloudSyncPremium ? setSubPage('gdrive') : navigateToProfile(router)
-                }
+                onOpen={() => openPremiumProvider('gdrive')}
                 toggleLabel={_('Sync with Google Drive')}
               />
             )}
@@ -834,7 +824,7 @@ const IntegrationsPanel: React.FC = () => {
                 isEnabled: !!settings.webdav?.enabled,
               })}
               onToggle={(next) => toggleCloudProvider('webdav', next)}
-              onOpen={() => (isCloudSyncPremium ? setSubPage('webdav') : navigateToProfile(router))}
+              onOpen={() => openPremiumProvider('webdav')}
               toggleLabel={_('Sync with WebDAV')}
             />
             <CloudProviderRow
@@ -849,7 +839,7 @@ const IntegrationsPanel: React.FC = () => {
                 isEnabled: !!settings.s3?.enabled,
               })}
               onToggle={(next) => toggleCloudProvider('s3', next)}
-              onOpen={() => (isCloudSyncPremium ? setSubPage('s3') : navigateToProfile(router))}
+              onOpen={() => openPremiumProvider('s3')}
               toggleLabel={_('Sync with S3')}
             />
             {(appService?.isDesktopApp ||
@@ -869,9 +859,7 @@ const IntegrationsPanel: React.FC = () => {
                   isEnabled: !!settings.onedrive?.enabled,
                 })}
                 onToggle={(next) => toggleCloudProvider('onedrive', next)}
-                onOpen={() =>
-                  isCloudSyncPremium ? setSubPage('onedrive') : navigateToProfile(router)
-                }
+                onOpen={() => openPremiumProvider('onedrive')}
                 toggleLabel={_('Sync with OneDrive')}
               />
             )}
@@ -888,9 +876,7 @@ const IntegrationsPanel: React.FC = () => {
                   isEnabled: !!settings.icloud?.enabled,
                 })}
                 onToggle={(next) => toggleCloudProvider('icloud', next)}
-                onOpen={() =>
-                  isCloudSyncPremium ? setSubPage('icloud') : navigateToProfile(router)
-                }
+                onOpen={() => openPremiumProvider('icloud')}
                 toggleLabel={_('Sync with iCloud')}
               />
             )}

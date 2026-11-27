@@ -4,6 +4,8 @@ import { MdErrorOutline, MdInsertDriveFile } from 'react-icons/md';
 
 import Dialog from '@/components/Dialog';
 import { useTranslation } from '@/hooks/useTranslation';
+import { writeTextToClipboard } from '@/utils/clipboard';
+import { eventDispatcher } from '@/utils/event';
 
 export interface FailedImport {
   filename: string;
@@ -17,12 +19,25 @@ interface FailedImportsDialogProps {
 
 const FailedImportsDialog: React.FC<FailedImportsDialogProps> = ({ failedImports, onClose }) => {
   const _ = useTranslation();
+  const collator = new Intl.Collator(undefined, { numeric: true });
+  const sortedImports = [...failedImports].sort((a, b) => collator.compare(a.filename, b.filename));
 
   const uniqueErrors = Array.from(
     new Set(failedImports.map((f) => f.errorMessage).filter(Boolean)),
   );
   const sharedError = uniqueErrors.length === 1 ? uniqueErrors[0] : null;
   const subtitle = sharedError ?? _('Some files could not be added to your library.');
+
+  const handleCopy = async () => {
+    const copied = await writeTextToClipboard(
+      sortedImports.map(({ filename }) => filename).join('\n'),
+    );
+    void eventDispatcher.dispatch('toast', {
+      type: copied ? 'info' : 'error',
+      message: copied ? _('Copied to clipboard') : _('Operation failed'),
+      timeout: 2000,
+    });
+  };
 
   return (
     <Dialog
@@ -49,7 +64,7 @@ const FailedImportsDialog: React.FC<FailedImportsDialogProps> = ({ failedImports
             'divide-base-300/50 divide-y',
           )}
         >
-          {failedImports.map((item, index) => (
+          {sortedImports.map((item, index) => (
             <li key={`${item.filename}-${index}`} className='flex items-center gap-2.5 px-3 py-2'>
               <MdInsertDriveFile
                 className='text-base-content/40 h-4 w-4 shrink-0'
@@ -69,7 +84,14 @@ const FailedImportsDialog: React.FC<FailedImportsDialogProps> = ({ failedImports
           ))}
         </ul>
 
-        <div className='flex justify-end pt-1'>
+        <div className='flex justify-end gap-2 pt-1'>
+          <button
+            type='button'
+            className='btn btn-ghost btn-sm min-w-24 rounded-lg'
+            onClick={handleCopy}
+          >
+            {_('Copy')}
+          </button>
           <button
             type='button'
             className='btn btn-contrast btn-sm min-w-24 rounded-lg'

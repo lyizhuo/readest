@@ -9,6 +9,7 @@ import { Insets } from '@/types/misc';
 import { eventDispatcher } from '@/utils/event';
 import { canShareText } from '@/utils/share';
 import { dataUrlToBytes, imageExtensionFromMime } from '@/utils/image';
+import { mountDarkMonochromeFilter, mountWhiteTransparencyFilter } from '@/utils/imageBackground';
 import {
   isLightColor,
   probeImageInk,
@@ -63,6 +64,7 @@ const ImageViewer: React.FC<ImageViewerProps> = ({
   const _ = useTranslation();
   const { appService } = useEnv();
   const isIPhoneDuo = useThemeStore((s) => s.isIPhoneDuo);
+  const themeCode = useThemeStore((s) => s.themeCode);
   // On Android the button saves straight to the photo gallery (the share sheet
   // can't save to a file there); elsewhere it shares where supported, else
   // exports. The affordance reflects the actual action.
@@ -130,6 +132,10 @@ const ImageViewer: React.FC<ImageViewerProps> = ({
     setFitSize({ width: fitWidth, height: img.naturalHeight * fitRatio });
     setPixelPerfectScale(img.naturalWidth / (fitWidth * dpr));
   }, []);
+
+  // The page's filter, copied below, names its definition by id.
+  useEffect(() => mountWhiteTransparencyFilter(document), []);
+  useEffect(() => mountDarkMonochromeFilter(document, themeCode.fg), [themeCode.fg]);
 
   // A cached image can already be decoded before the load event would fire, and
   // rotating the device or resizing the window changes the fit size.
@@ -228,7 +234,15 @@ const ImageViewer: React.FC<ImageViewerProps> = ({
   const handleKeyDown = (e: React.KeyboardEvent) => {
     e.stopPropagation();
 
-    // Escape is handled by useKeyDownActions (also covers Android Back key).
+    // The viewer takes focus when it opens, so Escape starts here, and the
+    // line above keeps it from useKeyDownActions' window listener. Closing
+    // here also keeps Escape from a dialog underneath, such as book details
+    // under the cover viewer.
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      onClose();
+      return;
+    }
 
     // Arrow key navigation
     if (e.key === 'ArrowLeft' && onPrevious) {

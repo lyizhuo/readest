@@ -23,7 +23,15 @@ afterEach(cleanup);
 
 describe('Notebook All notes action', () => {
   it('keeps Annotations navigation out of the header', () => {
-    render(<NotebookHeader isPinned={false} handleClose={vi.fn()} handleTogglePin={vi.fn()} />);
+    render(
+      <NotebookHeader
+        bookKey='book-1'
+        activeTab='notes'
+        isPinned={false}
+        handleClose={vi.fn()}
+        handleTogglePin={vi.fn()}
+      />,
+    );
 
     expect(screen.queryByRole('button', { name: 'Open Annotations' })).toBeNull();
   });

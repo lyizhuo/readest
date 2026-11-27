@@ -43,7 +43,9 @@ export const MEDIA_OVERLAY_VOICE_ID = 'media-overlay';
 // are throttled with the screen off.
 const CLOCK_POLL_MS = 50;
 
-type WaitOutcome = 'reached' | 'ended' | 'aborted' | 'error';
+// 'looped': the clip ended because the native player jumped back to the start
+// of the A-B span it repeats.
+type WaitOutcome = 'reached' | 'looped' | 'ended' | 'aborted' | 'error';
 
 // How far the playhead may sit from a clip's start and still count as "already
 // rolling into it" rather than needing a seek. Covers the few milliseconds that
@@ -55,6 +57,10 @@ const CLIP_CONTINUITY_TOLERANCE_SEC = 0.3;
 // next block to claim it. Long enough that a normal handover is never cut short,
 // short enough that narration can never be left running unattended.
 const HANDOVER_GRACE_MS = 1000;
+
+// How far past B's end the clock may run before a native A-B repeat counts as
+// having failed to jump, and the end of B is taken from the clock after all.
+const NATIVE_LOOP_FALLBACK_SEC = 0.75;
 
 // Container blobs come out of the zip with no MIME type, and a media element
 // given a typeless blob URL refuses to decode it ("Format error"), so the type
@@ -165,7 +171,11 @@ export class MediaOverlayClient implements TTSClient {
   #audio: NarrationClock | null = null;
   #audioHref: string | null = null;
   #objectUrl: string | null = null;
-  #audioLoad: { href: string; promise: Promise<NarrationClock> } | null = null;
+  #audioLoad: {
+    href: string;
+    promise: Promise<NarrationClock>;
+    abort: AbortController;
+  } | null = null;
   #currentPar: NarrationPar | null = null;
   // Last par the recording actually rode, kept across the handover that ends
   // every block (unlike #currentPar) so speak() can tell a stalled cursor
@@ -175,6 +185,9 @@ export class MediaOverlayClient implements TTSClient {
   // played, its position is where the recording is, like a stalled cursor.
   #rolledInto: string | null = null;
   #nextChunkPosition: number | null = null;
+  // B just ended on a native jump back to A, so the controller's return to A
+  // must join the recording where it is rather than seek.
+  #loopedBack = false;
   #handoverTimer: ReturnType<typeof setTimeout> | null = null;
   #rate = 1;
   #lang = 'en';
@@ -228,6 +241,22 @@ export class MediaOverlayClient implements TTSClient {
     this.#section = section;
   }
 
+  // Hand the controller's A-B span to the native player, when both ends are
+  // clips of the file it is playing. Called as the span changes and before
+  // every run, since the file playing changes under it.
+  async refreshLoop(): Promise<void> {
+    const player = this.#player;
+    if (!player?.loopsNatively || this.#audio !== player) return;
+    // Pausing after every sentence stops at B's end: a native jump would
+    // start A before the pause.
+    const span = this.controller?.pauseAfterSentence
+      ? null
+      : (this.controller?.getNarrationLoop?.() ?? null);
+    const loop =
+      span && span.audioHref === player.href ? { begin: span.clipBegin, end: span.clipEnd } : null;
+    await player.setLoop(loop).catch(() => undefined);
+  }
+
   // Queue the next section's first file on the native player so it plays on
   // without JS. Only while this section's last file is the one playing:
   // queued earlier, it would play in place of this section's later files.
@@ -263,10 +292,14 @@ export class MediaOverlayClient implements TTSClient {
   // each built its own element, and each one's #releaseAudio() revoked the
   // previous URL while it was still loading.
   async #ensureAudio(href: string): Promise<NarrationClock> {
-    if (this.#audio && this.#audioHref === href) return this.#audio;
+    if (this.#audio && this.#audioHref === href) {
+      this.#leaveLoadBehind(href);
+      return this.#audio;
+    }
     if (this.#player && this.#audio === this.#player && this.#player.href === href) {
       // The native player already rolled into this queued file: join it where
       // it is instead of loading it again.
+      this.#leaveLoadBehind(href);
       this.#cancelHandover();
       this.#audioHref = href;
       this.#rolledInto = href;
@@ -274,8 +307,10 @@ export class MediaOverlayClient implements TTSClient {
     }
     if (this.#audioLoad?.href === href) return this.#audioLoad.promise;
 
-    const promise = this.#loadAudio(href);
-    this.#audioLoad = { href, promise };
+    this.#leaveLoadBehind();
+    const abort = new AbortController();
+    const promise = this.#loadAudio(href, abort.signal);
+    this.#audioLoad = { href, promise, abort };
     try {
       return await promise;
     } finally {
@@ -283,12 +318,22 @@ export class MediaOverlayClient implements TTSClient {
     }
   }
 
-  async #loadAudio(href: string): Promise<NarrationClock> {
+  // A load of another file that narration no longer wants: it moved on, came
+  // back to the clock it holds, or playback was reset. Aborted, the load can
+  // no longer release or replace the clock narration is on (#7621).
+  #leaveLoadBehind(keep?: string): void {
+    if (!this.#audioLoad || this.#audioLoad.href === keep) return;
+    this.#audioLoad.abort.abort();
+    this.#audioLoad = null;
+  }
+
+  async #loadAudio(href: string, wanted: AbortSignal): Promise<NarrationClock> {
     if (!this.#source) throw new Error('Book cannot load narration audio');
 
-    const signal = this.#player?.cancelsPendingLoads ? this.#playback.signal : undefined;
+    // The Linux decoder stops opening a file narration no longer wants.
+    const signal = this.#player?.cancelsPendingLoads ? wanted : undefined;
     const tracks = await this.#source.resolveTracks?.(href).catch(() => null);
-    signal?.throwIfAborted();
+    wanted.throwIfAborted();
     if (tracks?.length) {
       let player: NarrationTrackPlayer;
       if (this.#native && this.#player?.supportsStreaming) {
@@ -316,7 +361,15 @@ export class MediaOverlayClient implements TTSClient {
     if (this.#native && this.#player) {
       // Keep the prior native session until the new file replaces it.
       this.#cancelHandover();
-      if (await this.#player.loadSource(href, this.#source, audioType(href), null, signal)) {
+      let placed: boolean;
+      try {
+        placed = await this.#player.loadSource(href, this.#source, audioType(href), null, signal);
+      } finally {
+        // A file it opened anyway must not play beside the element narration
+        // moved to.
+        if (signal?.aborted && this.#audio !== this.#player) this.#player.pause();
+      }
+      if (placed) {
         signal?.throwIfAborted();
         if (this.#audio !== this.#player) {
           this.#audio?.pause();
@@ -346,6 +399,9 @@ export class MediaOverlayClient implements TTSClient {
             .getMediaFileUrl(media.path, media.start, media.end, audioType(href))
             .catch(() => null)
         : null;
+    // A Stop while the native player was declining the file must not leave
+    // this element playing in place of the session.
+    wanted.throwIfAborted();
     this.#releaseAudio();
     let url = directUrl ?? mediaUrl;
     if (!url) {
@@ -353,6 +409,7 @@ export class MediaOverlayClient implements TTSClient {
         media && 'blob' in media
           ? media.blob
           : audioBlobWithType(href, await this.#source.loadBlob(href));
+      wanted.throwIfAborted();
       url = URL.createObjectURL(blob);
       this.#objectUrl = url;
     }
@@ -412,7 +469,7 @@ export class MediaOverlayClient implements TTSClient {
     this.#currentPar = null;
     this.#playedPar = null;
     this.#rolledInto = null;
-    this.#audioLoad = null;
+    this.#leaveLoadBehind();
     this.#audio = null;
     this.#audioHref = null;
     if (this.#objectUrl) {
@@ -444,14 +501,22 @@ export class MediaOverlayClient implements TTSClient {
   // An `ended` that fired while nothing was waiting (the WebView resuming from
   // suspension delivers it at any point) still counts, as does the native
   // player having moved past `href` into the next queued file.
+  //
+  // At the end of a span the native player repeats, the clock never reaches
+  // `until`: the player jumps back first. The wait ends on its 'loop' event
+  // instead, or on finding the clock already back before `from` (the event
+  // went to an earlier wait while the WebView lagged behind).
   #waitUntil(
     audio: NarrationClock,
     until: number,
     signal: AbortSignal,
     href: string,
+    from = 0,
   ): Promise<WaitOutcome> {
     return new Promise<WaitOutcome>((resolve) => {
       let done = false;
+      const player = audio === this.#player ? this.#player : null;
+      const loopsAtStart = player?.loopCount ?? 0;
       const finish = (outcome: WaitOutcome) => {
         if (done) return;
         done = true;
@@ -459,12 +524,21 @@ export class MediaOverlayClient implements TTSClient {
         audio.removeEventListener('timeupdate', check);
         audio.removeEventListener('ended', onEnded);
         audio.removeEventListener('error', onError);
+        player?.removeEventListener('loop', check);
         signal.removeEventListener('abort', onAbort);
         resolve(outcome);
       };
       const check = () => {
         if (signal.aborted) return finish('aborted');
         if (audio.ended || this.#playedPast(audio, href)) return finish('ended');
+        const loop = this.#nativeLoopFor(audio, href);
+        if (loop && Math.abs(until - loop.end) < 1e-3) {
+          const time = audio.currentTime;
+          if (player!.loopCount !== loopsAtStart) return finish('looped');
+          if (time < from - CLIP_CONTINUITY_TOLERANCE_SEC) return finish('looped');
+          if (time >= until + NATIVE_LOOP_FALLBACK_SEC) return finish('reached');
+          return;
+        }
         if (audio.currentTime >= until) finish('reached');
       };
       const onEnded = () => finish('ended');
@@ -475,9 +549,18 @@ export class MediaOverlayClient implements TTSClient {
       audio.addEventListener('timeupdate', check);
       audio.addEventListener('ended', onEnded);
       audio.addEventListener('error', onError);
+      player?.addEventListener('loop', check);
       signal.addEventListener('abort', onAbort);
       check();
     });
+  }
+
+  // The span the native player repeats on `href`, when `audio` is that player.
+  #nativeLoopFor(audio: NarrationClock, href: string): { begin: number; end: number } | null {
+    const player = this.#player;
+    if (!player || audio !== player) return null;
+    const loop = player.loop;
+    return loop && loop.href === href ? loop : null;
   }
 
   #playedPast(audio: NarrationClock, href: string): boolean {
@@ -496,9 +579,12 @@ export class MediaOverlayClient implements TTSClient {
       // first play of a section from stalling on a large clip read out of the
       // container. Only when nothing is loaded yet: preloading runs CONCURRENTLY
       // with playback, and loading a different file swaps the element (and
-      // revokes its blob URL) out from under the clip being played.
+      // revokes its blob URL) out from under the clip being played. Nor while
+      // a load is running: starting another would leave playback's behind.
       const href = pars[0]?.audioHref;
-      if (href && !this.#audio) await this.#ensureAudio(href).catch(() => undefined);
+      if (href && !this.#audio && !this.#audioLoad) {
+        await this.#ensureAudio(href).catch(() => undefined);
+      }
       return;
     }
 
@@ -508,6 +594,8 @@ export class MediaOverlayClient implements TTSClient {
     }
 
     const runs = toRuns(pars);
+    const loopedBack = this.#loopedBack;
+    this.#loopedBack = false;
     const requestedStart = this.#nextChunkPosition;
     this.#nextChunkPosition = null;
     for (const [runIndex, run] of runs.entries()) {
@@ -538,6 +626,7 @@ export class MediaOverlayClient implements TTSClient {
       }
       if (signal.aborted) return;
       this.#queueNextInSection(run.audioHref);
+      await this.refreshLoop();
 
       this.#cancelHandover();
       await setClockRate(audio, this.#rate);
@@ -571,7 +660,21 @@ export class MediaOverlayClient implements TTSClient {
         (this.#rolledInto === first.audioHref ||
           (this.#playedPar?.audioHref === first.audioHref &&
             first.clipBegin > this.#playedPar.clipBegin));
-      if (requestedPosition !== null || !(alreadyRolling || ranPastWhileStalled)) {
+      // Back to A after B while the native player repeats the span: it has
+      // jumped to A already and may be well into the span by now, if the
+      // WebView fell behind it. Seeking would restart the span mid-way.
+      const loop = this.#nativeLoopFor(audio, run.audioHref);
+      const loopingNatively =
+        runIndex === 0 &&
+        loopedBack &&
+        !!loop &&
+        Math.abs(first.clipBegin - loop.begin) < 1e-3 &&
+        playhead >= loop.begin - CLIP_CONTINUITY_TOLERANCE_SEC &&
+        playhead < loop.end;
+      if (
+        requestedPosition !== null ||
+        !(alreadyRolling || ranPastWhileStalled || loopingNatively)
+      ) {
         await seekClock(audio, requestedPosition ?? first.clipBegin);
       }
       try {
@@ -599,7 +702,14 @@ export class MediaOverlayClient implements TTSClient {
         });
         yield { code: 'boundary', mark: par.markName, message: 'narration' };
 
-        const outcome = await this.#waitUntil(audio, par.clipEnd, signal, run.audioHref);
+        const outcome = await this.#waitUntil(
+          audio,
+          par.clipEnd,
+          signal,
+          run.audioHref,
+          par.clipBegin,
+        );
+        if (outcome === 'looped') this.#loopedBack = true;
         if (outcome === 'aborted') {
           audio.pause();
           return;
@@ -764,6 +874,7 @@ export class MediaOverlayClient implements TTSClient {
   async shutdown(): Promise<void> {
     this.#playback.abort();
     this.#playback = new AbortController();
+    this.#leaveLoadBehind();
     this.initialized = false;
     const player = this.#player;
     this.#player = null;

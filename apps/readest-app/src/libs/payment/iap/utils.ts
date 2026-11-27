@@ -1,4 +1,5 @@
 import { PlanInterval, PlanType, UserPlan } from '@/types/quota';
+import { GiftTier } from '@/types/gift';
 import { IAPStatus } from './types';
 
 // Statuses that still grant the user their paid plan. Anything else (expired,
@@ -40,6 +41,29 @@ export const isPurchaseProduct = (productId: string): boolean => {
   return productId.includes('.purchase');
 };
 
+// The App Store and Play products, one year each; the length is in the id so
+// a card of another length can have its own.
+export const GIFT_PRODUCT_IDS: Record<GiftTier, string> = {
+  plus: 'com.bilingify.readest.giftcard_plus_1y.purchase',
+  pro: 'com.bilingify.readest.giftcard_pro_1y.purchase',
+};
+
+/**
+ * A store purchase nobody paid for, reaching the live server: Apple sends
+ * sandbox (TestFlight, App Review) notifications to the production endpoint,
+ * and a Play license tester's purchase is free. A gift bought this way is a
+ * test card. Elsewhere sandbox is how development buys, and stays real.
+ */
+export const isTestPurchaseInProduction = (environment: string): boolean =>
+  environment === 'sandbox' && process.env.NODE_ENV === 'production';
+
+export const isGiftProduct = (productId: string): boolean =>
+  Object.values(GIFT_PRODUCT_IDS).includes(productId);
+
+export const giftTierForProduct = (productId: string): GiftTier | null =>
+  (Object.keys(GIFT_PRODUCT_IDS) as GiftTier[]).find((t) => GIFT_PRODUCT_IDS[t] === productId) ??
+  null;
+
 export const isStoragePurchase = (productId: string): boolean => {
   return isPurchaseProduct(productId) && productId.includes('.storage');
 };
@@ -53,8 +77,10 @@ export const isStoragePurchase = (productId: string): boolean => {
  * rather than a denylist on purpose: an unrecognised product failing to be
  * repurchasable is an annoyance caught in testing, while wrongly consuming a
  * permanent unlock costs a user real money.
+ * Gift cards are consumable too: they are bought repeatedly.
  */
-export const isConsumablePurchase = (productId: string): boolean => isStoragePurchase(productId);
+export const isConsumablePurchase = (productId: string): boolean =>
+  isStoragePurchase(productId) || isGiftProduct(productId);
 
 export const parseStorageGB = (productId: string): number => {
   const match = productId.match(/\.([0-9]+)gb/);

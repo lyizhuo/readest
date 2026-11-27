@@ -865,10 +865,19 @@ describe('getColorStyles branches (via getStyles)', () => {
     expect(css).toMatch(/svg,\s*img\s*\{[^}]*background-color:\s*transparent\s*!important/);
   });
 
-  it('applies screen blend mode for inline images in dark mode', () => {
+  it('draws inline images as ink in the text color in dark mode (#7981)', () => {
     const vs = makeViewSettings();
     const theme = makeThemeCode({ isDarkMode: true, bg: '#1a1a1a', fg: '#e0e0e0' });
     const css = getStyles(vs, theme);
+    expect(css).toContain('filter: url(#readest-dark-monochrome-e0e0e0);');
+    expect(css).toContain('mix-blend-mode: normal');
+  });
+
+  it('keeps screen blending for inline images when inverting images in dark mode', () => {
+    const vs = makeViewSettings({ invertImgColorInDark: true });
+    const theme = makeThemeCode({ isDarkMode: true, bg: '#1a1a1a', fg: '#e0e0e0' });
+    const css = getStyles(vs, theme);
+    expect(css).not.toContain('readest-dark-monochrome');
     expect(css).toContain('mix-blend-mode: screen');
   });
 
@@ -970,7 +979,14 @@ describe('translated text style (via getStyles)', () => {
 // ---------------------------------------------------------------------------
 describe('getRubyStyles branches (via getStyles)', () => {
   const theme = makeThemeCode();
+  const rubyBlock = (css: string) => css.match(/ruby\.wl-gloss\s*\{([^}]*)\}/)?.[1] ?? '';
   const rtBlock = (css: string) => css.match(/ruby\.wl-gloss\s*>\s*rt\s*\{([^}]*)\}/)?.[1] ?? '';
+
+  it('keeps glossed words unbroken and centered under their hint (#7880)', () => {
+    const block = rubyBlock(getStyles(makeViewSettings(), theme));
+    expect(block).toMatch(/white-space:\s*nowrap/);
+    expect(block).toMatch(/ruby-align:\s*center/);
+  });
 
   it('defaults the gloss to 0.5em and muted (opacity 0.7, no color override)', () => {
     const block = rtBlock(getStyles(makeViewSettings(), theme));

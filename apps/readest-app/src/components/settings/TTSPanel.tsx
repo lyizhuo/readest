@@ -2,7 +2,6 @@ import React, { useEffect, useState } from 'react';
 import { useEnv } from '@/context/EnvContext';
 import { useAuth } from '@/context/AuthContext';
 import { useAppRouter } from '@/hooks/useAppRouter';
-import { useKeyDownActions } from '@/hooks/useKeyDownActions';
 import { isCustomTTSAllowed } from '@/utils/access';
 import { navigateToLogin, navigateToProfile } from '@/utils/nav';
 import { useReaderStore } from '@/store/readerStore';
@@ -34,6 +33,12 @@ import CustomTTSServices from './CustomTTSServices';
 import TTSVoicesPage from './TTSVoicesPage';
 import TTSHighlightStyleEditor, { TTSHighlightStyle } from './theme/TTSHighlightStyleEditor';
 
+// Set when the voice library leaves for sign-in or the plans page, to the
+// engine it had on show, so coming back reopens it instead of this panel. It
+// lives for this app run only, like SettingsDialog's savedScroll: a full page
+// load closes Settings anyway.
+let returnToVoices: string | null = null;
+
 const TTSPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset }) => {
   const _ = useTranslation();
   const { envConfig, appService } = useEnv();
@@ -41,7 +46,12 @@ const TTSPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset }
   const { token, user } = useAuth();
   const hasPremium = isCustomTTSAllowed(token);
   const [showCustomServices, setShowCustomServices] = useState(false);
-  const [showVoices, setShowVoices] = useState(false);
+  const [returnTo, setReturnTo] = useState(() => returnToVoices);
+  const [showVoices, setShowVoices] = useState(returnTo !== null);
+  // Spent on this mount: a later open of Settings starts on this panel again.
+  useEffect(() => {
+    returnToVoices = null;
+  }, []);
   const [voiceLibrary, setVoiceLibrary] = useState<VoiceLibrary | null>(null);
   const [defaultVoiceName, setDefaultVoiceName] = useState<string | null>(null);
   const { getBookData } = useBookDataStore();
@@ -138,12 +148,6 @@ const TTSPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ttsSkipInlineAnnotations]);
 
-  // Android Back / Esc steps back to this panel instead of closing Settings.
-  useKeyDownActions({
-    enabled: showCustomServices,
-    onCancel: () => setShowCustomServices(false),
-  });
-
   // Every engine's voices, for the Voices page and to name the default here.
   useEffect(() => {
     let current = true;
@@ -198,9 +202,14 @@ const TTSPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset }
 
   const handleCustomTtsColorsChange = (colors: string[]) => {
     setCustomTtsHighlightColors(colors);
-    settings.globalReadSettings.customTtsHighlightColors = colors;
-    setSettings(settings);
-    saveSettings(envConfig, settings);
+    const { settings: current } = useSettingsStore.getState();
+    // Account sync publishes when the settings reference changes.
+    const next = {
+      ...current,
+      globalReadSettings: { ...current.globalReadSettings, customTtsHighlightColors: colors },
+    };
+    setSettings(next);
+    void saveSettings(envConfig, next);
   };
 
   const handleMediaMetadataChange = (event: React.ChangeEvent<HTMLSelectElement>) => {
@@ -222,8 +231,16 @@ const TTSPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset }
           library={voiceLibrary}
           lang={voiceLang}
           bookKey={bookKey || null}
-          onBack={() => setShowVoices(false)}
+          onBack={() => {
+            // The restored visit is over: the next one starts on every engine.
+            setReturnTo(null);
+            setShowVoices(false);
+          }}
           onDefaultChange={refreshDefaultVoiceName}
+          initialSection={returnTo ?? ''}
+          onLeave={(section) => {
+            returnToVoices = section;
+          }}
         />
       </div>
     );

@@ -1,3 +1,5 @@
+import type { ReadingSpeed, ReadingSpeedSample, ReadingSpeedUnit } from '@/types/statistics';
+
 /** Minimum reading in a day for it to count toward a streak. */
 const MIN_STREAK_SECONDS = 60;
 
@@ -17,6 +19,34 @@ const addDays = (date: Date, days: number) => {
   const d = new Date(date);
   d.setDate(d.getDate() + days);
   return d;
+};
+
+/** Split intervals at local midnight and sum counts and time independently for each unit. */
+export const getDailyReadingSpeeds = (
+  samples: ReadingSpeedSample[],
+  startMs: number,
+  endMs: number,
+): Map<string, ReadingSpeed[]> => {
+  const days = new Map<string, Map<ReadingSpeedUnit, ReadingSpeed>>();
+  for (const sample of samples) {
+    const end = Math.min(endMs, sample.startTimeMs + sample.durationMs);
+    let start = Math.max(startMs, sample.startTimeMs);
+    while (start < end) {
+      const date = new Date(start);
+      const key = toDateKey(date);
+      const midnight = new Date(date.getFullYear(), date.getMonth(), date.getDate() + 1).getTime();
+      const until = Math.min(end, midnight);
+      const durationMs = until - start;
+      const units = days.get(key) ?? new Map<ReadingSpeedUnit, ReadingSpeed>();
+      const entry = units.get(sample.unit) ?? { unit: sample.unit, count: 0, durationMs: 0 };
+      entry.count += (sample.count * durationMs) / sample.durationMs;
+      entry.durationMs += durationMs;
+      units.set(sample.unit, entry);
+      days.set(key, units);
+      start = until;
+    }
+  }
+  return new Map([...days].map(([key, units]) => [key, [...units.values()]]));
 };
 
 /** Folds quarter-hour totals into seconds read on each local day. */
@@ -99,26 +129,36 @@ export const getStreaks = (daily: Map<string, number>, today = new Date()) => {
   return { current, longest };
 };
 
-/** Bars for the last 7 or 30 days, or for the last 12 months. */
+/** Start of the calendar week (Sunday-first, like the heatmap), month or year `delta` periods from the one holding `date`. */
+export const shiftPeriod = (range: ReadingRange, date: Date, delta: number): Date => {
+  const year = date.getFullYear();
+  if (range === 'year') return new Date(year + delta, 0, 1);
+  if (range === 'month') return new Date(year, date.getMonth() + delta, 1);
+  return new Date(year, date.getMonth(), date.getDate() - date.getDay() + 7 * delta);
+};
+
+/** Bars for each day of the calendar week or month holding `date`, or for each month of its year. */
 export const getReadingBars = (
   daily: Map<string, number>,
   range: ReadingRange,
-  today = new Date(),
+  date = new Date(),
 ): ReadingBar[] => {
+  const start = shiftPeriod(range, date, 0);
   if (range === 'year') {
     return Array.from({ length: 12 }, (_, i) => {
-      const date = new Date(today.getFullYear(), today.getMonth() - 11 + i, 1);
-      const prefix = toDateKey(date).slice(0, 8);
+      const month = new Date(start.getFullYear(), i, 1);
+      const prefix = toDateKey(month).slice(0, 8);
       let seconds = 0;
       for (const [key, value] of daily) {
         if (key.startsWith(prefix)) seconds += value;
       }
-      return { date, seconds };
+      return { date: month, seconds };
     });
   }
-  const length = range === 'week' ? 7 : 30;
-  return Array.from({ length }, (_, i) => {
-    const date = addDays(today, i - length + 1);
-    return { date, seconds: daily.get(toDateKey(date)) ?? 0 };
-  });
+  const end = shiftPeriod(range, start, 1);
+  const bars: ReadingBar[] = [];
+  for (let day = start; day < end; day = addDays(day, 1)) {
+    bars.push({ date: day, seconds: daily.get(toDateKey(day)) ?? 0 });
+  }
+  return bars;
 };

@@ -162,6 +162,7 @@ class AnkiOutgoingNoteArg {
 @InvokeArg
 class AnkiAddNotesArgs {
     var deckName: String = ""
+    var modelId: Long? = null
     var notes: Array<AnkiOutgoingNoteArg> = emptyArray()
 }
 
@@ -174,6 +175,30 @@ class AnkiTagUpdateArg {
 @InvokeArg
 class AnkiUpdateTagsArgs {
     var notes: Array<AnkiTagUpdateArg> = emptyArray()
+}
+
+@InvokeArg
+class AnkiNoteFillArg {
+    var id: Long = 0
+    var word: String = ""
+    var language: String = ""
+}
+
+@InvokeArg
+class AnkiUpgradeNoteTypeArgs {
+    var notes: Array<AnkiNoteFillArg> = emptyArray()
+}
+
+@InvokeArg
+class AnkiEntryArg {
+    var id: Long = 0
+    var field: Int = -1
+    var entry: String = ""
+}
+
+@InvokeArg
+class AnkiSetEntriesArgs {
+    var notes: Array<AnkiEntryArg> = emptyArray()
 }
 
 @InvokeArg
@@ -2183,6 +2208,20 @@ class NativeBridgePlugin(private val activity: Activity): Plugin(activity) {
         JSObject().apply { put("decks", decks) }
     }
 
+    /** Every note type in the collection with its field names, for card profiles (#7849). */
+    @Command
+    fun anki_list_note_types(invoke: Invoke) = ankiCall(invoke) { cr ->
+        val types = JSArray()
+        AnkiDroidLink.listNoteTypes(cr).forEach { t ->
+            types.put(JSObject().apply {
+                put("id", t.id)
+                put("name", t.name)
+                put("fields", JSArray(t.fields))
+            })
+        }
+        JSObject().apply { put("noteTypes", types) }
+    }
+
     @Command
     fun anki_read_deck(invoke: Invoke) {
         val args = invoke.parseArgs(AnkiReadDeckArgs::class.java)
@@ -2191,6 +2230,7 @@ class NativeBridgePlugin(private val activity: Activity): Plugin(activity) {
             AnkiDroidLink.readNotes(cr, args.deckIds.toList()).forEach { n ->
                 notes.put(JSObject().apply {
                     put("id", n.id)
+                    put("mid", n.mid)
                     put("fields", JSArray(n.fields))
                     put("tags", n.tags)
                 })
@@ -2224,7 +2264,7 @@ class NativeBridgePlugin(private val activity: Activity): Plugin(activity) {
         val args = invoke.parseArgs(AnkiAddNotesArgs::class.java)
         ankiCall(invoke) { cr ->
             val notes = args.notes.map { it.fields.toList() to it.tags.toList() }
-            JSObject().apply { put("added", AnkiDroidLink.addNotes(cr, args.deckName, notes)) }
+            JSObject().apply { put("added", AnkiDroidLink.addNotes(cr, args.deckName, args.modelId, notes)) }
         }
     }
 
@@ -2234,6 +2274,36 @@ class NativeBridgePlugin(private val activity: Activity): Plugin(activity) {
         ankiCall(invoke) { cr ->
             val notes = args.notes.map { it.id to it.tags.toList() }
             JSObject().apply { put("updated", AnkiDroidLink.updateTags(cr, notes)) }
+        }
+    }
+
+    /** Whether the Readest note type is behind its current fields or template, plus its id and fields. */
+    @Command
+    fun anki_note_type(invoke: Invoke) = ankiCall(invoke) { cr ->
+        JSObject().apply {
+            put("outdated", AnkiDroidLink.noteTypeOutdated(cr))
+            AnkiDroidLink.findNoteType(cr)?.let { (mid, names) ->
+                put("id", mid)
+                put("fields", JSArray(names))
+            }
+        }
+    }
+
+    @Command
+    fun anki_set_entries(invoke: Invoke) {
+        val args = invoke.parseArgs(AnkiSetEntriesArgs::class.java)
+        ankiCall(invoke) { cr ->
+            val entries = args.notes.map { Triple(it.id, it.field, it.entry) }
+            JSObject().apply { put("updated", AnkiDroidLink.setEntries(cr, entries)) }
+        }
+    }
+
+    @Command
+    fun anki_upgrade_note_type(invoke: Invoke) {
+        val args = invoke.parseArgs(AnkiUpgradeNoteTypeArgs::class.java)
+        ankiCall(invoke) { cr ->
+            val fills = args.notes.map { Triple(it.id, it.word, it.language) }
+            JSObject().apply { put("updated", AnkiDroidLink.upgradeNoteType(cr, fills)) }
         }
     }
 

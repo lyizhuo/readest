@@ -13,6 +13,7 @@ import type { AISettings } from '@/services/ai/types';
 import type { CoverSearchEngine } from '@/services/metadata/coverSearch';
 import type { NotebookTab } from '@/store/notebookStore';
 import type { DictionarySettings, ImportedDictionary } from '@/services/dictionaries/types';
+import type { AnkiProfileSettings } from '@/services/vocabulary/types';
 
 export type ThemeType = 'light' | 'dark' | 'auto';
 export type LibraryViewModeType = 'grid' | 'list';
@@ -42,6 +43,16 @@ export type LibrarySortByType = (typeof LibrarySortByType)[keyof typeof LibraryS
  */
 export type LibrarySecondarySortByType = LibrarySortByType | 'none';
 
+export type LibraryMetadataSortByType = Exclude<
+  LibrarySortByType,
+  typeof LibrarySortByType.Custom | typeof LibrarySortByType.Size
+>;
+
+export interface LibrarySortCriterion {
+  by: LibraryMetadataSortByType;
+  ascending: boolean;
+}
+
 export type LibraryCoverFitType = 'crop' | 'fit';
 
 export const LibraryGroupByType = {
@@ -57,6 +68,7 @@ export const LibraryGroupByType = {
 export type LibraryGroupByType = (typeof LibraryGroupByType)[keyof typeof LibraryGroupByType];
 
 export type KOSyncChecksumMethod = 'binary' | 'filename';
+export type KOSyncFilenameFormat = 'original' | 'author-title' | 'title-author';
 export type KOSyncStrategy = 'prompt' | 'silent' | 'send' | 'receive';
 
 export interface ReadSettings {
@@ -100,6 +112,11 @@ export interface KOSyncSettings {
   deviceId: string;
   deviceName: string;
   checksumMethod: KOSyncChecksumMethod;
+  /**
+   * The name the File Name checksum hashes for a book without a name of its
+   * own (`BookMetadata.kosyncFilename`). Unset means 'original'.
+   */
+  filenameFormat?: KOSyncFilenameFormat;
   strategy: KOSyncStrategy;
   customHeaders?: Record<string, string>;
   /**
@@ -125,6 +142,12 @@ export interface BookOrbitSettings {
   username: string;
   userkey: string;
   password?: string;
+  /**
+   * BookOrbit 3.8+ API key for the audiobook API. When set, it is sent as the
+   * bearer instead of signing in with `password`; KOReader sync still uses
+   * `username` and `userkey`, which BookOrbit's KOReader routes require.
+   */
+  apiKey?: string;
   deviceId: string;
   deviceName: string;
   strategy: KOSyncStrategy;
@@ -267,6 +290,7 @@ export interface WebDAVSettings {
   syncProgress?: boolean;
   syncNotes?: boolean;
   syncBooks?: boolean;
+  syncFonts?: boolean;
   // When true, "Sync now" re-checks every book instead of only those whose
   // local copy differs from the shared library.json index (the default
   // incremental walk). An escape hatch for drift or a first full sync.
@@ -301,6 +325,7 @@ export interface GoogleDriveSettings {
   syncProgress?: boolean;
   syncNotes?: boolean;
   syncBooks?: boolean;
+  syncFonts?: boolean;
   fullSync?: boolean;
   strategy?: KOSyncStrategy;
   deviceId?: string;
@@ -329,6 +354,7 @@ export interface S3Settings {
   syncProgress?: boolean;
   syncNotes?: boolean;
   syncBooks?: boolean;
+  syncFonts?: boolean;
   fullSync?: boolean;
   strategy?: KOSyncStrategy;
   deviceId?: string;
@@ -351,6 +377,7 @@ export interface OneDriveSettings {
   syncProgress?: boolean;
   syncNotes?: boolean;
   syncBooks?: boolean;
+  syncFonts?: boolean;
   fullSync?: boolean;
   strategy?: KOSyncStrategy;
   deviceId?: string;
@@ -370,6 +397,7 @@ export interface ICloudSettings {
   syncProgress?: boolean;
   syncNotes?: boolean;
   syncBooks?: boolean;
+  syncFonts?: boolean;
   fullSync?: boolean;
   strategy?: KOSyncStrategy;
   deviceId?: string;
@@ -564,7 +592,12 @@ export interface SystemSettings {
   libraryThenSortBy: LibrarySecondarySortByType;
   /** Sort order of the secondary ("Then by") key, independent of `librarySortAscending` (#5119). */
   libraryThenSortAscending: boolean;
+  /** Ordered list of unique metadata sort criteria (highest priority first) with per-criterion direction. */
+  librarySortOrder?: LibrarySortCriterion[];
   libraryGroupBy: LibraryGroupByType;
+  /** Whether the View menu's Group by... and Sort by... sections open expanded (#7893). */
+  libraryGroupByExpanded: boolean;
+  librarySortByExpanded: boolean;
   libraryCoverFit: LibraryCoverFitType;
   libraryAutoColumns: boolean;
   libraryColumns: number;
@@ -593,6 +626,8 @@ export interface SystemSettings {
   customTextures: CustomTexture[];
   customDictionaries: ImportedDictionary[];
   dictionarySettings: DictionarySettings;
+  /** The card profiles Sync with Anki uses (#7849); Readest's own cards without one. */
+  ankiProfiles?: AnkiProfileSettings;
   opdsCatalogs: OPDSCatalog[];
   absServers: ABSServer[];
   /** User-configured translation backends; synced as `custom_translator`. */
@@ -608,6 +643,7 @@ export interface SystemSettings {
   metadataSeriesCollapsed: boolean;
   metadataOthersCollapsed: boolean;
   metadataDescriptionCollapsed: boolean;
+  metadataStatsCollapsed: boolean;
   lastSyncedAtBooks: number;
   lastSyncedAtConfigs: number;
   lastSyncedAtNotes: number;
@@ -655,6 +691,12 @@ export interface SystemSettings {
    * distinct identifier semantics and rotation policies.
    */
   replicaDeviceId?: string;
+  /**
+   * iOS only: copy of the device-bound keychain anchor. When it differs from
+   * the keychain, settings.json came from another device and the sync device
+   * IDs above are replaced (#7558).
+   */
+  deviceAnchor?: string;
   /**
    * Per-kind cursor for replica sync. Stores the HLC string of the last
    * pulled row per kind. Absent kinds pull from the beginning.

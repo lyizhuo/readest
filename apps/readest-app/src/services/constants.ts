@@ -177,6 +177,7 @@ export const DEFAULT_WEBDAV_SETTINGS = {
   syncProgress: true,
   syncNotes: true,
   syncBooks: false,
+  syncFonts: true,
   strategy: 'silent',
   deviceId: '',
   lastSyncedAt: 0,
@@ -187,6 +188,7 @@ export const DEFAULT_GOOGLE_DRIVE_SETTINGS = {
   syncProgress: true,
   syncNotes: true,
   syncBooks: false,
+  syncFonts: true,
   strategy: 'silent',
   deviceId: '',
   lastSyncedAt: 0,
@@ -202,6 +204,7 @@ export const DEFAULT_S3_SETTINGS = {
   syncProgress: true,
   syncNotes: true,
   syncBooks: false,
+  syncFonts: true,
   strategy: 'silent',
   deviceId: '',
   lastSyncedAt: 0,
@@ -212,6 +215,7 @@ export const DEFAULT_ONEDRIVE_SETTINGS = {
   syncProgress: true,
   syncNotes: true,
   syncBooks: false,
+  syncFonts: true,
   strategy: 'silent',
   deviceId: '',
   lastSyncedAt: 0,
@@ -222,6 +226,7 @@ export const DEFAULT_ICLOUD_SETTINGS = {
   syncProgress: true,
   syncNotes: true,
   syncBooks: false,
+  syncFonts: true,
   strategy: 'silent',
   deviceId: '',
   lastSyncedAt: 0,
@@ -264,6 +269,8 @@ export const DEFAULT_SYSTEM_SETTINGS: Partial<SystemSettings> = {
   libraryThenSortBy: 'none',
   libraryThenSortAscending: true,
   libraryGroupBy: LibraryGroupByType.Group,
+  libraryGroupByExpanded: false,
+  librarySortByExpanded: false,
   libraryCoverFit: 'crop',
   libraryAutoColumns: true,
   libraryColumns: 6,
@@ -274,6 +281,7 @@ export const DEFAULT_SYSTEM_SETTINGS: Partial<SystemSettings> = {
   metadataSeriesCollapsed: false,
   metadataOthersCollapsed: false,
   metadataDescriptionCollapsed: false,
+  metadataStatsCollapsed: false,
 
   pinCodeEnabled: false,
 
@@ -610,6 +618,7 @@ export const DEFAULT_ANNOTATOR_CONFIG: AnnotatorConfig = {
   keepSelectionAfterLookup: false,
   annotationToolbarItems: DEFAULT_ANNOTATION_TOOLBAR_ITEMS,
   copyToNotebook: false,
+  copyWithCitation: false,
   noteExportConfig: DEFAULT_NOTE_EXPORT_CONFIG,
 };
 
@@ -1039,6 +1048,10 @@ export const SYNC_PROGRESS_INTERVAL_SEC = 3;
 export const SYNC_NOTES_INTERVAL_SEC = 5;
 export const SYNC_BOOKS_INTERVAL_SEC = 5;
 export const CHECK_UPDATE_INTERVAL_SEC = 24 * 60 * 60;
+// A manual update check that hasn't answered by then reports an error, which
+// shows for UPDATE_ERROR_DISPLAY_MS before the Check Update button returns.
+export const CHECK_UPDATE_TIMEOUT_MS = 15_000;
+export const UPDATE_ERROR_DISPLAY_MS = 5_000;
 
 export const MAX_ZOOM_LEVEL = 500;
 export const MIN_ZOOM_LEVEL = 50;
@@ -1058,7 +1071,7 @@ export const CONTRAST_STEP = 10;
 export const AUTO_SCROLL_BASE_PX_PER_SEC = 20;
 export const MAX_AUTO_SCROLL_SPEED = 500;
 export const MIN_AUTO_SCROLL_SPEED = 25;
-export const AUTO_SCROLL_SPEED_STEP = 25;
+export const AUTO_SCROLL_SPEED_STEP = 5;
 
 export const SHOW_UNREAD_STATUS_BADGE = false;
 
@@ -1075,6 +1088,9 @@ export const DEFAULT_DAILY_TRANSLATION_QUOTA: UserDailyTranslationQuota = {
   pro: 500 * 1024,
   purchase: 0,
 };
+
+// Devices a Free account syncs on; every other plan has no limit.
+export const FREE_PLAN_DEVICE_LIMIT = 3;
 
 export const DEFAULT_DAILY_TTS_QUOTA: UserDailyTTSQuota = {
   free: 0,

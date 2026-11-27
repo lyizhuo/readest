@@ -41,6 +41,13 @@ vi.mock('@/services/tts/WebAudioPlayer', async (importActual) => ({
   startAudioKeepAlive: () => startKeepAlive(),
   stopAudioKeepAlive: () => stopKeepAlive(),
 }));
+const releaseUnblock = vi.fn();
+const unblock = vi.fn();
+vi.mock('@/services/tts/ttsMediaBridge', async (importActual) => ({
+  ...(await importActual<typeof import('@/services/tts/ttsMediaBridge')>()),
+  releaseUnblockAudio: () => releaseUnblock(),
+  unblockAudio: () => unblock(),
+}));
 
 vi.mock('@/services/tts/TTSUtils', () => ({
   TTSUtils: {
@@ -227,6 +234,127 @@ describe('TTSController', () => {
     // is still alive.
     await new Promise((resolve) => setTimeout(resolve, 0));
     vi.restoreAllMocks();
+  });
+
+  describe('iOS Web TTS silent audio ownership', () => {
+    beforeEach(() => {
+      vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue(
+        'Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X)',
+      );
+      releaseUnblock.mockClear();
+      unblock.mockClear();
+      speakingControllers.push(controller);
+    });
+
+    test('releases the silent audio once reading starts with Web TTS', async () => {
+      vi.mocked(TTSUtils.getPreferredClient).mockReturnValueOnce('web');
+      await controller.init();
+      await controller.initViewTTS(0);
+      expect(
+        releaseUnblock,
+        'the silent audio is left alone until reading starts',
+      ).not.toHaveBeenCalled();
+
+      await controller.speak('<speak>hello</speak>');
+
+      expect(controller.ttsClient).toBe(controller.ttsWebClient);
+      expect(releaseUnblock, 'the silent audio is released for Web TTS').toHaveBeenCalled();
+      expect(unblock, 'the silent audio stays released').not.toHaveBeenCalled();
+    });
+
+    test("releases it when the book's language picks Web TTS", async () => {
+      await controller.init();
+      await controller.initViewTTS(0);
+      expect(controller.ttsClient).toBe(controller.ttsEdgeClient);
+      expect(unblock, 'the silent audio is left alone until reading starts').not.toHaveBeenCalled();
+
+      vi.mocked(TTSUtils.getPreferredClientForLang).mockReturnValueOnce('web');
+      await controller.setLang('ja');
+      await controller.speak('<speak>hello</speak>');
+
+      expect(controller.ttsClient).toBe(controller.ttsWebClient);
+      expect(releaseUnblock, 'the silent audio is released for Web TTS').toHaveBeenCalled();
+      expect(unblock, 'the silent audio stays released').not.toHaveBeenCalled();
+    });
+
+    test('restores it when switching from Web TTS to Edge', async () => {
+      controller.ttsEdgeVoices = [{ id: 'edge-voice-1', name: 'Edge', lang: 'ja-JP' }];
+      await controller.initViewTTS(0);
+
+      await controller.setVoice('unknown-voice', 'ja');
+      await controller.start();
+      expect(controller.ttsClient).toBe(controller.ttsWebClient);
+      expect(releaseUnblock, 'the silent audio is released for Web TTS').toHaveBeenCalledTimes(1);
+
+      await controller.stop();
+      await controller.setVoice('edge-voice-1', 'ja');
+      await controller.start();
+      expect(controller.ttsClient).toBe(controller.ttsEdgeClient);
+      expect(unblock, 'the silent audio is restored for Edge').toHaveBeenCalledTimes(1);
+    });
+
+    test('plays the silent audio for a voice change only in the browser on iOS', () => {
+      controller.unblockSilentAudio();
+      expect(unblock, 'played in the browser on iOS').toHaveBeenCalledTimes(1);
+
+      vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue(
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+      );
+      controller.unblockSilentAudio();
+      expect(unblock, 'left alone on Windows').toHaveBeenCalledTimes(1);
+
+      vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue(
+        'Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X)',
+      );
+      const iosApp = new TTSController(createMockAppService(false, true), mockView, false);
+      iosApp.unblockSilentAudio();
+      expect(unblock, 'left alone in the iOS app').toHaveBeenCalledTimes(1);
+    });
+
+    test('leaves the silent audio alone for Web TTS on Windows', async () => {
+      vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue(
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+      );
+      await controller.initViewTTS(0);
+
+      await controller.setVoice('unknown-voice', 'ja');
+      await controller.start();
+
+      expect(releaseUnblock).not.toHaveBeenCalled();
+      expect(unblock).not.toHaveBeenCalled();
+    });
+
+    // iPadOS Safari sends a desktop ("Macintosh") user agent.
+    test('releases it for Web TTS in the browser on iPad', async () => {
+      vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue(
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/26.0 Safari/605.1.15',
+      );
+      Object.defineProperty(navigator, 'maxTouchPoints', { value: 5, configurable: true });
+      try {
+        await controller.initViewTTS(0);
+
+        await controller.setVoice('unknown-voice', 'ja');
+        await controller.start();
+
+        expect(controller.ttsClient).toBe(controller.ttsWebClient);
+        expect(releaseUnblock, 'the silent audio is released on iPad').toHaveBeenCalled();
+      } finally {
+        Reflect.deleteProperty(navigator, 'maxTouchPoints');
+      }
+    });
+
+    test('leaves it alone for Web TTS in the browser on a Mac', async () => {
+      vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue(
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/26.0 Safari/605.1.15',
+      );
+      await controller.initViewTTS(0);
+
+      await controller.setVoice('unknown-voice', 'ja');
+      await controller.start();
+
+      expect(releaseUnblock).not.toHaveBeenCalled();
+      expect(unblock).not.toHaveBeenCalled();
+    });
   });
 
   describe('constructor', () => {
@@ -2245,6 +2373,105 @@ describe('TTSController', () => {
       await c.pause();
 
       expect(startKeepAlive).toHaveBeenCalled();
+    });
+
+    // The tone keeps an audio output open, so a session left paused held one
+    // open for good and kept a sleeping BOOX from suspending (#7546).
+    // Transport still reaches the page for as long as Media3 keeps a paused
+    // player in the foreground.
+    test.each([
+      ['native', false],
+      ['Edge', true],
+    ] as const)('drops the keep-alive once a paused %s session has idled for ten minutes', async (_engine, buffered) => {
+      const c = await makeAndroidNativeController();
+      if (buffered) c.ttsClient = c.ttsEdgeClient;
+      vi.spyOn(c, 'forward').mockResolvedValue();
+      c.speak('<speak>hello</speak>');
+      await vi.waitFor(() => expect(c.state).toBe('playing'), { timeout: 5000 });
+      vi.useFakeTimers();
+      try {
+        await c.pause();
+        expect(startKeepAlive).toHaveBeenCalled();
+        stopKeepAlive.mockClear();
+
+        await vi.advanceTimersByTimeAsync(10 * 60 * 1000 - 1);
+        expect(stopKeepAlive).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        expect(stopKeepAlive).toHaveBeenCalled();
+        expect(c.state).toContain('paused');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    test('a session played again before the limit keeps its keep-alive', async () => {
+      const c = await makeAndroidNativeController();
+      vi.spyOn(c, 'forward').mockResolvedValue();
+      c.speak('<speak>hello</speak>');
+      await vi.waitFor(() => expect(c.state).toBe('playing'), { timeout: 5000 });
+      vi.useFakeTimers();
+      try {
+        await c.pause();
+        await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+        c.speak('<speak>hello again</speak>');
+        await vi.advanceTimersByTimeAsync(0);
+        expect(c.state).toBe('playing');
+        stopKeepAlive.mockClear();
+
+        await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
+        expect(stopKeepAlive).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    test('a session parked by sentence-by-sentence mode drops the keep-alive after ten minutes', async () => {
+      const c = await makeAndroidNativeController();
+      let count = 0;
+      c.ttsClient.speak = vi.fn().mockImplementation(async function* (
+        _ssml: string,
+        _signal: AbortSignal,
+        preload?: boolean,
+      ): AsyncGenerator<TTSMessageEvent> {
+        if (preload || count++ > 0) return;
+        yield { code: 'end' };
+      });
+      c.pauseAfterSentence = true;
+      vi.useFakeTimers();
+      try {
+        await c.speak('<speak>hello</speak>');
+        await vi.advanceTimersByTimeAsync(0);
+        expect(c.state).toBe('forward-paused');
+        stopKeepAlive.mockClear();
+
+        await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
+        expect(stopKeepAlive).toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    // A direct-speak engine that pauses in place (Web Speech) resumes through
+    // resume(), not a new speak(), so the tone dropped at the limit must come
+    // back there or the hidden page stalls between sentences again (#4408).
+    test('resuming in place after the limit restores the keep-alive', async () => {
+      const c = await makeAndroidNativeController();
+      vi.spyOn(c, 'forward').mockResolvedValue();
+      c.speak('<speak>hello</speak>');
+      await vi.waitFor(() => expect(c.state).toBe('playing'), { timeout: 5000 });
+      vi.useFakeTimers();
+      try {
+        await c.pause();
+        expect(c.state).toBe('paused');
+        await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
+        expect(stopKeepAlive).toHaveBeenCalled();
+        startKeepAlive.mockClear();
+
+        await c.resume();
+        expect(startKeepAlive).toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     test('does not keep the page awake while paused off Android', async () => {

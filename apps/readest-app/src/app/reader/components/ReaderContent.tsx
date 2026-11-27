@@ -1,5 +1,6 @@
 'use client';
 
+import clsx from 'clsx';
 import React, { useEffect, useRef, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 
@@ -19,6 +20,7 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import { UnlistenFn } from '@tauri-apps/api/event';
 import { tauriHandleClose, tauriHandleOnCloseWindow } from '@/utils/window';
 import { isTauriAppPlatform } from '@/services/environment';
+import { ttsSessionManager } from '@/services/tts/TTSSessionManager';
 import { splitLibraryOpenIds } from '@/utils/audiobook';
 import { uniqueId } from '@/utils/misc';
 import { eventDispatcher } from '@/utils/event';
@@ -318,6 +320,11 @@ const ReaderContent: React.FC<{ ids?: string; settings: SystemSettings }> = ({ i
   };
 
   const navigateBackToLibrary = () => {
+    // A reader window never mounted the library, so its launch-only restores
+    // are still armed and would reopen the book just closed.
+    const { setCheckOpenWithBooks, setCheckLastOpenBooks } = useLibraryStore.getState();
+    setCheckOpenWithBooks(false);
+    setCheckLastOpenBooks(false);
     navigateToLibrary(router, '', undefined, true);
   };
 
@@ -391,9 +398,14 @@ const ReaderContent: React.FC<{ ids?: string; settings: SystemSettings }> = ({ i
   const handleCloseBooksToLibrary = async () => {
     // SPA navigation in the main window (or on web) keeps the webview alive:
     // TTS may continue headless. Non-main Tauri windows close their webview
-    // below, but their per-window TTS dies with the window either way.
+    // below, unless Read Aloud is live: its session and mini player belong to
+    // this webview, so they go to the library here as well (#7523).
     await runNotebookTransition(bookKeys, async () => {
-      if (isTauriAppPlatform() && getCurrentWindow().label !== 'main') {
+      if (
+        isTauriAppPlatform() &&
+        getCurrentWindow().label !== 'main' &&
+        !ttsSessionManager.getActiveSession()
+      ) {
         await closeBooks(true);
         if (appService) {
           await ensureMainLibraryWindow(appService);
@@ -410,8 +422,9 @@ const ReaderContent: React.FC<{ ids?: string; settings: SystemSettings }> = ({ i
 
   const handleCloseBook = async (bookKey: string) => {
     // Header X / pane close: an SPA-side close on web and the main window.
-    // The Tauri reader-window branches below destroy their webview, which
-    // takes the per-window TTS with it either way.
+    // The Tauri window branches below destroy their webview, so they are
+    // skipped while Read Aloud is live: the session keeps playing after the
+    // book closes, and its mini player lives in this webview's library (#7523).
     const closeBook = async () => {
       await saveConfigAndCloseBook(bookKey, true);
       if (sideBarBookKey === bookKey) {
@@ -432,7 +445,7 @@ const ReaderContent: React.FC<{ ids?: string; settings: SystemSettings }> = ({ i
       await closeBook();
       if (isLastBook) {
         const openWithFiles = (await parseOpenWithFiles(appService)) || [];
-        if (appService?.hasWindow) {
+        if (appService?.hasWindow && !ttsSessionManager.getActiveSession()) {
           if (openWithFiles.length > 0) {
             void tauriHandleOnCloseWindow(handleCloseBooks).catch((error) => {
               console.info('Failed to register close-window listener:', error);
@@ -451,6 +464,7 @@ const ReaderContent: React.FC<{ ids?: string; settings: SystemSettings }> = ({ i
     });
   };
 
+  const isWebPwa = appService?.appPlatform === 'web' && appService.hasSafeAreaInset;
   if (!bookKeys || bookKeys.length === 0) return null;
   const bookData = getBookData(bookKeys[0]!);
   const viewSettings = getViewSettings(bookKeys[0]!);
@@ -459,7 +473,9 @@ const ReaderContent: React.FC<{ ids?: string; settings: SystemSettings }> = ({ i
     return (
       loading &&
       !errorLoading && (
-        <div className='hero hero-content full-height'>
+        <div
+          className={clsx('hero hero-content full-height', isWebPwa && 'bg-base-100 fixed inset-0')}
+        >
           <Spinner loading={true} />
         </div>
       )

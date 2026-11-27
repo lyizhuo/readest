@@ -5,11 +5,12 @@ const mocks = vi.hoisted(() => ({
   premium: true,
 }));
 
-vi.mock('@/services/dictionaries/contextDictionary', () => ({
+vi.mock('@/services/dictionaries/contextDictionary', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/services/dictionaries/contextDictionary')>()),
   lookupInContext: mocks.lookupInContext,
 }));
 vi.mock('@/utils/access', () => ({
-  getAccessToken: async () => 'token',
+  getSignedInToken: () => 'token',
   isCustomTranslatorAllowed: () => mocks.premium,
 }));
 
@@ -175,9 +176,8 @@ describe('context dictionary provider', () => {
   });
 
   it.each([
-    'connection lost',
-    'Request cancelled',
     'The AI provider returned an invalid reply.',
+    'The AI provider returned an incomplete entry.',
   ])('clears a partial entry before displaying a lookup failure: %s', async (message) => {
     setTranslators([llm('a')]);
     const container = document.createElement('div');

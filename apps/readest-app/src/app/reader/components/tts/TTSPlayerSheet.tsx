@@ -1,9 +1,10 @@
 import clsx from 'clsx';
-import { useEffect, useMemo, useState } from 'react';
+import { type ChangeEvent, useEffect, useMemo, useState } from 'react';
 import {
   MdAlarm,
   MdArrowBackIosNew,
   MdCheck,
+  MdClose,
   MdKeyboardArrowLeft,
   MdKeyboardArrowRight,
   MdKeyboardDoubleArrowLeft,
@@ -12,6 +13,7 @@ import {
   MdPlayArrow,
   MdOutlineFileDownload,
   MdChevronRight,
+  MdSearch,
   MdSkipNext,
   MdSkipPrevious,
   MdTextDecrease,
@@ -41,6 +43,7 @@ import { getBookProgress } from '@/store/readerProgressStore';
 import { MULTILINGUAL_LANG } from '@/services/tts/types';
 import { getPagePreviewText, getSampleText } from '@/services/tts/voicePreviewText';
 import Dialog from '@/components/Dialog';
+import { BoxedList, SettingsRow, SettingsSelect } from '@/components/settings/primitives';
 import VoiceList from '@/components/tts/VoiceList';
 import { PageInfo } from '@/types/book';
 import { TTSPlaybackInfo } from './usePlaybackInfo';
@@ -56,6 +59,11 @@ import { TTS_STOP_AT_CHAPTER_END } from '@/services/tts/TTSSessionManager';
 import type { UseTTSDownloadsResult } from '@/app/reader/hooks/useTTSDownloads';
 
 type SheetView = 'main' | 'speed' | 'voice' | 'timer' | 'chapters';
+
+// One section of the voice list: an engine, or one custom service / system
+// engine within it (those share an engine id). Mirrors the Settings voice
+// library so this picker narrows the very same groups that one does.
+const sectionKey = (group: TTSVoicesGroup) => `${group.engine}/${group.id}`;
 
 // Exported so the audiobook player route (src/app/player/components/PlayerView.tsx)
 // can reuse the same sleep-timer preset list instead of duplicating it.
@@ -106,6 +114,8 @@ type TTSPlayerSheetProps = {
   // `resume`: start reading again with the voice (a preview stopped reading).
   onSetVoice: (voice: string, lang: string, resume?: boolean) => void;
   onGetVoiceId: () => string;
+  // The voice the engine reads with, once it has resolved one.
+  voiceId: string;
   onSelectTimeout: (bookKey: string, value: number) => void;
   onSeek: (seconds: number) => Promise<void>;
   onSeekPreview: (seconds: number) => void;
@@ -153,6 +163,7 @@ const TTSPlayerSheet = ({
   onGetVoices,
   onSetVoice,
   onGetVoiceId,
+  voiceId,
   onSelectTimeout,
   onSeek,
   onSeekPreview,
@@ -193,6 +204,9 @@ const TTSPlayerSheet = ({
   const [coverFailed, setCoverFailed] = useState(false);
   const [view, setView] = useState<SheetView>('main');
   const [voiceGroups, setVoiceGroups] = useState<TTSVoicesGroup[]>([]);
+  // The voice view's engine ('' for all of them) and filter text.
+  const [voiceSection, setVoiceSection] = useState('');
+  const [voiceQuery, setVoiceQuery] = useState('');
   const [rate, setRate] = useState(viewSettings?.ttsRate ?? 1.0);
   const [selectedVoice, setSelectedVoice] = useState('');
   // Previews read the page being read aloud, else a sample in the voice's
@@ -283,12 +297,13 @@ const TTSPlayerSheet = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen]);
 
-  // Opened while the clients initialized: pick up the voice once they are
-  // ready, without leaving the view the user is on.
+  // Opened before the engine resolved its voice (on the first utterance, after
+  // the clients are ready): pick it up then, without leaving the view the user
+  // is on. A voice already shown stays.
   useEffect(() => {
-    if (isOpen && clientsReady) setSelectedVoice(onGetVoiceId());
+    if (isOpen && voiceId) setSelectedVoice((prev) => prev || voiceId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [clientsReady]);
+  }, [voiceId]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -305,6 +320,28 @@ const TTSPlayerSheet = ({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen, ttsLang, clientsReady]);
+
+  // The engine picker narrows the list to one section; the text filter (and
+  // VoiceList's gender tabs) narrow it further. Same model as the Settings
+  // voice library, so the two pages behave identically.
+  const activeSection = voiceGroups.some((group) => sectionKey(group) === voiceSection)
+    ? voiceSection
+    : '';
+  const shownGroups = activeSection
+    ? voiceGroups.filter((group) => sectionKey(group) === activeSection)
+    : voiceGroups;
+  const sections = [
+    { value: '', label: _('All') },
+    ...voiceGroups.map((group) => ({
+      value: sectionKey(group),
+      label: group.literalName ? group.name : _(group.name),
+    })),
+  ];
+
+  const handleSectionChange = (event: ChangeEvent<HTMLSelectElement>) => {
+    voicePreview.stop();
+    setVoiceSection(event.target.value);
+  };
 
   const handleSelectRate = (value: number) => {
     setRate(value);
@@ -402,6 +439,7 @@ const TTSPlayerSheet = ({
       : loopState === 'a'
         ? _('Set Repeat End (B)')
         : _('Clear A-B Repeat');
+  const arrowButtonClass = '@max-[360px]:p-1.5 rounded-full p-2';
   const modeButtonClass = (active: boolean) =>
     clsx(
       'flex h-9 min-w-9 items-center justify-center rounded-full px-1.5',
@@ -414,7 +452,7 @@ const TTSPlayerSheet = ({
         type='button'
         aria-label={_('Close')}
         onClick={onClose}
-        className='bg-base-300/65 btn btn-ghost btn-circle absolute end-3 top-1 z-10 hidden h-6 min-h-6 w-6 focus:outline-hidden sm:flex'
+        className='bg-base-300/65 eink:bg-transparent btn btn-ghost btn-circle absolute end-3 top-1 z-10 hidden h-6 min-h-6 w-6 focus:outline-hidden sm:flex'
       >
         <svg xmlns='http://www.w3.org/2000/svg' width='1em' height='1em' viewBox='0 0 24 24'>
           <path
@@ -451,6 +489,9 @@ const TTSPlayerSheet = ({
     <Dialog
       id='tts_player_sheet'
       isOpen={isOpen}
+      // The voice filter field must stay reachable while the software
+      // keyboard is up on short mobile viewports.
+      aboveKeyboard
       // The lyric sheet needs room to read as one: at the cover player's 0.65
       // it collapses to two or three visible lines.
       snapHeight={showLyrics ? 0.8 : 0.65}
@@ -567,7 +608,17 @@ const TTSPlayerSheet = ({
               </span>
             )
           )}
-          <div dir='ltr' className='flex w-full items-center justify-between'>
+          {/* With its two mode buttons the row needs about 355 px at phone icon
+              sizes. A 360 px phone, or the desktop card dragged to its minimum,
+              leaves it 328 px, so below 360 px the transport closes up instead
+              of overhanging. The audiobook transport has room as it is. */}
+          <div
+            dir='ltr'
+            className={clsx(
+              'flex w-full items-center justify-between',
+              !audioTransport && '@container',
+            )}
+          >
             {/* Sentence-by-sentence and A-B repeat step by sentence, which a
                 paired audiobook does not have. */}
             {!audioTransport && (
@@ -591,10 +642,10 @@ const TTSPlayerSheet = ({
                 <TbArrowBarToRight size={iconSize18} />
               </button>
             )}
-            <div className='flex flex-1 items-center justify-center gap-1'>
+            <div className='@max-[360px]:gap-0.5 flex flex-1 items-center justify-center gap-1'>
               <button
                 type='button'
-                className='rounded-full p-2'
+                className={arrowButtonClass}
                 title={prevLargeLabel}
                 aria-label={prevLargeLabel}
                 onClick={() => onBackward(false)}
@@ -608,7 +659,7 @@ const TTSPlayerSheet = ({
               </button>
               <button
                 type='button'
-                className='rounded-full p-2'
+                className={arrowButtonClass}
                 title={prevSmallLabel}
                 aria-label={prevSmallLabel}
                 onClick={() => onBackward(true)}
@@ -622,7 +673,7 @@ const TTSPlayerSheet = ({
               </button>
               <button
                 type='button'
-                className='btn btn-contrast btn-circle relative mx-2 h-14 min-h-14 w-14'
+                className='btn btn-contrast btn-circle @max-[360px]:mx-1 relative mx-2 h-14 min-h-14 w-14'
                 aria-label={isPlaying ? _('Pause') : _('Play')}
                 aria-busy={buffering}
                 onClick={onTogglePlay}
@@ -639,7 +690,7 @@ const TTSPlayerSheet = ({
               </button>
               <button
                 type='button'
-                className='rounded-full p-2'
+                className={arrowButtonClass}
                 title={nextSmallLabel}
                 aria-label={nextSmallLabel}
                 onClick={() => onForward(true)}
@@ -653,7 +704,7 @@ const TTSPlayerSheet = ({
               </button>
               <button
                 type='button'
-                className='rounded-full p-2'
+                className={arrowButtonClass}
                 title={nextLargeLabel}
                 aria-label={nextLargeLabel}
                 onClick={() => onForward(false)}
@@ -674,7 +725,7 @@ const TTSPlayerSheet = ({
                 aria-label={loopLabel}
                 onClick={onToggleLoop}
               >
-                <span className='text-sm font-semibold'>
+                <span className='whitespace-nowrap text-sm font-semibold'>
                   A-<span className={clsx(loopState === 'a' && 'opacity-40')}>B</span>
                 </span>
               </button>
@@ -695,7 +746,12 @@ const TTSPlayerSheet = ({
             <button
               type='button'
               aria-label={_('Voice')}
-              onClick={() => setView('voice')}
+              onClick={() => {
+                // Like the voice library, every visit starts on all engines, unfiltered.
+                setVoiceSection('');
+                setVoiceQuery('');
+                setView('voice');
+              }}
               className='not-eink:bg-base-200 eink-bordered flex h-14 min-w-0 flex-1 flex-col items-center justify-center gap-0.5 rounded-xl'
             >
               <RiVoiceAiFill size={iconSize18} />
@@ -756,9 +812,51 @@ const TTSPlayerSheet = ({
         </div>
       )}
       {view === 'voice' && (
-        <div className='settings-content flex w-full flex-col pb-4 pt-1'>
+        <div className='settings-content flex w-full flex-col gap-4 pb-4 pt-1'>
+          <BoxedList>
+            <SettingsRow label={_('Voice Engine')}>
+              <SettingsSelect
+                value={activeSection}
+                onChange={handleSectionChange}
+                ariaLabel={_('Voice Engine')}
+                options={sections}
+              />
+            </SettingsRow>
+          </BoxedList>
+          <div className='eink-bordered bg-base-100 focus-within:ring-base-content/15 eink:focus-within:ring-base-content flex h-9 w-full items-center rounded-lg focus-within:ring-2'>
+            <MdSearch className='text-base-content/50 ms-3 h-4 w-4 shrink-0' />
+            <input
+              type='text'
+              value={voiceQuery}
+              spellCheck={false}
+              onChange={(event) => setVoiceQuery(event.target.value)}
+              // Capture phase: the Dialog listens natively on the sheet
+              // element itself, and its bubble handler runs before React's
+              // root one — a bubble-phase stopPropagation here never fires
+              // for the keys Dialog swallows (Esc dismisses the sheet).
+              onKeyDownCapture={(event) => {
+                event.stopPropagation();
+                if (event.key === 'Escape') event.preventDefault();
+              }}
+              placeholder={_('Filter voices')}
+              aria-label={_('Filter voices')}
+              className='settings-content min-w-0 flex-1 bg-transparent px-2 focus:outline-hidden'
+            />
+            {voiceQuery && (
+              <button
+                type='button'
+                onClick={() => setVoiceQuery('')}
+                className='btn btn-ghost h-8 min-h-8 w-8 shrink-0 p-0'
+                title={_('Clear')}
+                aria-label={_('Clear')}
+              >
+                <MdClose className='text-base-content/60 h-4 w-4' />
+              </button>
+            )}
+          </div>
           <VoiceList
-            groups={voiceGroups}
+            groups={shownGroups}
+            query={voiceQuery}
             selected={{ voiceId: selectedVoice }}
             onSelect={(_group, voice) => handleSelectVoice(voice.id, voice.lang)}
             onUpgrade={handleUpgrade}

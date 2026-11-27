@@ -1,3 +1,4 @@
+import { renderSVG } from 'uqr';
 import { expect, test } from '../fixtures/base';
 
 test.describe('Annotation', () => {
@@ -10,6 +11,68 @@ test.describe('Annotation', () => {
     await expect(reader.popupTool('Highlight')).toBeVisible();
   });
 
+  test('shares the selected book text as a local QR code', async ({ page, openBook, context }) => {
+    await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+    const reader = await openBook();
+    await reader.enableAnnotationTool('Share as QR Code');
+    await reader.selectText();
+    await page.evaluate(() => navigator.clipboard.writeText(''));
+    await reader.popupTool('Copy').click();
+    await expect.poll(async () => (await reader.readClipboard()).length).toBeGreaterThan(0);
+    const text = (await reader.readClipboard()).replace(/\r\n/g, '\n');
+
+    await reader.selectText();
+
+    await reader.popupTool('Share as QR Code').click();
+    const dialog = page.getByRole('dialog', { name: 'Share as QR Code' });
+    const code = dialog.getByRole('img', { name: 'QR code for the selected text' });
+    await expect(code).toBeVisible();
+    const svg = renderSVG(text, { ecc: 'M', border: 4 });
+    expect(
+      (await code.getAttribute('src')) === `data:image/svg+xml,${encodeURIComponent(svg)}`,
+      'the QR code encodes the same passage as Copy',
+    ).toBe(true);
+    // A long passage makes a dense code, so it gets all the room the dialog has.
+    const { side, room } = await code.evaluate((img) => {
+      const body = img.parentElement!;
+      const style = getComputedStyle(body);
+      return {
+        side: Math.min(img.clientWidth, img.clientHeight),
+        room: Math.min(
+          body.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight),
+          body.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom),
+        ),
+      };
+    });
+    expect(side, 'the QR code fills the dialog body').toBe(room);
+    await dialog.getByRole('button', { name: 'Close', exact: true }).press('Enter');
+    await expect(dialog).toHaveCount(0);
+
+    // The reader's keys still work once the dialog is gone.
+    const before = await reader.readingProgress();
+    await reader.nextPage();
+    await expect.poll(() => reader.readingProgress()).toBeGreaterThan(before);
+  });
+
+  test('closes the QR code sheet on a phone-sized screen from its header only', async ({
+    page,
+    openBook,
+  }) => {
+    const reader = await openBook();
+    // Settings opens from the wide layout's header; the sheet is checked at phone width.
+    await reader.enableAnnotationTool('Share as QR Code');
+    await page.setViewportSize({ width: 412, height: 839 });
+    await reader.selectText();
+    await reader.popupTool('Share as QR Code').click();
+    const dialog = page.getByRole('dialog', { name: 'Share as QR Code' });
+    await expect(dialog.getByRole('img', { name: 'QR code for the selected text' })).toBeVisible();
+
+    const close = dialog.getByRole('button', { name: 'Close' });
+    await expect(close).toHaveCount(1);
+    await close.click();
+    await expect(dialog).toHaveCount(0);
+  });
+
   test('creates a highlight from the selected text', async ({ openBook }) => {
     const reader = await openBook();
 
@@ -19,6 +82,43 @@ test.describe('Annotation', () => {
     await reader.openAnnotationsTab();
     await expect(reader.annotationItems).toHaveCount(1);
   });
+
+  for (const popup of ['text selection', 'existing highlight']) {
+    test(`clicking outside the ${popup} toolbar dismisses it before turning the page`, async ({
+      openBook,
+    }) => {
+      const reader = await openBook();
+      await reader.selectText();
+      if (popup === 'existing highlight') {
+        await reader.highlightSelection();
+        await reader.dismissPopup();
+        // Let the previous popup's close settle before reopening the highlight.
+        await reader.page.waitForTimeout(600);
+        await reader.clickHighlight();
+      }
+      await expect(reader.annotationPopup).toBeVisible();
+      if (popup === 'existing highlight') {
+        // This is a separate click after opening the highlight, not a double-click.
+        await reader.page.waitForTimeout(600);
+      }
+      await expect.poll(() => reader.readingProgress()).toBeGreaterThan(0);
+      const position = await reader.readingProgress();
+      const bounds = await reader.foliateView.boundingBox();
+      if (!bounds) throw new Error('reader has no visible page bounds');
+      const clickPageTurnZone = () =>
+        reader.page.mouse.click(bounds.x + bounds.width * 0.8, bounds.y + bounds.height * 0.65);
+
+      await clickPageTurnZone();
+      await expect(reader.annotationPopup).toBeHidden();
+      // Allow the single-click and popup-dismiss timers to run before checking
+      // the position or making a separate click in the same page-turn zone.
+      await reader.page.waitForTimeout(600);
+      expect(await reader.readingProgress()).toBe(position);
+
+      await clickPageTurnZone();
+      await expect.poll(() => reader.readingProgress()).toBeGreaterThan(position);
+    });
+  }
 
   test('closing the dictionary popup returns to the selection toolbar (#5213)', async ({
     openBook,
@@ -232,19 +332,24 @@ test.describe('Annotation', () => {
     const noteBubbles = reader.foliateView.locator('svg > g:has(line)');
     const clickHighlight = async () => {
       // Restyling appends the highlight after its bubble, so target the
-      // highlight explicitly instead of whichever SVG path comes first.
-      await reader.foliateView
-        .locator('svg > g:not(:has(line)) path')
-        .first()
-        .evaluate((node) => {
-          const path = node as SVGPathElement;
-          const box = path.getBBox();
-          const doc = path.ownerSVGElement?.parentElement?.querySelector('iframe')?.contentDocument;
-          if (!doc) throw new Error('highlight overlay has no section document');
-          doc.body.dispatchEvent(
-            new MouseEvent('click', { clientX: box.x + 4, clientY: box.y + 4, bubbles: true }),
-          );
-        });
+      // highlight explicitly instead of whichever SVG path comes first. Saving
+      // the note redraws the highlight, so a path found just before that is
+      // detached when clicked: find it again.
+      await expect(async () => {
+        await reader.foliateView
+          .locator('svg > g:not(:has(line)) path')
+          .first()
+          .evaluate((node) => {
+            const path = node as SVGPathElement;
+            const box = path.getBBox();
+            const doc =
+              path.ownerSVGElement?.parentElement?.querySelector('iframe')?.contentDocument;
+            if (!doc) throw new Error('highlight overlay has no section document');
+            doc.body.dispatchEvent(
+              new MouseEvent('click', { clientX: box.x + 4, clientY: box.y + 4, bubbles: true }),
+            );
+          });
+      }).toPass();
     };
 
     await reader.selectText();
@@ -256,6 +361,10 @@ test.describe('Annotation', () => {
     await reader.selectHighlightColor('green');
     await expect(noteBubbles).toHaveCount(1);
 
+    // A click on the book within 250 ms of the last one is a double-click
+    // (DOUBLE_CLICK_INTERVAL_THRESHOLD_MS), which selects a word instead of
+    // opening the highlight. No one picks a color and comes back that fast.
+    await reader.page.waitForTimeout(250);
     await clickHighlight();
     await reader.popupTool('Delete Highlight').click();
 

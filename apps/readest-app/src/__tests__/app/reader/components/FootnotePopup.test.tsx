@@ -131,7 +131,8 @@ vi.mock('@/styles/fonts', () => ({
   mountCustomFont: vi.fn(),
 }));
 
-vi.mock('@/utils/sel', () => ({
+vi.mock('@/utils/sel', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/utils/sel')>()),
   getPosition: () => ({ point: { x: 10, y: 10 }, dir: 'down' }),
   getPopupPosition: () => ({ point: { x: 10, y: 10 }, dir: 'down' }),
 }));
@@ -146,6 +147,7 @@ vi.mock('@/app/reader/utils/annotatorUtil', () => ({
 
 vi.mock('@/app/reader/utils/footnoteHeuristics', () => ({
   shouldCheckAsFootnote: () => false,
+  linksToDeclaredNote: () => false,
   isLinkTargetVisible: hoisted.isLinkTargetVisible,
 }));
 
@@ -158,7 +160,9 @@ vi.mock('@/app/reader/utils/footnoteCfi', () => ({
 }));
 
 vi.mock('@/components/Overlay', () => ({
-  Overlay: () => <div data-testid='overlay' />,
+  Overlay: ({ onDismiss }: { onDismiss?: () => void }) => (
+    <div data-testid='overlay' onClick={onDismiss} />
+  ),
 }));
 
 // The real Popup keeps its children mounted and only moves them off-screen
@@ -202,6 +206,8 @@ const createPopupView = () => {
 const renderPopup = async () => {
   const grid = document.createElement('div');
   grid.id = `gridcell-${BOOK_KEY}`;
+  // The popup measures its room in the cell; here the cell fills the window.
+  grid.getBoundingClientRect = () => new DOMRect(0, 0, window.innerWidth, window.innerHeight);
   document.body.appendChild(grid);
   const { default: FootnotePopup } = await import('@/app/reader/components/FootnotePopup');
   return render(<FootnotePopup bookKey={BOOK_KEY} bookDoc={{} as BookDoc} />);
@@ -335,6 +341,57 @@ describe('FootnotePopup Word Lens hints', () => {
 
     expect(doc.querySelector('.wl-gloss rt')?.textContent).toBe('黄金');
   });
+
+  // A hint drawn or removed moves the text under the highlights mirrored into
+  // the popup, and nothing else redraws them while it stays open.
+  it('redraws its highlights when a hint changes while the footnote stays open', async () => {
+    const config = bookDataState.booksData.bookid.config as { booknotes: unknown[] };
+    config.booknotes = [
+      {
+        id: 'h1',
+        type: 'annotation',
+        cfi: 'epubcfi(/6/8!/4/2,/1:0,/1:5)',
+        style: 'highlight',
+        color: 'yellow',
+        updatedAt: 1,
+      },
+    ];
+    try {
+      await renderPopup();
+      const anchor = document.createElement('a');
+      anchor.setAttribute('href', HREF);
+      document.body.appendChild(anchor);
+      await act(async () => {
+        hoisted.onLinkClick.current?.(
+          new CustomEvent('link', { detail: { a: anchor, href: HREF }, cancelable: true }),
+        );
+      });
+      const view = Object.assign(createPopupView(), {
+        getCFI: () => 'epubcfi(/6/8!/4)',
+        addAnnotation: vi.fn(),
+      });
+      const handler = hoisted.handlers.at(-1)!;
+      await act(async () => {
+        handler.dispatchEvent(new CustomEvent('before-render', { detail: { view } }));
+        handler.dispatchEvent(
+          new CustomEvent('render', { detail: { view, href: HREF, index: 3, extract: {} } }),
+        );
+        view.dispatchEvent(new CustomEvent('relocate', { detail: {} }));
+      });
+      const doc = await loadPopupDoc(view, '<p>Worth more than gold.</p>');
+      expect(view.addAnnotation).toHaveBeenCalledWith(expect.objectContaining({ id: 'h1' }));
+      view.addAnnotation.mockClear();
+
+      await act(async () => {
+        await setVocabulary({ learning: new Map([['gold', '黄金']]), mastered: new Set<string>() });
+      });
+
+      expect(doc.querySelector('.wl-gloss rt')?.textContent).toBe('黄金');
+      expect(view.addAnnotation).toHaveBeenCalledWith(expect.objectContaining({ id: 'h1' }));
+    } finally {
+      config.booknotes = [];
+    }
+  });
 });
 
 describe('FootnotePopup jump to location', () => {
@@ -356,7 +413,7 @@ describe('FootnotePopup jump to location', () => {
       fireEvent.click(button);
     });
 
-    expect(hoisted.goTo).toHaveBeenCalledWith(HREF);
+    expect(hoisted.goTo).toHaveBeenCalledWith(HREF, { focus: true });
     expect(screen.getByTestId('popup').dataset['open']).toBe('false');
     expect(screen.queryByLabelText('Jump to Location')).toBeNull();
   });
@@ -382,7 +439,7 @@ describe('FootnotePopup jump to location', () => {
       fireEvent.click(screen.getByLabelText('Jump to Location'));
     });
 
-    expect(hoisted.goTo).toHaveBeenCalledWith(nestedHref);
+    expect(hoisted.goTo).toHaveBeenCalledWith(nestedHref, { focus: true });
   });
 
   // The reader's stylesheet hides inline footnote bodies, so a link that
@@ -487,6 +544,36 @@ describe('FootnotePopup jump to location', () => {
         )
         .map(([, detail]) => (detail as { quickAction?: boolean }).quickAction);
 
+    // #7691: a tap on a Word Lens hint looks the word up, as in the book; the
+    // Annotator opens the dictionary for a report flagged `wordLens`.
+    const wordLensReports = (dispatch: { mock: { calls: unknown[][] } }) =>
+      dispatch.mock.calls
+        .filter(
+          ([name, detail]) =>
+            name === 'footnote-selection' && (detail as { wordLens?: boolean }).wordLens,
+        )
+        .map(([, detail]) => (detail as { range: Range }).range.toString());
+
+    it('reports a tap on a Word Lens hint as a lookup of its word', async () => {
+      const { doc, dispatch } = await loadPopupDoc();
+      doc.body.innerHTML =
+        '<p>A pinch of <ruby class="wl-gloss">spice<rt>seasoning</rt></ruby> here.</p>';
+
+      doc.querySelector('rt')!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+
+      expect(wordLensReports(dispatch)).toEqual(['spice']);
+    });
+
+    it('leaves a Word Lens hint inside a link to the link', async () => {
+      const { doc, dispatch } = await loadPopupDoc();
+      doc.body.innerHTML =
+        '<p><a href="#n1"><ruby class="wl-gloss">spice<rt>seasoning</rt></ruby></a></p>';
+
+      doc.querySelector('ruby')!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+
+      expect(wordLensReports(dispatch)).toEqual([]);
+    });
+
     it('marks a selection settled when the pointer is released', async () => {
       const { doc, dispatch } = await loadPopupDoc();
 
@@ -578,6 +665,23 @@ describe('FootnotePopup jump to location', () => {
     });
     Object.defineProperty(window, 'innerWidth', { value: width, configurable: true });
     expect(screen.getByTestId('popup').dataset['open']).toBe('false');
+  });
+
+  // The instant dictionary drops the popup selection as it opens, so the
+  // Annotator ignores a plain cleared report while it is up; a tap outside
+  // the popup has to say the popup itself is gone, or the lookup stays (#7727).
+  it('reports itself closed when a tap outside dismisses it', async () => {
+    await renderPopup();
+    await openFootnotePopup();
+    const dispatch = vi.spyOn(eventDispatcher, 'dispatch');
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('overlay'));
+    });
+
+    expect(screen.getByTestId('popup').dataset['open']).toBe('false');
+    expect(dispatch).toHaveBeenCalledWith('footnote-selection', { key: BOOK_KEY, closed: true });
+    dispatch.mockRestore();
   });
 
   it('closes when paragraph mode focuses a different paragraph in this book', async () => {

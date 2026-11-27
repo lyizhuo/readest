@@ -245,6 +245,10 @@ impl<R: Runtime> NativeBridge<R> {
         Err(crate::Error::UnsupportedPlatformError)
     }
 
+    pub fn anki_list_note_types(&self) -> crate::Result<AnkiListNoteTypesResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
     pub fn anki_read_deck(
         &self,
         _payload: AnkiReadDeckRequest,
@@ -262,6 +266,24 @@ impl<R: Runtime> NativeBridge<R> {
     pub fn anki_update_tags(
         &self,
         _payload: AnkiUpdateTagsRequest,
+    ) -> crate::Result<AnkiUpdateTagsResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn anki_note_type(&self) -> crate::Result<AnkiNoteTypeResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn anki_upgrade_note_type(
+        &self,
+        _payload: AnkiUpgradeNoteTypeRequest,
+    ) -> crate::Result<AnkiUpdateTagsResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn anki_set_entries(
+        &self,
+        _payload: AnkiSetEntriesRequest,
     ) -> crate::Result<AnkiUpdateTagsResponse> {
         Err(crate::Error::UnsupportedPlatformError)
     }
@@ -629,6 +651,27 @@ impl<R: Runtime> NativeBridge<R> {
             let _ = payload;
             Err(crate::Error::UnsupportedPlatformError)
         }
+    }
+
+    /// Apple's on-device model is bridged on iOS only; desktops report it
+    /// unavailable so the JS side never offers it.
+    pub fn on_device_llm_status(&self) -> crate::Result<OnDeviceLlmStatusResponse> {
+        Ok(OnDeviceLlmStatusResponse {
+            available: false,
+            reason: Some("unsupportedOS".into()),
+            ..Default::default()
+        })
+    }
+
+    pub fn on_device_llm_generate(
+        &self,
+        _payload: OnDeviceLlmGenerateRequest,
+    ) -> crate::Result<OnDeviceLlmGenerateResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn on_device_llm_cancel(&self, _payload: OnDeviceLlmCancelRequest) -> crate::Result<()> {
+        Ok(())
     }
 }
 

@@ -1,5 +1,6 @@
 import type { StripeAvailablePlan } from '@/libs/payment/stripe/client';
 import type { AvailablePlan, PlanInterval, PlanType, QuotaFeature, UserPlan } from '@/types/quota';
+import { FREE_PLAN_DEVICE_LIMIT } from '@/services/constants';
 import { stubTranslation as _ } from '@/utils/misc';
 
 type FeatureType = {
@@ -82,10 +83,15 @@ export const getYearlySavingsPercent = (availablePlans: AvailablePlan[]): number
  * A user who already holds a Stripe subscription must change it through the
  * billing portal: a second checkout session would leave both subscriptions
  * running and bill them twice. `purchase` means storage add-ons with no
- * subscription behind them, so those users still go to checkout.
+ * subscription behind them, so those users still go to checkout. A gift-only
+ * holder has no Stripe subscription at all, so they go to checkout too.
  */
-export const shouldUseBillingPortal = (userPlan: UserPlan, planType: PlanType): boolean =>
-  planType === 'subscription' && (userPlan === 'plus' || userPlan === 'pro');
+export const shouldUseBillingPortal = (
+  userPlan: UserPlan,
+  planType: PlanType,
+  giftOnly = false,
+): boolean =>
+  !giftOnly && planType === 'subscription' && (userPlan === 'plus' || userPlan === 'pro');
 
 /**
  * Per-tier accent. The store front is the one surface that is actively selling,
@@ -251,6 +257,7 @@ export function getPlanDetails(
         limits: {
           [_('Cloud Sync Storage')]: '500 MB',
           [_('AI Translations (per day)')]: '10K',
+          [_('Number of Devices')]: FREE_PLAN_DEVICE_LIMIT,
         },
       };
     case 'plus':
@@ -312,6 +319,7 @@ export function getPlanDetails(
         limits: {
           [_('Cloud Sync Storage')]: '5 GB',
           [_('AI Translations (per day)')]: '100K',
+          [_('Number of Devices')]: _('Unlimited'),
         },
       };
     case 'pro':
@@ -357,6 +365,7 @@ export function getPlanDetails(
         limits: {
           [_('Cloud Sync Storage')]: '20 GB',
           [_('AI Translations (per day)')]: '500K',
+          [_('Number of Devices')]: _('Unlimited'),
         },
       };
     default:

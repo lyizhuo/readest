@@ -1,5 +1,6 @@
 import { createClient } from '@supabase/supabase-js';
 import { getRuntimeConfig } from '@/services/runtimeConfig';
+import { withAuthRequestTimeout } from './authRequestTimeout';
 
 const supabaseUrl =
   getRuntimeConfig()?.supabaseUrl ||
@@ -32,11 +33,23 @@ const isProxiedAuthRequest = ({ pathname, searchParams }: URL) =>
   (pathname === '/auth/v1/token' &&
     ['password', 'refresh_token'].includes(searchParams.get('grant_type') ?? ''));
 
-const proxyAuthFetch: typeof fetch = (input, init) => {
+const authFetch = withAuthRequestTimeout((input, init) => fetch(input, init));
+
+// A network that can't reach the proxy host (a filter that blocks the new
+// domain) goes to the Supabase host instead, as before the proxy existed;
+// otherwise every refresh fails and the reader is signed out (#7538). Only a
+// failed or timed-out connection falls back: an answer from the proxy is final.
+// Each attempt gets its own time limit, so a proxy that never answers still
+// leaves time for the Supabase host.
+const proxyAuthFetch: typeof fetch = async (input, init) => {
   const url = new URL(input instanceof Request ? input.url : input);
-  return isProxiedAuthRequest(url)
-    ? fetch(`${AUTH_PROXY_URL}${url.pathname}${url.search}`, init)
-    : fetch(input, init);
+  if (!isProxiedAuthRequest(url)) return authFetch(input, init);
+  try {
+    return await authFetch(`${AUTH_PROXY_URL}${url.pathname}${url.search}`, init);
+  } catch (error) {
+    if (init?.signal?.aborted) throw error;
+    return authFetch(input, init);
+  }
 };
 
 export const supabase = createClient(
@@ -44,7 +57,7 @@ export const supabase = createClient(
   supabaseAnonKey,
   READEST_CLOUD_HOSTS.includes(new URL(supabaseUrl).hostname)
     ? { auth: { storageKey: 'sb-readest-auth-token' }, global: { fetch: proxyAuthFetch } }
-    : undefined,
+    : { global: { fetch: authFetch } },
 );
 
 export const createSupabaseClient = (accessToken?: string) => {

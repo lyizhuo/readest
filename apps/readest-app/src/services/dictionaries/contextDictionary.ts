@@ -9,6 +9,7 @@
 import type { CustomTranslator } from '@/types/translation';
 import { md5Fingerprint } from '@/utils/md5';
 import { renderPrompt } from '@/services/translators/custom/prompts';
+import { onDeviceInputChars, prepareOnDevice } from '@/services/translators/custom/onDevice';
 import {
   generateChatText,
   loadSDK,
@@ -152,6 +153,9 @@ const readContextEntry = (parsed: unknown): ContextEntry => {
   };
 };
 
+/** The reply stopped after part of the entry was already shown (#7861). */
+export class IncompleteEntryError extends Error {}
+
 const cache = new Map<string, ContextEntry>();
 
 export const __clearContextCacheForTests = () => cache.clear();
@@ -162,6 +166,13 @@ export const lookupInContext = async (
   signal: AbortSignal,
   options: ContextLookupOptions = {},
 ): Promise<ContextEntry> => {
+  if (translator.type === 'apple-intelligence') {
+    // Each side gets half of what fits Apple's small on-device window.
+    const side = Math.floor(
+      onDeviceInputChars((await prepareOnDevice(input.targetLang)).contextSize) / 2,
+    );
+    input = { ...input, before: input.before.slice(-side), after: input.after.slice(0, side) };
+  }
   const customPrompt = options.systemPrompt?.trim();
   const system = renderPrompt(customPrompt || CONTEXT_DICTIONARY_PROMPT, {
     sourceLang: input.sourceLang || 'AUTO',
@@ -205,6 +216,7 @@ export const lookupInContext = async (
     timer = setTimeout(abort, REQUEST_TIMEOUT_MS);
   };
   signal.addEventListener('abort', abort, { once: true });
+  let shown = false;
   try {
     const [{ parsePartialJson }] = await loadSDK();
     const text = await generateChatText(translator, {
@@ -227,6 +239,7 @@ export const lookupInContext = async (
             synonyms: [],
             markdown,
           });
+          shown = true;
           return;
         }
         const start = markdown.indexOf('{');
@@ -234,7 +247,11 @@ export const lookupInContext = async (
         const { value } = await parsePartialJson(markdown.slice(start).replace(/\s*```\s*$/, ''));
         if (!isRecord(value) || !readString(value, 'definition') || signal.aborted) return;
         options.onUpdate(readContextEntry(value));
+        shown = true;
       },
+    }).catch((err: unknown) => {
+      if (!shown || signal.aborted) throw err;
+      throw new IncompleteEntryError(err instanceof Error ? err.message : String(err));
     });
     signal.throwIfAborted();
     const markdown = stripReasoning(text);

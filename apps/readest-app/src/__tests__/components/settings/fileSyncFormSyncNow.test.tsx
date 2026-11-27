@@ -17,6 +17,8 @@ import { useSettingsStore } from '@/store/settingsStore';
  */
 
 const syncLibrary = vi.fn();
+const { syncFonts } = vi.hoisted(() => ({ syncFonts: vi.fn(async () => {}) }));
+vi.mock('@/services/sync/file/fonts', () => ({ syncFonts }));
 
 vi.mock('@/components/Dialog', () => ({
   default: ({ isOpen, children }: { isOpen: boolean; children: React.ReactNode }) =>
@@ -94,6 +96,18 @@ describe('FileSyncForm — Sync now health reporting', () => {
     expect(useFileSyncStore.getState().byKind.webdav?.isSyncing ?? false).toBe(false);
   });
 
+  test('Sync now syncs custom fonts too, and a font failure is not a sync error (#7793)', async () => {
+    syncFonts.mockRejectedValueOnce(new Error('font upload failed'));
+    renderForm();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Sync now' }));
+
+    await waitFor(() => expect(syncFonts).toHaveBeenCalledTimes(1));
+    expect((syncFonts.mock.calls[0] as unknown[])[2]).toBe('silent');
+    await waitFor(() => expect(useFileSyncStore.getState().byKind.webdav?.isSyncing).toBe(false));
+    expect(useFileSyncStore.getState().lastErrorByKind.webdav).toBeNull();
+  });
+
   test('Sync now reports what moved to Data Flow', async () => {
     localStorage.clear();
     syncLibrary.mockResolvedValueOnce({
@@ -153,4 +167,31 @@ test.each([
   await waitFor(() => expect(useFileSyncStore.getState().byKind.webdav?.isSyncing).toBe(false));
   expect(persist).not.toHaveBeenCalled();
   expect(useFileSyncStore.getState().lastErrorByKind.webdav).toMatch(/HTTP 507/);
+});
+
+test('renders Sync Custom Fonts checked by default and persists toggle changes', () => {
+  const persist = vi.fn(async () => {});
+  render(<FileSyncForm kind='webdav' stored={stored} persist={persist} />);
+
+  const toggle = screen.getByRole('checkbox', { name: /Sync Custom Fonts/ }) as HTMLInputElement;
+  expect(toggle.checked).toBe(true);
+
+  fireEvent.click(toggle);
+  expect(persist).toHaveBeenCalledWith({ syncFonts: false });
+});
+
+test('Sync now skips custom font sync when syncFonts is false', async () => {
+  render(
+    <FileSyncForm
+      kind='webdav'
+      stored={{ ...stored, syncFonts: false }}
+      persist={vi.fn(async () => {})}
+    />,
+  );
+
+  fireEvent.click(screen.getByRole('button', { name: 'Sync now' }));
+
+  await waitFor(() => expect(useFileSyncStore.getState().byKind.webdav?.isSyncing).toBe(false));
+  expect(syncLibrary).toHaveBeenCalledTimes(1);
+  expect(syncFonts).not.toHaveBeenCalled();
 });

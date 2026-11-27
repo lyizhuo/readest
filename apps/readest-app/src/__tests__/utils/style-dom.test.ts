@@ -519,7 +519,7 @@ describe('getStyles', () => {
     expect(clampRule).not.toContain('vertical-align');
   });
 
-  it('inverts inline glyphs and gaiji in dark mode under screen blending (#7373)', () => {
+  it('draws inline glyphs and gaiji as ink in the text color in dark mode (#7373, #7981)', () => {
     const vs = makeViewSettings({ invertImgColorInDark: false });
     const themeCode: ThemeCode = {
       bg: '#171717',
@@ -540,9 +540,9 @@ describe('getStyles', () => {
     };
     const css = getStyles(vs, themeCode);
     expect(css).toMatch(
-      /img\[class\*="gaiji"\]\s*\{[^}]*filter:\s*invert\(1\)\s*hue-rotate\(180deg\);/,
+      /img\[class\*="gaiji"\]\s*\{[^}]*filter:\s*url\(#readest-dark-monochrome-ffffff\);/,
     );
-    expect(css).toMatch(/img\[class\*="gaiji"\]\s*\{[^}]*mix-blend-mode:\s*screen;/);
+    expect(css).toMatch(/img\[class\*="gaiji"\]\s*\{[^}]*mix-blend-mode:\s*normal;/);
   });
 
   it('keeps inline and gaiji parent backgrounds transparent over a background texture (#7373)', () => {
@@ -791,6 +791,92 @@ describe('applyImageStyle', () => {
     const exempt = Array.from(document.querySelectorAll(selector)).map((p) => p.id);
 
     expect(exempt).toEqual(['figure', 'linked', 'wrapped', 'captioned', 'dropcap']);
+  });
+
+  // A section holding only one image is a picture page, fitted to one page (#6676)
+  const SVG = 'xmlns="http://www.w3.org/2000/svg"';
+  it.each([
+    ['an image in a paragraph', '<p><img src="c.png" /></p>', true],
+    [
+      'an image with an empty skip link',
+      '<p><img src="c.png" /><span aria-label="x"></span></p>',
+      true,
+    ],
+    ['an svg cover', `<div><svg ${SVG}><image href="c.png" /></svg></div>`, true],
+    [
+      'an svg cover with a title and desc',
+      `<div><svg ${SVG}><title>Cover</title><desc>Front</desc><image href="c.png" /></svg></div>`,
+      true,
+    ],
+    ['an image with a caption', '<p><img src="c.png" /></p><p>Plate 1</p>', false],
+    ['an svg with visible text', `<svg ${SVG}><text>Chapter 1</text></svg>`, false],
+    ['two images', '<p><img src="a.png" /></p><p><img src="b.png" /></p>', false],
+  ])('tells whether %s is a lone image', (_, html, lone) => {
+    document.body.innerHTML = html;
+    applyImageStyle(document);
+    expect(document.querySelectorAll('.lone-image')).toHaveLength(lone ? 1 : 0);
+  });
+
+  // An image with no text on its line is top-aligned in WebKit so a page-tall
+  // one fits its page (#6676); an image sharing its line with text keeps the
+  // book's alignment, even inside a link
+  it.each([
+    ['an image and a line break', '<p><img src="c.png" /><br /></p>', true],
+    ['an image in a div', '<div><img src="c.png" /></div>', true],
+    ['a linked image', '<p><a href="#p"><img src="c.png" /></a></p>', true],
+    ['an image above its caption', '<p><img src="c.png" /><br />Plate 1</p>', true],
+    ['an image beside a comment', '<p><!-- plate --><img src="c.png" /></p>', true],
+    [
+      'an image before a span that breaks the line',
+      '<p><img src="c.png" /><span><br />Caption</span></p>',
+      true,
+    ],
+    [
+      'an image after a break inside its span',
+      '<p>Caption<span><br /><img src="c.png" /></span></p>',
+      true,
+    ],
+    [
+      'an image in a span made a block, before text',
+      '<p><span style="display: block"><img src="c.png" /></span>Text</p>',
+      true,
+    ],
+    [
+      'an image between paragraphs',
+      '<div><p>Before</p><img src="c.png" /><p>After</p></div>',
+      true,
+    ],
+    [
+      'an image after text in a link',
+      '<p>Figure 1 <a href="#f"><img src="c.png" /></a></p>',
+      false,
+    ],
+    [
+      'a linked icon before text',
+      '<p><a href="#n"><img class="icon" src="n.png" /></a>Text</p>',
+      false,
+    ],
+    ['an image beside linked text', '<p><img src="c.png" /><a href="#n">Note</a></p>', false],
+    ['an image in a span after text', '<p>Text <span><img src="c.png" /></span></p>', false],
+    [
+      'an image before a span with text, then a break',
+      '<p><img src="c.png" /><span>Note<br />Caption</span></p>',
+      false,
+    ],
+    [
+      'an image before a hidden break and text',
+      '<p><img src="c.png" /><br style="display: none" />Text</p>',
+      false,
+    ],
+    [
+      'a linked icon in a div made inline, before text',
+      '<div><div style="display: inline"><a href="#n"><img src="n.png" /></a></div> Text</div>',
+      false,
+    ],
+  ])('tells whether %s is alone on its line', (_, html, alone) => {
+    document.body.innerHTML = html;
+    applyImageStyle(document);
+    expect(document.querySelectorAll('img.alone-on-line')).toHaveLength(alone ? 1 : 0);
   });
 });
 

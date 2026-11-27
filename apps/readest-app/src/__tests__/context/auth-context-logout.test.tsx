@@ -21,6 +21,12 @@ vi.mock('@/utils/supabase', async () => {
 });
 
 vi.mock('posthog-js', () => ({ default: { identify: vi.fn() } }));
+// The test token has no plan claim, so it reads as the Free plan; the device
+// check at sign-in is covered in auth-context-device-limit.test.tsx.
+vi.mock('@/libs/syncDevices', () => ({
+  hasDeviceLimit: () => false,
+  checkSignInDeviceLimit: async () => null,
+}));
 
 import { AuthProvider, useAuth } from '@/context/AuthContext';
 import { supabase } from '@/utils/supabase';
@@ -93,5 +99,64 @@ describe('AuthContext logout', () => {
     for (const key of ['token', 'refresh_token', 'user', 'logout-test-session']) {
       expect(localStorage.getItem(key), key).toBeNull();
     }
+  });
+
+  // The library marks a signed-in user to be kept signed in when it opens.
+  // Sign Out opens the library while these requests are still on the network,
+  // so the next launch opened the login page (#7726).
+  it('shows the user signed out at once, before the sign-out requests finish', async () => {
+    const { result } = renderHook(() => useAuth(), { wrapper: AuthProvider });
+    await waitFor(() => expect(result.current.user?.id).toBe(user.id));
+    const answer = authFetch.getMockImplementation()!;
+    let answerRefresh = () => {};
+    const refreshAnswered = new Promise<void>((resolve) => (answerRefresh = resolve));
+    authFetch.mockImplementation(async (input, init) => {
+      if (new URL(String(input)).pathname === '/auth/v1/token') await refreshAnswered;
+      return answer(input, init);
+    });
+    const storedTokens = vi.spyOn(localStorage, 'setItem');
+
+    let signingOut: Promise<void> | void;
+    act(() => {
+      signingOut = result.current.logout();
+    });
+    try {
+      expect(result.current.token).toBeNull();
+      expect(result.current.user).toBeNull();
+      expect(localStorage.getItem('token')).toBeNull();
+    } finally {
+      await act(async () => {
+        answerRefresh();
+        await signingOut;
+      });
+    }
+    // The refresh before signOut reports the session again; it must not be stored again.
+    const tokenWrites = storedTokens.mock.calls.filter(([key]) => key === 'token');
+    storedTokens.mockRestore();
+    expect(tokenWrites).toEqual([]);
+    expect(result.current.token).toBeNull();
+    expect(result.current.user).toBeNull();
+    expect((await supabase.auth.getSession()).data.session).toBeNull();
+  });
+
+  it('signs this device out when the logout request cannot reach the server', async () => {
+    const { result } = renderHook(() => useAuth(), { wrapper: AuthProvider });
+    await waitFor(() => expect(result.current.user?.id).toBe(user.id));
+    const answer = authFetch.getMockImplementation()!;
+    authFetch.mockImplementation(async (input, init) => {
+      if (new URL(String(input)).pathname === '/auth/v1/logout') {
+        throw new TypeError('Failed to fetch');
+      }
+      return answer(input, init);
+    });
+
+    await act(async () => {
+      await result.current.logout();
+    });
+
+    // The SDK must not keep a session it would restore on the next start.
+    expect((await supabase.auth.getSession()).data.session).toBeNull();
+    expect(localStorage.getItem('logout-test-session')).toBeNull();
+    expect(result.current.user).toBeNull();
   });
 });

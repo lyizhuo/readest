@@ -3,15 +3,23 @@ import { afterEach, expect, it, vi } from 'vitest';
 import type { ComponentProps } from 'react';
 import FoliateViewer from '@/app/reader/components/FoliateViewer';
 
-const { readerState, openGate, bookDataState, attrs } = vi.hoisted(() => {
+const { readerState, openGate, bookDataState, attrs, viewSettings } = vi.hoisted(() => {
+  const viewSettings = {
+    writingMode: 'auto',
+    showHeader: true,
+    vertical: false,
+    compactMarginTopPx: 16,
+    compactMarginBottomPx: 16,
+  };
   return {
     attrs: new Map<string, string>(),
     bookDataState: { bookData: null as unknown },
     openGate: { pending: null as Promise<void> | null, started: false },
+    viewSettings,
     readerState: {
       setProgress: vi.fn(),
       getViewState: () => ({}),
-      getViewSettings: () => ({ writingMode: 'auto', showHeader: true, vertical: false }),
+      getViewSettings: () => viewSettings,
       setView: () => {},
       setViewInited: () => {},
     },
@@ -76,7 +84,9 @@ vi.mock('@/services/transformService', () => ({}));
 vi.mock('@/app/reader/utils/wordlensSection', () => ({}));
 vi.mock('@/app/reader/hooks/useFoliateEvents', () => ({ useFoliateEvents: vi.fn() }));
 vi.mock('@/app/reader/hooks/useBrightnessGesture', () => ({ useBrightnessGesture: () => ({}) }));
-vi.mock('@/app/reader/hooks/useAutoScroll', () => ({ useAutoScroll: () => ({}) }));
+vi.mock('@/app/reader/hooks/useAutoScroll', () => ({
+  useAutoScroll: () => ({ isWipeAhead: () => false }),
+}));
 vi.mock('@/app/reader/hooks/useAutoScrollSpeedGesture', () => ({
   useAutoScrollSpeedGesture: () => ({}),
 }));
@@ -114,16 +124,22 @@ vi.mock('@/app/reader/components/BrightnessOverlay', () => ({ default: () => nul
 vi.mock('@/app/reader/components/ImageViewer', () => ({ default: () => null }));
 vi.mock('@/app/reader/components/TableViewer', () => ({ default: () => null }));
 
-afterEach(cleanup);
+afterEach(() => {
+  viewSettings.vertical = false;
+  viewSettings.showHeader = true;
+  viewSettings.compactMarginTopPx = 16;
+  viewSettings.compactMarginBottomPx = 16;
+  cleanup();
+});
 
 const insets = (top: number) => ({ top, right: 0, bottom: 0, left: 0 });
-const props = (top: number) =>
+const props = (contentTop: number, gridTop = 0) =>
   ({
     bookKey: 'test-book',
     bookDoc: { metadata: {}, transformTarget: new EventTarget() },
     config: {},
-    gridInsets: insets(0),
-    contentInsets: insets(top),
+    gridInsets: insets(gridTop),
+    contentInsets: insets(contentTop),
   }) as unknown as ComponentProps<typeof FoliateViewer>;
 
 // The book opens while the status bar still shows (iPhone Duo's 82pt top
@@ -143,4 +159,55 @@ it('applies the insets current when the book finishes opening', async () => {
   finishOpen();
   await waitFor(() => expect(attrs.has('max-block-size')).toBe(true));
   expect(attrs.get('margin-top')).toBe('44px');
+});
+
+it('preserves gridInsets.top / 1.5 + viewInsets.top in vertical mode (#7389)', async () => {
+  attrs.clear();
+  viewSettings.vertical = true;
+  viewSettings.showHeader = false;
+  openGate.pending = Promise.resolve();
+  openGate.started = false;
+  render(
+    <FoliateViewer
+      {...({
+        ...props(75, 59),
+        gridInsets: { top: 59, right: 0, bottom: 34, left: 0 },
+        contentInsets: { top: 75, right: 0, bottom: 50, left: 0 },
+      } as unknown as ComponentProps<typeof FoliateViewer>)}
+    />,
+  );
+  await waitFor(() => expect(attrs.has('margin-top')).toBe(true));
+  expect(attrs.get('margin-top')).toBe(`${59 / 1.5 + 16}px`);
+  expect(attrs.get('margin-bottom')).toBe(`${34 / 1.5 + 16}px`);
+});
+
+it('floors vertical header/footer side margins at 16px when side margins are 0px', async () => {
+  attrs.clear();
+  viewSettings.vertical = true;
+  viewSettings.showHeader = true;
+  Object.assign(viewSettings, {
+    showFooter: true,
+    showProgressInfo: true,
+    marginLeftPx: 0,
+    marginRightPx: 0,
+    compactMarginLeftPx: 0,
+    compactMarginRightPx: 0,
+  });
+  openGate.pending = Promise.resolve();
+  openGate.started = false;
+  render(<FoliateViewer {...props(75, 59)} />);
+  await waitFor(() => expect(attrs.has('margin-left')).toBe(true));
+  expect(attrs.get('margin-left')).toBe('16px');
+  expect(attrs.get('margin-right')).toBe('16px');
+});
+
+it('keeps horizontal mode edge-to-edge when header is hidden (#5565)', async () => {
+  attrs.clear();
+  viewSettings.vertical = false;
+  viewSettings.showHeader = false;
+  openGate.pending = Promise.resolve();
+  openGate.started = false;
+  render(<FoliateViewer {...props(75, 59)} />);
+  await waitFor(() => expect(attrs.has('margin-top')).toBe(true));
+  expect(attrs.get('margin-top')).toBe('16px');
 });

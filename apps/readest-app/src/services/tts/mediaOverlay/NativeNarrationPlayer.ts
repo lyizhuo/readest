@@ -32,6 +32,12 @@ type FileSource =
   | { start: number; end: number; contentType: string }
   | { entry: string; contentType: string };
 
+interface NativeLoop {
+  href: string;
+  begin: number;
+  end: number;
+}
+
 interface PlayoutEvent {
   type: string;
   session: number;
@@ -57,11 +63,14 @@ export class NativeNarrationPlayer {
   readonly supportsStreaming: boolean;
   readonly queuesNext: boolean;
   readonly cancelsPendingLoads: boolean;
+  // Android repeats an A-B span itself (see setLoop).
+  readonly loopsNatively: boolean;
 
   constructor(appService?: AppService | null) {
     this.supportsStreaming = !appService?.isLinuxApp;
     this.queuesNext = !!appService?.isAndroidApp;
     this.cancelsPendingLoads = !!appService?.isLinuxApp;
+    this.loopsNatively = !!appService?.isAndroidApp;
   }
 
   static isSupported(appService?: AppService | null): boolean {
@@ -97,6 +106,15 @@ export class NativeNarrationPlayer {
   #cache = { mediaSec: 0, playing: false, at: 0 };
   #endedListeners = new Set<() => void>();
   #errorListeners = new Set<() => void>();
+  #loopListeners = new Set<() => void>();
+  // The A-B span the native player repeats, on the file `href`, once it has
+  // confirmed it; and how many times it has jumped back to the span's start.
+  #loop: NativeLoop | null = null;
+  #loopRequest: NativeLoop | null = null;
+  #loopCount = 0;
+  // What each href was handed to the plugin as, which is how the plugin names
+  // its playlist items: set-loop names the file its span belongs to with it.
+  #nativeFiles = new Map<string, { path: string; start?: number; end?: number }>();
 
   // The file the native player is on: the one loaded, or the queued one it
   // rolled into by itself.
@@ -144,15 +162,103 @@ export class NativeNarrationPlayer {
     void this.setRate(rate);
   }
 
-  addEventListener(type: 'ended' | 'error' | 'timeupdate', fn: () => void): void {
+  addEventListener(type: 'ended' | 'error' | 'timeupdate' | 'loop', fn: () => void): void {
     if (type === 'ended') this.#endedListeners.add(fn);
     else if (type === 'error') this.#errorListeners.add(fn);
+    else if (type === 'loop') this.#loopListeners.add(fn);
     // 'timeupdate' is unused: MediaOverlayClient polls currentTime on an interval.
   }
 
-  removeEventListener(type: 'ended' | 'error' | 'timeupdate', fn: () => void): void {
+  removeEventListener(type: 'ended' | 'error' | 'timeupdate' | 'loop', fn: () => void): void {
     if (type === 'ended') this.#endedListeners.delete(fn);
     else if (type === 'error') this.#errorListeners.delete(fn);
+    else if (type === 'loop') this.#loopListeners.delete(fn);
+  }
+
+  // The A-B span being repeated natively on the file now playing, if any.
+  get loop(): NativeLoop | null {
+    return this.#loop && this.#loop.href === this.#href ? this.#loop : null;
+  }
+
+  get loopCount(): number {
+    return this.#loopCount;
+  }
+
+  // Repeat [begin, end) seconds of the file now playing, or stop repeating.
+  // The WebView's timers are throttled to about once a minute after the screen
+  // has been off a few minutes, which made the JS check for the end of B fire
+  // far too late: playback read on past B. The native player jumps back to A
+  // on its own and reports each jump with a 'loop' event.
+  async setLoop(loop: { begin: number; end: number } | null): Promise<void> {
+    if (!this.loopsNatively) return;
+    const want = loop && this.#href ? { href: this.#href, ...loop } : null;
+    const current = this.#loopRequest;
+    if (
+      want === current ||
+      (want &&
+        current &&
+        want.href === current.href &&
+        want.begin === current.begin &&
+        want.end === current.end)
+    ) {
+      return;
+    }
+    if (!this.#nativeSession) {
+      // Nothing to send it to: no request is outstanding, so the next call
+      // for the same span still goes through.
+      this.#loop = null;
+      this.#loopRequest = null;
+      return;
+    }
+    const file = want ? this.#nativeFiles.get(want.href) : undefined;
+    if (want && !file) {
+      this.#loop = null;
+      this.#loopRequest = null;
+      return;
+    }
+    this.#loopRequest = want;
+    try {
+      await this.#nativeSession;
+      if (!want) {
+        // The confirmed span stays until Android has dropped it: a failed
+        // clear leaves it repeating there.
+        await invoke('plugin:native-tts|playout_control', { payload: { action: 'clear-loop' } });
+        if (this.#loopRequest === want) this.#loop = null;
+        return;
+      }
+      // The plugin arms the span only if this file is still the one playing:
+      // playback may have rolled into the next file since `want` was taken.
+      const res = await invoke<{ armed?: boolean }>('plugin:native-tts|playout_control', {
+        payload: {
+          action: 'set-loop',
+          ...file,
+          loopStartMs: want.begin * 1000,
+          loopEndMs: want.end * 1000,
+        },
+      });
+      if (this.#loopRequest === want) {
+        this.#loop = res?.armed ? want : null;
+        // Not armed: send it again once the file is playing.
+        if (!res?.armed) this.#loopRequest = null;
+      }
+    } catch (e) {
+      // Back to what Android is known to hold, so the next call retries.
+      if (this.#loopRequest === want) this.#loopRequest = this.#loop;
+      throw e;
+    }
+  }
+
+  #rememberNativeFile(href: string, path: string, bytes?: FileSource): void {
+    this.#nativeFiles.set(
+      href,
+      bytes && 'start' in bytes ? { path, start: bytes.start, end: bytes.end } : { path },
+    );
+  }
+
+  #forgetLoop(): void {
+    // The native side drops the span with its playlist.
+    this.#loop = null;
+    this.#loopRequest = null;
   }
 
   async ensureReady(): Promise<void> {
@@ -164,6 +270,7 @@ export class NativeNarrationPlayer {
       return;
     }
     this.#ended = false;
+    this.#forgetLoop();
     // A new session starts with an empty native playlist.
     this.#playlist = [];
     this.#nativeIndex = -1;
@@ -180,6 +287,7 @@ export class NativeNarrationPlayer {
   // Forget the native session id after another engine (Edge) aborted the shared
   // AVPlayer. Keeps the staged chapter file so the next load() is cheap.
   invalidateSession(abort = this.cancelsPendingLoads): void {
+    if (abort) this.#forgetLoop();
     this.#userPaused = true;
     this.#cache.playing = false;
     this.#href = null;
@@ -207,10 +315,11 @@ export class NativeNarrationPlayer {
     const path = await source.resolvePath?.(href).catch(() => null);
     signal?.throwIfAborted();
     if (path && (this.supportsStreaming || path.startsWith('/'))) {
-      await (after !== null
-        ? this.queuePath(href, path, after)
-        : this.loadPath(href, path, 0, undefined, signal));
-      return true;
+      return await this.#placed(
+        after !== null
+          ? this.queuePath(href, path, after)
+          : this.loadPath(href, path, 0, undefined, signal),
+      );
     }
     const resolving = source.getMediaSource?.(href, contentType);
     // Direct-file backends must surface errors without extracting a recording.
@@ -225,10 +334,7 @@ export class NativeNarrationPlayer {
         after !== null
           ? this.queuePath(href, media.path, after, bytes)
           : this.loadPath(href, media.path, 0, bytes, signal);
-      if (!this.supportsStreaming) {
-        await placing;
-        return true;
-      }
+      if (!this.supportsStreaming) return await this.#placed(placing);
       if (
         await placing.then(
           () => true,
@@ -242,6 +348,21 @@ export class NativeNarrationPlayer {
     const blob = loaded.type ? loaded : new Blob([loaded], { type: contentType });
     await (after !== null ? this.queue(href, blob, after) : this.load(href, blob, 0));
     return true;
+  }
+
+  // The Linux decoder has no Opus, and an .mp4 or .m4a does not say which codec
+  // it holds (#7560). A file it refuses for that is declined, for the web view
+  // to play; any other failure still surfaces.
+  async #placed(placing: Promise<void>): Promise<boolean> {
+    try {
+      await placing;
+      return true;
+    } catch (error) {
+      if (!this.supportsStreaming && String(error).includes('no supported audio track')) {
+        return false;
+      }
+      throw error;
+    }
   }
 
   // Stage the chapter blob once per href, then load (or seek) on the native
@@ -277,6 +398,7 @@ export class NativeNarrationPlayer {
     // Checked with nothing awaited before the command: another file loaded
     // while this one resolved means it no longer follows what is playing.
     if (this.#href !== after || this.#playlist.includes(href)) return;
+    this.#rememberNativeFile(href, path, bytes);
     await invoke('plugin:native-tts|playout_control', {
       payload: { action: 'queue', path, ...bytes },
     });
@@ -318,6 +440,7 @@ export class NativeNarrationPlayer {
     this.#href = href;
     this.#ended = false;
     this.#loads++;
+    this.#rememberNativeFile(href, path, bytes);
     await invoke('plugin:native-tts|playout_control', {
       payload: {
         action: 'load',
@@ -385,6 +508,7 @@ export class NativeNarrationPlayer {
   }
 
   async release(): Promise<void> {
+    this.#forgetLoop();
     this.pause();
     this.#href = null;
     this.#stopPolling();
@@ -489,6 +613,15 @@ export class NativeNarrationPlayer {
       this.#ended = true;
       this.#cache.playing = false;
       for (const fn of [...this.#errorListeners]) fn();
+    } else if (event.type === 'loop') {
+      // Back at A: the clock restarts there, and whatever waits on B's end
+      // learns the span came round without having to catch the moment itself.
+      const loop = this.#loop;
+      if (!loop) return;
+      this.#loopCount++;
+      this.#ended = false;
+      this.#cache = { mediaSec: loop.begin, playing: !this.#userPaused, at: performance.now() };
+      for (const fn of [...this.#loopListeners]) fn();
     } else if (event.type === 'chunk-start') {
       this.#ended = false;
       this.#cache.playing = !this.#userPaused;

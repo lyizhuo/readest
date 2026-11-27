@@ -88,9 +88,13 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             commands::anki_status,
             commands::anki_request_permission,
             commands::anki_list_decks,
+            commands::anki_list_note_types,
             commands::anki_read_deck,
             commands::anki_add_notes,
             commands::anki_update_tags,
+            commands::anki_note_type,
+            commands::anki_upgrade_note_type,
+            commands::anki_set_entries,
             commands::select_directory,
             commands::show_file_picker,
             commands::get_storefront_region_code,
@@ -122,6 +126,9 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             commands::read_share_clip_html,
             commands::icloud_container_status,
             commands::icloud_ensure_downloaded,
+            commands::on_device_llm_status,
+            commands::on_device_llm_generate,
+            commands::on_device_llm_cancel,
         ])
         .setup(|app, api| {
             #[cfg(mobile)]

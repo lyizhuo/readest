@@ -14,7 +14,12 @@ vi.mock('@/hooks/useTranslation', () => ({
       params ? key.replace(/\{\{(\w+)\}\}/g, (_match, name) => String(params[name] ?? '')) : key,
 }));
 
-const renderActions = (userPlan: UserPlan = 'free', customizationPurchased = false) => {
+const renderActions = (
+  userPlan: UserPlan = 'free',
+  customizationPurchased = false,
+  giftOnly = false,
+  onRedeemGiftCard?: () => void,
+) => {
   const onConfirmDelete = vi.fn();
   const onConfirmDeleteAllBooks = vi.fn();
   render(
@@ -24,11 +29,13 @@ const renderActions = (userPlan: UserPlan = 'free', customizationPurchased = fal
       userPlan={userPlan}
       customizationPurchased={customizationPurchased}
       iapAvailable={false}
+      giftOnly={giftOnly}
       onLogout={vi.fn()}
       onResetPassword={vi.fn()}
       onUpdateEmail={vi.fn()}
       onConfirmDelete={onConfirmDelete}
       onConfirmDeleteAllBooks={onConfirmDeleteAllBooks}
+      onRedeemGiftCard={onRedeemGiftCard}
     />,
   );
   return { onConfirmDelete, onConfirmDeleteAllBooks };
@@ -160,5 +167,40 @@ describe('account deletion confirmation (#7251)', () => {
     expect(onConfirmDeleteAllBooks).toHaveBeenCalledTimes(1);
     expect(onConfirmDelete).not.toHaveBeenCalled();
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+  });
+});
+
+describe('gift cards', () => {
+  // Buying, and the cards you bought, live behind On-Demand Purchase.
+  it('offers Redeem Gift Card, which opens the redeem view', () => {
+    const onRedeemGiftCard = vi.fn();
+    renderActions('free', false, false, onRedeemGiftCard);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Redeem Gift Card' }));
+
+    expect(onRedeemGiftCard).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('button', { name: 'Gift Cards' })).toBeNull();
+  });
+});
+
+describe('gift-only holders', () => {
+  it('hides Manage Subscription for a gift-only holder', () => {
+    renderActions('plus', false, true);
+    expect(screen.queryByRole('button', { name: 'Manage Subscription' })).toBeNull();
+  });
+
+  it('keeps Manage Subscription for a paying holder', () => {
+    renderActions('plus', false, false);
+    expect(screen.getByRole('button', { name: 'Manage Subscription' })).toBeTruthy();
+  });
+});
+
+describe('sign-in details', () => {
+  it('labels the password and email actions as changes', () => {
+    renderActions();
+    expect(screen.getByRole('button', { name: 'Change Password' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Change Email' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Reset Password' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Update Email' })).toBeNull();
   });
 });

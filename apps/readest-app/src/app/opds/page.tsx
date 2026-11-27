@@ -1,7 +1,7 @@
 'use client';
 
 import clsx from 'clsx';
-import { useEffect, useState, useCallback, useRef, useMemo } from 'react';
+import { useEffect, useState, useCallback, useRef, useMemo, useId } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { isOPDSCatalog, getPublication, getFeed, getOpenSearch } from 'foliate-js/opds.js';
 import { openUrl } from '@tauri-apps/plugin-opener';
@@ -21,6 +21,7 @@ import { queueOPDSBookUploads } from '@/services/opds/cloudUpload';
 import { useTransferQueue } from '@/hooks/useTransferQueue';
 import { useTheme } from '@/hooks/useTheme';
 import { useLibrary } from '@/hooks/useLibrary';
+import { useLibraryFileSync } from '@/app/library/hooks/useLibraryFileSync';
 import { eventDispatcher } from '@/utils/event';
 import { navigateToReader } from '@/utils/nav';
 import { getFileExtFromMimeType } from '@/libs/document';
@@ -41,6 +42,7 @@ import {
   getProxiedURL,
   fetchWithAuth,
   probeAuth,
+  needsImageProxy,
   needsProxy,
   needsNativeImageFetch,
   probeFilename,
@@ -124,6 +126,7 @@ export default function BrowserPage() {
   const [historyIndex, setHistoryIndex] = useState(-1);
   const [showAddCatalog, setShowAddCatalog] = useState(false);
   const [newCatalogName, setNewCatalogName] = useState('');
+  const catalogNameId = useId();
 
   const searchParams = useSearchParams();
   const catalogUrl = searchParams?.get('url') || '';
@@ -158,6 +161,9 @@ export default function BrowserPage() {
 
   useTheme({ systemUIVisible: false });
   useTransferQueue(libraryLoaded);
+  // A download imports the book here, off the library screen: publish it to
+  // library.json on WebDAV / Google Drive / S3 too (#7464).
+  useLibraryFileSync();
 
   useEffect(() => {
     startURLRef.current = state.startURL;
@@ -719,6 +725,7 @@ export default function BrowserPage() {
                         serverUrl: settings.bookorbit!.serverUrl,
                         username: settings.bookorbit!.username,
                         password: settings.bookorbit!.password,
+                        apiKey: settings.bookorbit!.apiKey,
                         customHeaders: settings.bookorbit!.customHeaders,
                         allowSelfSignedCert: allowsSelfSignedCert(settings.bookorbit!),
                       },
@@ -744,7 +751,9 @@ export default function BrowserPage() {
             if (book) {
               queueOPDSBookUploads(!!user, useSettingsStore.getState().settings, [book]);
             }
-            setLibrary(library);
+            // importBook appended to the store's own array: hand back a new
+            // one so useLibraryFileSync sees the import (#7464).
+            setLibrary([...library]);
             appService.saveLibraryBooks(library);
             return book;
           } catch (importError) {
@@ -771,6 +780,7 @@ export default function BrowserPage() {
       catalogSourceId,
       publication,
       publicationCoverHref,
+      settings.bookorbit,
     ],
   );
 
@@ -897,7 +907,7 @@ export default function BrowserPage() {
         Object.keys(customHeaders).length === 0 &&
         !needsNativeImageFetch(url)
       ) {
-        return needsProxy(url) ? getProxiedURL(url, true) : url;
+        return needsImageProxy(url) ? getProxiedURL(url, true) : url;
       }
 
       const cachedKey = getOPDSImageCacheFilename(url, cacheVersion);
@@ -1132,9 +1142,16 @@ export default function BrowserPage() {
         catalogId: catalogSourceId,
         sourceUrls,
         library,
-      }).then((book) => {
-        if (!cancelled && book) setExistingBookForPublication(book);
-      });
+      })
+        .then((book) => {
+          if (!cancelled && book) setExistingBookForPublication(book);
+        })
+        .catch((error) => {
+          // Best-effort lookup: if the source-map database is corrupt or
+          // unavailable (web OPFS), skip the "Open & Read" badge rather
+          // than emit an unhandled rejection on every page view.
+          console.warn('OPDS: source map lookup failed:', error);
+        });
     }
     return () => {
       cancelled = true;
@@ -1184,6 +1201,8 @@ export default function BrowserPage() {
     setShowAddCatalog(false);
   }, [newCatalogName, state.currentURL, catalog, envConfig, _]);
 
+  const isWebPwa = appService?.appPlatform === 'web' && appService.hasSafeAreaInset;
+
   return (
     <div
       className={clsx(
@@ -1192,7 +1211,7 @@ export default function BrowserPage() {
       )}
     >
       <div
-        className='relative top-0 z-40 w-full'
+        className={clsx('top-0 z-40 w-full', isWebPwa ? 'bg-base-100 sticky' : 'relative')}
         style={{
           paddingTop: `${safeAreaInsets?.top || 0}px`,
           // Clear iPhone Duo's side status strip (#6307).
@@ -1286,10 +1305,14 @@ export default function BrowserPage() {
       >
         <div className='flex flex-col gap-4 pt-2'>
           <div className='flex flex-col'>
-            <label className='flex select-none items-center justify-between px-1 py-2'>
+            <label
+              htmlFor={catalogNameId}
+              className='flex select-none items-center justify-between px-1 py-2'
+            >
               <span className='text-sm font-medium text-sm'>{_('Catalog Name')}</span>
             </label>
             <input
+              id={catalogNameId}
               type='text'
               value={newCatalogName}
               onChange={(e) => setNewCatalogName(e.target.value)}

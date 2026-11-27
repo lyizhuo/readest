@@ -32,9 +32,13 @@ const COMMANDS: &[&str] = &[
     "anki_status",
     "anki_request_permission",
     "anki_list_decks",
+    "anki_list_note_types",
     "anki_read_deck",
     "anki_add_notes",
     "anki_update_tags",
+    "anki_note_type",
+    "anki_upgrade_note_type",
+    "anki_set_entries",
     "select_directory",
     "show_file_picker",
     "get_storefront_region_code",
@@ -75,6 +79,9 @@ const COMMANDS: &[&str] = &[
     "read_share_clip_html",
     "icloud_container_status",
     "icloud_ensure_downloaded",
+    "on_device_llm_status",
+    "on_device_llm_generate",
+    "on_device_llm_cancel",
 ];
 
 fn main() {

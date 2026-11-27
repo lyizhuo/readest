@@ -5,8 +5,13 @@ export type AnnotationToolType =
   | 'annotate'
   | 'search'
   | 'dictionary'
+  | 'contextdictionary'
+  | 'xray'
+  | 'systemdictionary'
+  | 'vocabulary'
   | 'translate'
   | 'tts'
   | 'proofread'
   | 'share'
+  | 'shareqr'
   | 'quotecard';

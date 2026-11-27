@@ -40,6 +40,7 @@ const DEFAULT_DICTIONARY_SETTINGS: DictionarySettings = {
     BUILTIN_PROVIDER_IDS.wiktionary,
     BUILTIN_PROVIDER_IDS.wikipedia,
     BUILTIN_PROVIDER_IDS.context,
+    BUILTIN_PROVIDER_IDS.xray,
     ...BUILTIN_WEB_ORDER,
   ],
   providerEnabled: {
@@ -52,6 +53,7 @@ const DEFAULT_DICTIONARY_SETTINGS: DictionarySettings = {
     // Opt-in: it needs an OpenAI-compatible custom translator and spends
     // the user's own API tokens on every lookup.
     [BUILTIN_PROVIDER_IDS.context]: false,
+    [BUILTIN_PROVIDER_IDS.xray]: false,
     [BUILTIN_WEB_SEARCH_IDS.google]: false,
     [BUILTIN_WEB_SEARCH_IDS.urban]: false,
     [BUILTIN_WEB_SEARCH_IDS.merriamWebster]: false,
@@ -127,12 +129,14 @@ interface DictionaryStoreState {
   setAutoPlayPronunciation(enabled: boolean): void;
   setSaveLookupsToVocabulary(enabled: boolean): void;
   setSystemDictionaryFullscreen(enabled: boolean): void;
+  /** Pick the dictionary whose entry goes on Readest's Anki cards (#7728). */
+  setAnkiEntryProviderId(id: string | undefined): void;
   /** Pick the custom translator the context dictionary asks (#5544). */
   setContextTranslatorId(id: string): void;
   setContextOptions(
     options: Pick<
       DictionarySettings,
-      'contextPromptId' | 'contextSystemPrompt' | 'contextMaxOutputTokens'
+      'contextPromptId' | 'contextSystemPrompt' | 'contextMaxOutputTokens' | 'xrayAutoUpdate'
     >,
   ): void;
 
@@ -480,6 +484,12 @@ export const useCustomDictionaryStore = create<DictionaryStoreState>((set, get) 
     }));
   },
 
+  setAnkiEntryProviderId: (id) => {
+    set((state) => ({
+      settings: { ...state.settings, ankiEntryProviderId: id },
+    }));
+  },
+
   setContextTranslatorId: (id) => {
     set((state) => ({
       settings: { ...state.settings, contextTranslatorId: id },
@@ -678,11 +688,13 @@ export const useCustomDictionaryStore = create<DictionaryStoreState>((set, get) 
           persistedSettings.autoPlayPronunciation ??
           DEFAULT_DICTIONARY_SETTINGS.autoPlayPronunciation,
         saveLookupsToVocabulary: persistedSettings.saveLookupsToVocabulary,
+        ankiEntryProviderId: persistedSettings.ankiEntryProviderId,
         systemDictionaryFullscreen: persistedSettings.systemDictionaryFullscreen ?? false,
         contextTranslatorId: persistedSettings.contextTranslatorId,
         contextPromptId: persistedSettings.contextPromptId,
         contextSystemPrompt: persistedSettings.contextSystemPrompt,
         contextMaxOutputTokens: persistedSettings.contextMaxOutputTokens,
+        xrayAutoUpdate: persistedSettings.xrayAutoUpdate,
       };
       set({ dictionaries, settings: settingsMerged });
       return true;
@@ -714,7 +726,7 @@ export const useCustomDictionaryStore = create<DictionaryStoreState>((set, get) 
         markExplicitProviderOrderPublish();
       }
       setSettings(next);
-      saveSettings(envConfig, next);
+      await saveSettings(envConfig, next);
     } catch (error) {
       console.error('Failed to save custom dictionaries settings:', error);
       throw error;

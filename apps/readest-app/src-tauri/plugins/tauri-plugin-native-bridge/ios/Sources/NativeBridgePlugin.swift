@@ -269,6 +269,9 @@ class MediaKeyHandler {
   private weak var webView: WKWebView?
   private var registered = false
   private let commandCenter = MPRemoteCommandCenter.shared()
+  // native-tts registers its own targets on this shared center, so keep our
+  // tokens and remove only those on stop.
+  private var targets: [(MPRemoteCommand, Any)] = []
 
   func start(webView: WKWebView) {
     self.webView = webView
@@ -276,22 +279,28 @@ class MediaKeyHandler {
     registered = true
     commandCenter.nextTrackCommand.isEnabled = true
     commandCenter.previousTrackCommand.isEnabled = true
-    commandCenter.nextTrackCommand.addTarget { [weak self] _ in
+    let next = commandCenter.nextTrackCommand.addTarget { [weak self] _ in
       self?.forward("MediaNext")
       return .success
     }
-    commandCenter.previousTrackCommand.addTarget { [weak self] _ in
+    let previous = commandCenter.previousTrackCommand.addTarget { [weak self] _ in
       self?.forward("MediaPrevious")
       return .success
     }
+    targets = [
+      (commandCenter.nextTrackCommand, next),
+      (commandCenter.previousTrackCommand, previous),
+    ]
     logger.log("MediaKeyHandler: started")
   }
 
   func stop() {
     if !registered { return }
     registered = false
-    commandCenter.nextTrackCommand.removeTarget(nil)
-    commandCenter.previousTrackCommand.removeTarget(nil)
+    for (command, token) in targets {
+      command.removeTarget(token)
+    }
+    targets.removeAll()
     logger.log("MediaKeyHandler: stopped")
   }
 
@@ -1111,7 +1120,14 @@ class NativeBridgePlugin: Plugin {
       // prefersStatusBarHidden and setPrefersStatusBarHidden:, which calls
       // setNeedsStatusBarAppearanceUpdate. Needs
       // UIViewControllerBasedStatusBarAppearance = YES in Info.plist.
-      let applied = self.setPrefersStatusBarHidden(!visible, on: keyWindow.rootViewController)
+      let rootViewController = keyWindow.rootViewController
+      let applied = self.setPreference(
+        "setPrefersStatusBarHidden:", to: !visible, on: rootViewController)
+      // The home indicator hides with the status bar, never on its own: iOS
+      // empties the Dynamic Island while an app hides either one, so other
+      // apps' Live Activities show wherever the status bar does (#7471).
+      _ = self.setPreference(
+        "setPrefersHomeIndicatorAutoHidden:", to: !visible, on: rootViewController)
       keyWindow.layoutIfNeeded()
       // The safe area follows the status bar a moment later (iPhone Duo's side
       // strip is an 84pt inset on the inner display). Resolve once it has, so
@@ -1141,17 +1157,21 @@ class NativeBridgePlugin: Plugin {
     return windows.first(where: { $0.isKeyWindow }) ?? windows.first
   }
 
-  /// Returns false when the view controller does not respond to tao's
-  /// `setPrefersStatusBarHidden:`, so the caller can report the failure.
-  private func setPrefersStatusBarHidden(_ hidden: Bool, on viewController: UIViewController?) -> Bool {
-    let selector = NSSelectorFromString("setPrefersStatusBarHidden:")
+  /// Calls one of tao's TaoUIViewController setters, such as
+  /// `setPrefersStatusBarHidden:`, which also asks UIKit to re-read the
+  /// preference. Returns false when the view controller does not respond to
+  /// it, so the caller can report the failure.
+  private func setPreference(
+    _ setterName: String, to value: Bool, on viewController: UIViewController?
+  ) -> Bool {
+    let selector = NSSelectorFromString(setterName)
     guard let viewController = viewController, viewController.responds(to: selector) else {
-      logger.error("Root view controller cannot hide the status bar: \(String(describing: viewController))")
+      logger.error("Root view controller has no \(setterName): \(String(describing: viewController))")
       return false
     }
     typealias Setter = @convention(c) (AnyObject, Selector, Bool) -> Void
     let setter = unsafeBitCast(viewController.method(for: selector), to: Setter.self)
-    setter(viewController, selector, hidden)
+    setter(viewController, selector, value)
     return true
   }
 
@@ -1746,6 +1766,12 @@ class NativeBridgePlugin: Plugin {
       }
       var query = secureItemBaseQuery(args.key)
       query[kSecValueData as String] = data
+      if args.deviceBound == true {
+        // Device-bound items never migrate to another device (device-to-device
+        // transfer or restore), so their absence proves this app container
+        // moved to a new physical device (#7558).
+        query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+      }
       // Replace any existing entry. Delete-then-add keeps the
       // accessibility class consistent across SDK versions.
       SecItemDelete(query as CFDictionary)
@@ -2119,6 +2145,25 @@ class NativeBridgePlugin: Plugin {
       }
       invoke.resolve(["status": "timeout"])
     }
+  }
+
+  @objc public func on_device_llm_status(_ invoke: Invoke) {
+    invoke.resolve(OnDeviceLLM.status())
+  }
+
+  @objc public func on_device_llm_generate(_ invoke: Invoke) {
+    guard let args = try? invoke.parseArgs(OnDeviceLLMGenerateArgs.self) else {
+      return invoke.reject("Failed to parse arguments")
+    }
+    OnDeviceLLM.generate(args, invoke: invoke)
+  }
+
+  @objc public func on_device_llm_cancel(_ invoke: Invoke) {
+    guard let args = try? invoke.parseArgs(OnDeviceLLMCancelArgs.self) else {
+      return invoke.reject("Failed to parse arguments")
+    }
+    OnDeviceLLM.cancel(args.requestId)
+    invoke.resolve()
   }
 
   /// Hold a strong reference to the active folder picker delegate so
@@ -2560,6 +2605,9 @@ class SyncPassphraseSetArgs: Decodable {
 class SecureItemSetArgs: Decodable {
   let key: String
   let value: String
+  // When true, store with ThisDeviceOnly accessibility so the item does
+  // not migrate with the app container to another device (#7558).
+  let deviceBound: Bool?
 }
 
 class SecureItemGetArgs: Decodable {

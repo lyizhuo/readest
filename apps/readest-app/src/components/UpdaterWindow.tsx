@@ -80,6 +80,11 @@ const TAURI_UPDATER_KEYS = new Set([
   'windows-aarch64',
 ]);
 
+// An e-ink panel shows only a couple of frames a second, so on e-ink the
+// download readout moves at most this often, in one jump shared by the bar and
+// the byte count.
+const EINK_PROGRESS_INTERVAL_MS = 500;
+
 export const UpdaterContent = ({
   latestVersion,
   lastVersion,
@@ -116,6 +121,7 @@ export const UpdaterContent = ({
   const [downloaded, setDownloaded] = useState<number | null>(null);
   const [isMounted, setIsMounted] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
 
   useEffect(() => {
     setTargetLang(getLocale());
@@ -481,7 +487,11 @@ export const UpdaterContent = ({
     let downloaded = 0;
     let contentLength = 0;
     let lastLogged = 0;
+    let lastShownAt = 0;
+    // The attribute the e-ink styles key on, so the two cannot disagree.
+    const isEink = document.documentElement.dataset['eink'] === 'true';
     setProgress(0);
+    setDownloadError(null);
     setIsDownloading(true);
     try {
       await update.downloadAndInstall?.((event) => {
@@ -492,11 +502,15 @@ export const UpdaterContent = ({
             break;
           case 'Progress':
             downloaded += event.data.chunkLength;
-            setDownloaded(downloaded);
             // Guard against a 0 total (server omitted Content-Length): keep the
             // bar at an indeterminate 0% instead of NaN/Infinity.
             const percent = contentLength > 0 ? Math.floor((downloaded / contentLength) * 100) : 0;
-            setProgress(percent);
+            const now = Date.now();
+            if (!isEink || now - lastShownAt >= EINK_PROGRESS_INTERVAL_MS) {
+              lastShownAt = now;
+              setDownloaded(downloaded);
+              setProgress(percent);
+            }
             if (downloaded - lastLogged >= 1 * 1024 * 1024) {
               console.log(`downloaded ${downloaded} bytes from ${contentLength}`);
               lastLogged = downloaded;
@@ -514,7 +528,9 @@ export const UpdaterContent = ({
       }
     } catch (error) {
       console.error('Failed to download and install update:', error);
-      setError(_('Failed to download and install update'));
+      // Keep the update on screen so the reader can retry.
+      setProgress(null);
+      setDownloadError(_('Failed to download and install update'));
     } finally {
       setIsDownloading(false);
     }
@@ -558,6 +574,9 @@ export const UpdaterContent = ({
               <p className='mb-2'>{_('Download and install now?')}</p>
 
               <div className='flex w-full flex-row items-center justify-end gap-4'>
+                {downloadError && (
+                  <p className='text-error grow text-sm font-bold'>{downloadError}</p>
+                )}
                 {progress !== null && (
                   <div className='flex grow flex-col'>
                     <progress

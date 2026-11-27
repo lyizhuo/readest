@@ -1,5 +1,12 @@
 import clsx from 'clsx';
-import React, { useCallback, useMemo, useEffect, useRef, useState } from 'react';
+import React, {
+  useCallback,
+  useMemo,
+  useEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from 'react';
 import { useEnv } from '@/context/EnvContext';
 import { useSpatialNavigation } from '@/app/reader/hooks/useSpatialNavigation';
 import { useWindowFocusRestore } from '@/app/reader/hooks/useWindowFocusRestore';
@@ -14,6 +21,8 @@ import { useThemeStore } from '@/store/themeStore';
 import { eventDispatcher } from '@/utils/event';
 import type { FooterBarProps, NavigationHandlers, FooterBarChildProps } from './types';
 import { debounce } from '@/utils/debounce';
+import { getChapterScreensVersion, subscribeChapterScreens } from '@/utils/chapterScreens';
+import { getScreenPageFraction, getScreenPageInfo, usesScreenPages } from '../../utils/screenPages';
 import { isForcedMobileLayout } from '../../utils/mobileLayout';
 import { RSVPControl } from '../rsvp';
 import MobileFooterBar from './MobileFooterBar';
@@ -35,6 +44,7 @@ const FooterBar: React.FC<FooterBarProps> = ({
   const getConfig = useBookDataStore((s) => s.getConfig);
   const setConfig = useBookDataStore((s) => s.setConfig);
   const isFixedLayout = useBookDataStore((s) => !!s.getBookData(bookKey)?.isFixedLayout);
+  const sections = useBookDataStore((s) => s.getBookData(bookKey)?.bookDoc?.sections);
   const { hoveredBookKey, setHoveredBookKey, bottomBarTab, setBottomBarTab } = useReaderStore();
   const { getView, getViewState, getViewSettings } = useReaderStore();
   const { isSideBarVisible, isSideBarPinned, setSideBarVisible } = useSidebarStore();
@@ -59,10 +69,30 @@ const FooterBar: React.FC<FooterBarProps> = ({
   );
   const [shown, setShown] = useState(() => getBookProgress(bookKey));
   if (isVisible && progress !== shown) setShown(progress);
-  const { section: shownSection, pageinfo: shownPageinfo } = (isVisible ? progress : shown) ?? {};
+  const shownProgress = isVisible ? progress : shown;
+  const { section: shownSection, pageinfo: shownPageinfo } = shownProgress ?? {};
+  // With Stable Page Numbers off the slider moves through the screen pages
+  // its label and the footer count.
+  const screenPages = usesScreenPages(viewSettings, isFixedLayout, sections);
+  const screensVersion = useSyncExternalStore(subscribeChapterScreens, getChapterScreensVersion);
   const progressInfo = useMemo(
-    () => (FIXED_LAYOUT_FORMATS.has(bookFormat) ? shownSection : shownPageinfo),
-    [bookFormat, shownSection, shownPageinfo],
+    () =>
+      FIXED_LAYOUT_FORMATS.has(bookFormat)
+        ? shownSection
+        : screenPages && shownProgress
+          ? getScreenPageInfo(bookKey, view, sections!, shownProgress)
+          : shownPageinfo,
+    [
+      bookFormat,
+      shownSection,
+      shownPageinfo,
+      screenPages,
+      bookKey,
+      view,
+      sections,
+      shownProgress,
+      screensVersion,
+    ],
   );
 
   const progressValid = !!progressInfo && progressInfo.total > 0 && progressInfo.current >= 0;
@@ -76,9 +106,20 @@ const FooterBar: React.FC<FooterBarProps> = ({
   const handleProgressChange = useMemo(
     () =>
       debounce((value: number) => {
-        view?.goToFraction(value / 100.0);
+        if (!view) return;
+        // Each move is a step of one run, so Back returns to where the drag began.
+        if (screenPages) {
+          // The page the label previews: (page + 1) / total is the slider's
+          // position for a page.
+          const { total } = getScreenPageInfo(bookKey, view, sections!, getBookProgress(bookKey));
+          const page = Math.max(0, Math.ceil((value / 100) * total) - 1);
+          const fraction = getScreenPageFraction(bookKey, view, sections!, page);
+          if (fraction !== null) view.goTo({ fraction }, { step: true });
+        } else {
+          view.goTo({ fraction: value / 100.0 }, { step: true });
+        }
       }, 100),
-    [view],
+    [view, screenPages, bookKey, sections],
   );
 
   const handleGoPrevPage = useCallback(() => {
@@ -232,7 +273,7 @@ const FooterBar: React.FC<FooterBarProps> = ({
 
   const containerClasses = clsx(
     'footer-bar shadow-xs bottom-0 left-0 z-10 flex w-full flex-col',
-    !forceMobileLayout && 'sm:h-[52px] sm:bg-base-100 sm:border-none',
+    !forceMobileLayout && 'sm:h-[52px] sm:bg-base-100 not-eink:sm:border-none',
     'not-eink:border-base-300/50 eink:border-base-content border-t',
     'transition-[opacity,transform] duration-300',
     getFooterBarPosition(forceMobileLayout || window.innerWidth < 640, isSideBarPinned),

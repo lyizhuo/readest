@@ -13,7 +13,6 @@ import { useParallelViewStore } from '@/store/parallelViewStore';
 import { isWebAppPlatform } from '@/services/environment';
 import { eventDispatcher } from '@/utils/event';
 import { canPairAudiobook } from '@/utils/audiobook';
-import { FIXED_LAYOUT_FORMATS } from '@/types/book';
 import { DOWNLOAD_READEST_URL } from '@/services/constants';
 import { saveViewSettings } from '@/helpers/settings';
 import { setProofreadRulesVisibility } from '@/app/reader/components/ProofreadRules';
@@ -31,7 +30,7 @@ const BookMenu: React.FC<BookMenuProps> = ({ menuClassName, setIsDropdownOpen })
   const _ = useTranslation();
   const { envConfig } = useEnv();
   const { settings } = useSettingsStore();
-  const { bookKeys, recreateViewer, getViewSettings } = useReaderStore();
+  const { bookKeys, recreateViewer, getViewSettings, getProgress } = useReaderStore();
   const { getVisibleLibrary } = useLibraryStore();
   const { openParallelView } = useBooksManager();
   const { sideBarBookKey } = useSidebarStore();
@@ -104,8 +103,14 @@ const BookMenu: React.FC<BookMenuProps> = ({ menuClassName, setIsDropdownOpen })
       );
     }
   };
+  // Keep the books on the sections they are on now (#4991).
   const handleSetParallel = () => {
-    setParallel(bookKeys);
+    const sections: Record<string, number> = {};
+    for (const key of bookKeys) {
+      const section = getProgress(key)?.section?.current;
+      if (section !== undefined) sections[key] = section;
+    }
+    setParallel(bookKeys, sections);
     setIsDropdownOpen?.(false);
   };
   const handleUnsetParallel = () => {
@@ -191,7 +196,6 @@ const BookMenu: React.FC<BookMenuProps> = ({ menuClassName, setIsDropdownOpen })
       >
         <ul className='max-h-60 overflow-y-auto'>
           {getVisibleLibrary()
-            .filter((book) => !FIXED_LAYOUT_FORMATS.has(book.format))
             .filter((book) => !!book.downloadedAt)
             .slice(0, 20)
             .map((book) => (

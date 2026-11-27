@@ -3,9 +3,10 @@ import { FiSearch } from 'react-icons/fi';
 import { FiCopy } from 'react-icons/fi';
 import { FiLink } from 'react-icons/fi';
 import { FiShare } from 'react-icons/fi';
+import { MdQrCode2 } from 'react-icons/md';
 import { FiImage } from 'react-icons/fi';
 import { PiHighlighterFill } from 'react-icons/pi';
-import { LuBookA } from 'react-icons/lu';
+import { LuBookA, LuBookOpenText, LuBookPlus, LuScanSearch, LuSparkles } from 'react-icons/lu';
 import { BsPencilSquare } from 'react-icons/bs';
 import { BsTranslate } from 'react-icons/bs';
 import { FaHeadphones } from 'react-icons/fa6';
@@ -79,6 +80,30 @@ export const annotationToolButtons = createAnnotationToolButtons([
     quickAction: true,
   },
   {
+    type: 'contextdictionary',
+    label: _('Context Dictionary'),
+    tooltip: _('Look up text in the context dictionary after selection'),
+    Icon: LuSparkles,
+  },
+  {
+    type: 'xray',
+    label: _('X-Ray'),
+    tooltip: _('Look up text in the X-Ray after selection'),
+    Icon: LuScanSearch,
+  },
+  {
+    type: 'systemdictionary',
+    label: _('System Dictionary'),
+    tooltip: _('Look up text in the system dictionary after selection'),
+    Icon: LuBookOpenText,
+  },
+  {
+    type: 'vocabulary',
+    label: _('Add to Vocabulary'),
+    tooltip: _('Add the selected word to the vocabulary list'),
+    Icon: LuBookPlus,
+  },
+  {
     type: 'translate',
     label: _('Translate'),
     tooltip: _('Translate text after selection'),
@@ -104,6 +129,12 @@ export const annotationToolButtons = createAnnotationToolButtons([
     tooltip: _('Share text after selection'),
     Icon: FiShare,
     quickAction: true,
+  },
+  {
+    type: 'shareqr',
+    label: _('Share as QR Code'),
+    tooltip: _('Show a QR code for the selected text'),
+    Icon: MdQrCode2,
   },
   {
     type: 'quotecard',

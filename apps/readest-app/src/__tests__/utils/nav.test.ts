@@ -215,6 +215,21 @@ describe('navigateToProfile', () => {
     );
     expect(document.documentElement.getAttribute('data-nav-direction')).toBe('forward');
   });
+
+  test('navigates to /user with section when specified', () => {
+    Object.defineProperty(window, 'location', {
+      value: { pathname: '/library', search: '' },
+      writable: true,
+    });
+
+    const router = mockRouter();
+    navigateToProfile(router, 'sync');
+
+    expect(router.push).toHaveBeenCalledWith(
+      `/user?section=sync&redirect=${encodeURIComponent('/library')}`,
+    );
+    expect(document.documentElement.getAttribute('data-nav-direction')).toBe('forward');
+  });
 });
 
 describe('navigateBackFromProfile', () => {
@@ -224,6 +239,33 @@ describe('navigateBackFromProfile', () => {
 
     expect(router.replace).toHaveBeenCalledWith('/reader?ids=book1');
     expect(document.documentElement.getAttribute('data-nav-direction')).toBe('back');
+  });
+
+  test('goes back to a book still open beneath instead of stacking a second reader', () => {
+    const router = mockRouter();
+    navigateBackFromProfile(router, '/reader?ids=book1', true);
+
+    expect(router.back).toHaveBeenCalledTimes(1);
+    expect(router.replace).not.toHaveBeenCalled();
+    expect(document.documentElement.getAttribute('data-nav-direction')).toBe('back');
+  });
+
+  test('slides back to the book where view transitions are supported', async () => {
+    const router = mockRouter();
+    document.body.appendChild(document.createElement('foliate-view'));
+    const startViewTransition = vi.fn((update: () => Promise<void>) => {
+      const updateCallbackDone = update();
+      return { ready: updateCallbackDone, finished: updateCallbackDone, updateCallbackDone };
+    });
+    Object.assign(document, { startViewTransition });
+    try {
+      navigateBackFromProfile(router, '/reader?ids=book1', true);
+      await vi.waitFor(() => expect(router.back).toHaveBeenCalledTimes(1));
+      expect(startViewTransition).toHaveBeenCalledTimes(1);
+    } finally {
+      delete (document as { startViewTransition?: unknown }).startViewTransition;
+      document.body.replaceChildren();
+    }
   });
 
   test('falls back to /library without a redirect', () => {
@@ -294,6 +336,31 @@ describe('navigateToLibrary', () => {
 
     // Should still use the provided queryParams since sessionStorage has nothing
     expect(router.replace).toHaveBeenCalledWith('/library?sort=date', undefined);
+  });
+
+  test('stays on / when already on the root library route', () => {
+    Object.defineProperty(window, 'location', {
+      value: { pathname: '/', search: '' },
+      writable: true,
+    });
+
+    const router = mockRouter();
+    navigateToLibrary(router, 'sort=title');
+    expect(router.replace).toHaveBeenCalledWith('/?sort=title', undefined);
+
+    navigateToLibrary(router);
+    expect(router.replace).toHaveBeenCalledWith('/', undefined);
+  });
+
+  test('still navigates to /library when called from another route like /reader', () => {
+    Object.defineProperty(window, 'location', {
+      value: { pathname: '/reader', search: '?ids=book1' },
+      writable: true,
+    });
+
+    const router = mockRouter();
+    navigateToLibrary(router, 'sort=title');
+    expect(router.replace).toHaveBeenCalledWith('/library?sort=title', undefined);
   });
 });
 

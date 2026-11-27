@@ -2,8 +2,7 @@ import React, { useState, useEffect } from 'react';
 import {
   applyCustomTheme,
   CustomTheme,
-  generateDarkPalette,
-  generateLightPalette,
+  customThemeToTheme,
   Theme,
   themes,
   ThemeScope,
@@ -34,6 +33,7 @@ import { useFileSelector } from '@/hooks/useFileSelector';
 import { PREDEFINED_TEXTURES } from '@/styles/textures';
 import { useAtmosphereStore } from '@/store/atmosphereStore';
 import { DefaultHighlightColor, HighlightColor, UserHighlightColor } from '@/types/book';
+import type { SystemSettings } from '@/types/settings';
 import clsx from 'clsx';
 import { ScopeSwitch, SectionTitle, SettingLabel } from './primitives';
 import { HIGHLIGHT_COLOR_HEX } from '@/services/constants';
@@ -482,17 +482,7 @@ const ThemePanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset
 
   useEffect(() => {
     const customThemes = settings.globalReadSettings.customThemes ?? [];
-    setCustomThemes(
-      customThemes.map((customTheme) => ({
-        name: customTheme.name,
-        label: customTheme.label,
-        colors: {
-          light: generateLightPalette(customTheme.colors.light),
-          dark: generateDarkPalette(customTheme.colors.dark),
-        },
-        isCustomizable: true,
-      })),
-    );
+    setCustomThemes(customThemes.map(customThemeToTheme));
   }, [settings]);
 
   const handleSaveCustomTheme = (customTheme: CustomTheme) => {
@@ -531,12 +521,14 @@ const ThemePanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset
           bundleDir: textureInfo.bundleDir,
           byteSize: textureInfo.byteSize,
         });
+        // Save before the next await: a sync pull reloads the store from
+        // settings and can land mid-import, dropping unsaved images (#7671).
+        saveCustomTextures(envConfig);
         if (customTexture && !customTexture.error) {
           await loadTexture(envConfig, customTexture.id);
           if (appService) void queueReplicaBinaryUpload('texture', customTexture, appService);
         }
       }
-      saveCustomTextures(envConfig);
     });
   };
 
@@ -553,27 +545,32 @@ const ThemePanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset
     saveCustomTextures(envConfig);
   };
 
+  const saveHighlightSettings = (patch: Partial<SystemSettings['globalReadSettings']>) => {
+    const { settings: current } = useSettingsStore.getState();
+    // Account sync publishes when the settings reference changes.
+    const next = {
+      ...current,
+      globalReadSettings: { ...current.globalReadSettings, ...patch },
+    };
+    setSettings(next);
+    void saveSettings(envConfig, next);
+  };
+
   const handleCustomHighlightColorsChange = (colors: Record<HighlightColor, string>) => {
     setCustomHighlightColors(colors);
-    settings.globalReadSettings.customHighlightColors = colors;
-    setSettings(settings);
-    saveSettings(envConfig, settings);
+    saveHighlightSettings({ customHighlightColors: colors });
   };
 
   const handleUserHighlightColorsChange = (colors: UserHighlightColor[]) => {
     setUserHighlightColors(colors);
-    settings.globalReadSettings.userHighlightColors = colors;
-    setSettings(settings);
-    saveSettings(envConfig, settings);
+    saveHighlightSettings({ userHighlightColors: colors });
   };
 
   const handleDefaultHighlightLabelsChange = (
     labels: Partial<Record<DefaultHighlightColor, string>>,
   ) => {
     setDefaultHighlightLabels(labels);
-    settings.globalReadSettings.defaultHighlightLabels = labels;
-    setSettings(settings);
-    saveSettings(envConfig, settings);
+    saveHighlightSettings({ defaultHighlightLabels: labels });
   };
 
   return (

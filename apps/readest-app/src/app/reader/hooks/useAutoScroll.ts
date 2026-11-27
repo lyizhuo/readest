@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useEnv } from '@/context/EnvContext';
 import { FoliateView } from '@/types/view';
 import { useReaderStore } from '@/store/readerStore';
@@ -12,6 +12,8 @@ import {
   MIN_AUTO_SCROLL_SPEED,
 } from '@/services/constants';
 import { PacedScroller } from '../utils/autoscroller';
+import { getPageArea, PageWiper, type PageWiperHost, revealPageWipe } from '../utils/pageWipe';
+import { applyPageTurnAttributes } from './useCapturedTurn';
 
 // A stalled forward tick must persist this long before the session reacts
 // (section hop, or stop at the end of the book) — brief stalls can happen
@@ -22,6 +24,17 @@ export interface AutoScrollState {
   active: boolean;
   paused: boolean;
   speed: number;
+  /** The session wipes pages in (paginated mode) instead of scrolling. */
+  wipe: boolean;
+  /** The line a page wipe draws. */
+  wipeLineRef: React.RefObject<HTMLDivElement | null>;
+  /** A layer over the viewer for the copy of the page being read. */
+  wipeCopyRef: React.RefObject<HTMLDivElement | null>;
+  /**
+   * The live view is on the page a wipe is bringing in, not the page being
+   * read: its relocation isn't the reading position yet.
+   */
+  isWipeAhead: () => boolean;
   togglePause: () => void;
   adjustSpeed: (dir: 1 | -1) => void;
   setSpeed: (value: number, persist?: boolean) => void;
@@ -32,15 +45,23 @@ export interface AutoScrollState {
 // scrolled mode, toggled via the 'autoscroll-toggle' event (View menu, Shift+A).
 // A tap on the page pauses/resumes instead of turning the page or toggling the
 // bars; manual wheel/drag input simply composes with the paced scrolling since
-// every frame is a relative containerPosition step. Escape or leaving scrolled
-// mode stops the session.
+// every frame is a relative containerPosition step. Escape or switching
+// between scrolled and paginated mode stops the session.
+//
+// In paginated mode the page stays still and a line wipes the next page in at
+// the same speed, down horizontal lines and across vertical ones (#7575, see
+// PageWiper).
 //
 // Whether a session is engaged is remembered per book (#5631): a book closed
 // mid-session reopens scrolling, so readers who use the mode all the time don't
 // re-toggle it after every app suspend. Only an explicit stop clears it.
+//
+// `commitRelocateRef` commits the relocation held back while a wipe was ahead
+// (see isWipeAhead), once the page is wiped in.
 export const useAutoScroll = (
   bookKey: string,
   viewRef: React.RefObject<FoliateView | null>,
+  commitRelocateRef?: React.RefObject<(() => void) | null>,
 ): AutoScrollState => {
   const _ = useTranslation();
   const { envConfig } = useEnv();
@@ -50,6 +71,18 @@ export const useAutoScroll = (
   const [active, setActive] = useState(false);
   const [paused, setPaused] = useState(false);
   const [speed, setSpeedState] = useState(viewSettings?.autoScrollSpeed ?? 100);
+  const [wipe, setWipe] = useState(false);
+  // The session's mode, for the scroller callbacks created once below.
+  const wipeRef = useRef(false);
+  const wipeLineRef = useRef<HTMLDivElement | null>(null);
+  const wipeCopyRef = useRef<HTMLDivElement | null>(null);
+  const wiperRef = useRef<PageWiper | null>(null);
+  // Page turns of the wipe itself, so its relocations aren't taken for the
+  // reader navigating away.
+  const ownTurnsRef = useRef(0);
+  const lastCfiRef = useRef<string | undefined>(undefined);
+  // The view's own page turns, before a session routes them through its wipe.
+  const viewTurnsRef = useRef<Pick<FoliateView, 'next' | 'prev'> & { view: FoliateView }>(null);
 
   // Undoes the per-session window listeners; set on start.
   const sessionCleanupRef = useRef<(() => void) | null>(null);
@@ -63,6 +96,10 @@ export const useAutoScroll = (
   if (!scrollerRef.current) {
     scrollerRef.current = new PacedScroller({
       scrollBy: (delta) => {
+        if (wipeRef.current) {
+          wiperRef.current?.advance(delta);
+          return;
+        }
         const view = viewRef.current;
         const renderer = view?.renderer;
         if (!renderer) return;
@@ -97,12 +134,19 @@ export const useAutoScroll = (
       // session visibly steps: at the minimum speed of 5px/s the page jumps a
       // whole pixel every 200ms instead of gliding.
       onSubpixel: (offset) => {
+        if (wipeRef.current) {
+          wiperRef.current?.render(offset);
+          return;
+        }
         const renderer = viewRef.current?.renderer;
         if (!renderer) return;
         const sign = renderer.scrollProp === 'scrollLeft' ? -1 : 1;
         renderer.subpixelOffset = sign * offset;
       },
       onStop: () => {
+        // The wiper is kept: until its turn back lands, isWipeAhead holds the
+        // page it brought in back from the reading position, also on close.
+        void wiperRef.current?.stop();
         setActive(false);
         setPaused(false);
         setAutoScrollEnabled(bookKey, false);
@@ -111,15 +155,94 @@ export const useAutoScroll = (
         }
         sessionCleanupRef.current?.();
         sessionCleanupRef.current = null;
+        // The session is over (the store says so): page turns animate as set
+        // again. Also after a scrolled session, which held them off when the
+        // View menu switched to paginated mode before it stopped.
+        const view = viewRef.current;
+        const settings = getViewSettings(bookKey);
+        if (view && settings) {
+          view.renderer.toggleAttribute('animated', !!settings.animated && !settings.isEink);
+          applyPageTurnAttributes(view, settings, !!view.isFixedLayout);
+        }
       },
     });
   }
 
+  const wipeHostRef = useRef<PageWiperHost | null>(null);
+  if (!wipeHostRef.current) {
+    wipeHostRef.current = {
+      getLayout: () => {
+        const host = wipeCopyRef.current;
+        const renderer = viewRef.current?.renderer;
+        const area = renderer && getPageArea(renderer);
+        if (!host || !area) return null;
+        const origin = host.getBoundingClientRect();
+        const rect = area.getBoundingClientRect();
+        const settings = getViewSettings(bookKey);
+        return {
+          x: rect.left - origin.left,
+          y: rect.top - origin.top,
+          width: rect.width,
+          height: rect.height,
+          columns: renderer.columnCount ?? 1,
+          rtl: !!settings?.rtl,
+          vertical: !!settings?.vertical,
+        };
+      },
+      turn: async (forward) => {
+        const renderer = viewRef.current?.renderer;
+        if (!renderer?.isConnected || renderer.scrolled) return;
+        // The paginator animates only with `animated` set; without it the turn
+        // is an instant jump under the copy.
+        const animated = renderer.hasAttribute('animated');
+        renderer.removeAttribute('animated');
+        ownTurnsRef.current++;
+        try {
+          await (forward ? renderer.next() : renderer.prev());
+        } finally {
+          ownTurnsRef.current--;
+          // Unless a wipe started meanwhile, which turns pages unanimated.
+          const wiping = scrollerRef.current?.active && wipeRef.current;
+          if (animated && !wiping) renderer.setAttribute('animated', '');
+        }
+      },
+      atEnd: () => !!viewRef.current?.renderer.atEnd,
+      reveal: async (turn) => {
+        const host = wipeCopyRef.current;
+        const renderer = viewRef.current?.renderer;
+        return host && renderer ? revealPageWipe(host, renderer, turn) : null;
+      },
+      drawEdge: (edge) => {
+        const line = wipeLineRef.current;
+        if (!line) return;
+        line.style.display = edge ? '' : 'none';
+        if (!edge) return;
+        line.dataset['axis'] = edge.vertical ? (edge.rtl ? 'rtl' : 'ltr') : 'h';
+        line.style.width = edge.vertical ? '' : `${edge.length}px`;
+        line.style.height = edge.vertical ? `${edge.length}px` : '';
+        line.style.transform = `translate(${edge.x}px, ${edge.y}px)`;
+      },
+      onEnd: () => {
+        scrollerRef.current?.stop();
+        eventDispatcher.dispatch('toast', { message: _('End of book'), type: 'info' });
+      },
+      onCommit: () => commitRelocateRef?.current?.(),
+    };
+  }
+
+  const isWipeAhead = useCallback(() => !!wiperRef.current?.ahead, []);
+
   const togglePause = () => {
     const scroller = scrollerRef.current!;
     if (!scroller.active) return;
-    if (scroller.paused) scroller.resume();
-    else scroller.pause();
+    // A paused wipe shows the page being read, live, so any word on it can be
+    // looked up or highlighted; play wipes on from where the line was.
+    if (scroller.paused) {
+      scroller.resume();
+    } else {
+      scroller.pause();
+      void wiperRef.current?.suspend();
+    }
     setPaused(scroller.paused);
   };
 
@@ -142,8 +265,14 @@ export const useAutoScroll = (
 
   const startSession = () => {
     const scroller = scrollerRef.current!;
-    const renderer = viewRef.current?.renderer;
-    if (!renderer?.scrolled) return;
+    const view = viewRef.current;
+    const renderer = view?.renderer;
+    if (!view || !renderer) return;
+    // Fixed-layout books keep Auto Scroll scrolled-only.
+    const wipeMode = !renderer.scrolled;
+    if (wipeMode && view.isFixedLayout) return;
+    wipeRef.current = wipeMode;
+    setWipe(wipeMode);
     const speedNow = getViewSettings(bookKey)?.autoScrollSpeed ?? 100;
     setSpeedState(speedNow);
     stallStartRef.current = null;
@@ -157,8 +286,63 @@ export const useAutoScroll = (
       if (event.key === 'Escape') scroller.stop();
     };
     window.addEventListener('keydown', onKeydown, true);
-    sessionCleanupRef.current = () => {
-      window.removeEventListener('keydown', onKeydown, true);
+    const cleanups = [() => window.removeEventListener('keydown', onKeydown, true)];
+    if (wipeMode) cleanups.push(startWipe(view));
+    sessionCleanupRef.current = () => cleanups.forEach((cleanup) => cleanup());
+  };
+
+  const startWipe = (view: FoliateView) => {
+    // A stopped session may still be turning back: the new one waits for it.
+    const wiper = new PageWiper(wipeHostRef.current!, wiperRef.current ?? undefined);
+    wiperRef.current = wiper;
+    lastCfiRef.current = view.lastLocation?.cfi;
+    // Navigating elsewhere (a key, a swipe, the TOC, a re-layout) starts the
+    // next wipe at the top of the page it lands on.
+    const onRelocate = (event: Event) => {
+      const cfi = (event as CustomEvent<{ cfi?: string }>).detail?.cfi;
+      const moved = ownTurnsRef.current === 0 && cfi !== lastCfiRef.current;
+      lastCfiRef.current = cfi;
+      if (moved) wiper.reset();
+    };
+    // While the copy of the page being read is up, taps on it land on it, not
+    // on the book. A tap pauses or plays, as it does on the book, at its
+    // click: a swipe, such as the right-edge speed swipe
+    // (useAutoScrollSpeedGesture), makes none.
+    const onClick = (event: MouseEvent) => {
+      if (!wipeCopyRef.current?.contains(event.target as Node)) return;
+      event.stopPropagation();
+      togglePause();
+    };
+    // Manual turns (keys, buttons, page-turner remotes) go through view.next
+    // and view.prev; the wipe turns the renderer itself (see yieldTo).
+    if (viewTurnsRef.current?.view !== view) {
+      viewTurnsRef.current = { view, next: view.next, prev: view.prev };
+    }
+    const { next, prev } = viewTurnsRef.current;
+    const wipeNext = (distance?: number) => wiper.yieldTo(() => next.call(view, distance));
+    const wipePrev = (distance?: number) => wiper.yieldTo(() => prev.call(view, distance));
+    Object.assign(view, { next: wipeNext, prev: wipePrev });
+    view.addEventListener('relocate', onRelocate);
+    window.addEventListener('click', onClick, true);
+    // No page turn animates during the session, so none plays over the wipe:
+    // not the paginator's slide, nor a curl, flip or slide of useCapturedTurn,
+    // which leaves an Auto Scroll session's turns alone.
+    view.renderer.removeAttribute('animated');
+    const settings = getViewSettings(bookKey);
+    if (settings) applyPageTurnAttributes(view, settings, false);
+    return () => {
+      // Page turns keep waiting behind the stop's turn back and any turn
+      // queued after it, unless a new session has taken the view over.
+      const restoreWhenIdle = () => {
+        const tail = wiper.idle;
+        void tail.then(() => {
+          if (wiper.idle !== tail) return restoreWhenIdle();
+          if (view.next === wipeNext) Object.assign(view, { next, prev });
+        });
+      };
+      restoreWhenIdle();
+      view.removeEventListener('relocate', onRelocate);
+      window.removeEventListener('click', onClick, true);
     };
   };
 
@@ -191,10 +375,11 @@ export const useAutoScroll = (
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bookKey]);
 
-  // Auto Scroll only exists in scrolled mode; leaving it ends the session.
+  // Scrolled and paginated mode run different sessions; switching ends it.
   const scrolled = !!viewSettings?.scrolled;
   useEffect(() => {
-    if (!scrolled) scrollerRef.current?.stop();
+    const scroller = scrollerRef.current;
+    if (scroller?.active && wipeRef.current === scrolled) scroller.stop();
   }, [scrolled]);
 
   // Resume the session the book was closed in (#5631). Waits for the view to
@@ -224,6 +409,10 @@ export const useAutoScroll = (
     active,
     paused,
     speed,
+    wipe,
+    wipeLineRef,
+    wipeCopyRef,
+    isWipeAhead,
     togglePause,
     adjustSpeed,
     setSpeed,

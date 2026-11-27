@@ -13,13 +13,17 @@ const entry = (patch: Partial<VocabularyEntry> = {}): VocabularyEntry => ({
   occurrences: [
     {
       sentence: 'It was pure serendipity that we met.',
-      at: Date.UTC(2026, 9, 30),
+      at: new Date(2026, 9, 30, 12).getTime(),
       bookTitle: 'The Alchemist',
       bookAuthor: 'Paulo Coelho',
     },
-    { sentence: 'Serendipity, again.', at: Date.UTC(2026, 9, 1), bookTitle: 'The Alchemist' },
+    {
+      sentence: 'Serendipity, again.',
+      at: new Date(2026, 9, 1, 12).getTime(),
+      bookTitle: 'The Alchemist',
+    },
   ],
-  createdAt: Date.UTC(2026, 9, 1),
+  createdAt: new Date(2026, 9, 1, 12).getTime(),
   modifiedAt: 1,
   deletedAt: null,
   ...patch,
@@ -77,7 +81,7 @@ describe('toCsv', () => {
     const csv = toCsv([entry()]);
     expect(csv.startsWith('﻿')).toBe(true);
     expect(csv.slice(1).split('\r\n')[0]).toBe(
-      'word,state,hint,latest sentence,all sentences,book,author,first looked up,last looked up,lookup count',
+      'word,state,hint,latest sentence,all sentences,book,author,first looked up,last looked up,lookup count,language',
     );
   });
 
@@ -96,6 +100,7 @@ describe('toCsv', () => {
         '2026-10-01',
         '2026-10-30',
         '2',
+        'en',
       ].join(','),
     );
   });
@@ -118,6 +123,19 @@ describe('export on older engines', () => {
     } finally {
       globalThis.RegExp = Native;
     }
+  });
+});
+
+// Half past midnight is still the day before in UTC: the unit tests run in
+// Asia/Tokyo (vitest.config.mts).
+const localNov23 = new Date(2026, 10, 23, 0, 30);
+
+describe('toCsv dates', () => {
+  it('dates a lookup by the local day it was made on', () => {
+    const at = localNov23.getTime();
+    const csv = toCsv([entry({ occurrences: [{ sentence: 'Late.', at }], createdAt: at })]);
+    const row = csv.slice(1).split('\r\n')[1]!;
+    expect(row).toContain(',2026-11-23,2026-11-23,');
   });
 });
 

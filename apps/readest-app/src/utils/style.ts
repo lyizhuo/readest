@@ -20,7 +20,7 @@ import { isDialogueHighlightActive } from './dialogueHighlight';
 import { readStoredAmbientIsDarkMode } from './ambientLight';
 import { INLINE_FORMATTING_SELECTOR } from './inlineTags';
 import { getOSPlatform } from './misc';
-import { WHITE_TRANSPARENCY_FILTER } from './imageBackground';
+import { getDarkMonochromeFilter, WHITE_TRANSPARENCY_FILTER } from './imageBackground';
 import { classifyAndTagStandaloneDiagrams } from './imageClassifier';
 import {
   LINK_HIT_AREA_CLASS,
@@ -313,15 +313,18 @@ const getDialogueHighlightStyles = (viewSettings: ViewSettings, themeCode: Theme
       : viewSettings.dialogueHighlightWeight === 'bold'
         ? '\n    font-weight: bold !important;'
         : '';
+  // Without a background the clone repeats nothing, and iOS 16's WebKit
+  // stops wrapping a line that holds a cloned inline (#7765).
+  const clone = bgBase
+    ? '\n    box-decoration-break: clone;\n    -webkit-box-decoration-break: clone;'
+    : '';
   return `
   /* Dialogue lines tinted with the custom color or, by default, the theme's
      primary color. !important so the tint survives "Override Book Color",
      which repaints spans/paragraphs with the theme background at the same
      importance level but lower specificity. */
   .readest-dialogue {${bgDecl(22)}${text}${weight}
-    border-radius: 0.2em;
-    box-decoration-break: clone;
-    -webkit-box-decoration-break: clone;
+    border-radius: 0.2em;${clone}
   }
   .readest-dialogue-block {${bgDecl(12)}${text}${weight}
     border-radius: 0.3em;
@@ -331,9 +334,7 @@ const getDialogueHighlightStyles = (viewSettings: ViewSettings, themeCode: Theme
   /* Italic runs marked like quoted dialogue; nested marks drop their own
      tint so overlapping translucent backgrounds don't stack. */
   :is(i, em) {${bgDecl(22)}${text}${weight}
-    border-radius: 0.2em;
-    box-decoration-break: clone;
-    -webkit-box-decoration-break: clone;
+    border-radius: 0.2em;${clone}
   }
   :is(i, em) :is(i, em, .readest-dialogue), .readest-dialogue :is(i, em) {
     background-color: transparent !important;
@@ -368,6 +369,11 @@ const getColorStyles = (
   // Tables keep the darker tint they get in dark mode (see `blockquote, table *`).
   const tableBg =
     hasBackgroundTexture || !isDarkMode ? overrideBg : `color-mix(in srgb, ${bg} 80%, #000)`;
+  // Gaiji, inline glyphs and monochrome diagrams are drawn as ink in the text
+  // color on a clear ground (#7981), blended normally: screen would lighten the
+  // ink over the page color Override Book Color paints behind them. Invert
+  // Image In Dark Mode inverts them like every other image instead.
+  const darkInk = isDarkMode && !invertImgColorInDark;
   const colorStyles = `
     html {
       --bg-texture-id: ${backgroundTextureId};
@@ -424,6 +430,16 @@ const getColorStyles = (
     }
     a:any-link {
       ${overrideColor ? `color: ${primary} !important;` : isDarkMode ? `color: lightblue;` : ''}
+    }${
+      overrideColor
+        ? `
+    /* the text color above must not reach a link's own text, such as a
+       footnote marker wrapped in a span (#7573) */
+    a:any-link :is(section, aside, blockquote, article, nav, header, footer, main, figure,
+    div, p, font, h1, h2, h3, h4, h5, h6, li, span) {
+      color: inherit !important;
+    }`
+        : ''
     }
     /* left off hovered links, so a book's own a:hover style applies (#6859) */
     a:any-link:where(:not(:hover)) {
@@ -471,12 +487,8 @@ const getColorStyles = (
     sup img.has-text-siblings,
     img.has-text-siblings,
     img[class*="gaiji"] {
-      ${
-        isDarkMode && !invertImgColorInDark
-          ? `filter: ${transparentImageBackground ? `${WHITE_TRANSPARENCY_FILTER} ` : ''}invert(1) hue-rotate(180deg);`
-          : ''
-      }
-      mix-blend-mode: ${isDarkMode ? 'screen' : 'multiply'};
+      ${darkInk ? `filter: ${getDarkMonochromeFilter(fg)};` : ''}
+      mix-blend-mode: ${darkInk ? 'normal' : isDarkMode ? 'screen' : 'multiply'};
     }
     ${
       isDarkMode
@@ -484,15 +496,11 @@ const getColorStyles = (
       ${overrideColor ? `background-color: ${overrideBg};` : ''}
     }
     img.monochrome-diagram {
-      ${
-        !invertImgColorInDark
-          ? `filter: ${transparentImageBackground ? `${WHITE_TRANSPARENCY_FILTER} ` : ''}invert(1) hue-rotate(180deg);`
-          : ''
-      }
-      mix-blend-mode: screen;
+      ${darkInk ? `filter: ${getDarkMonochromeFilter(fg)};` : ''}
+      mix-blend-mode: ${darkInk ? 'normal' : 'screen'};
     }
     p[width][height] > img.monochrome-diagram:only-child {
-      mix-blend-mode: screen;
+      mix-blend-mode: ${darkInk ? 'normal' : 'screen'};
     }`
         : ''
     }
@@ -595,6 +603,20 @@ const getPageLayoutStyles = (
      Size it to the paginator's content box, which is right in any writing mode. */
   body.paginated-mode > .main.vrtl.height-100per {
     height: calc(var(--available-height) * 1px) !important;
+  }
+  /* EBPAJ cover pages put a single img.fit inside body.p-cover > .main > p
+     with no block-axis centering, so a width-constrained cover on a portrait
+     screen sticks to the top edge (and under the notch when the header is off).
+     No :only-child on the img: the next-section skip link (a11y.ts) is
+     appended inside that <p>. */
+  body.paginated-mode:is(.p-cover, [epub|type~="cover"]) > .main:has(> p:only-child > img.fit) {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    min-height: calc(var(--available-height) * 1px);
+  }
+  body.paginated-mode:is(.p-cover, [epub|type~="cover"]) > .main:has(> p:only-child > img.fit) > p {
+    margin-block: 0 !important;
   }
   body {
     overflow: unset;
@@ -719,6 +741,34 @@ const getPageLayoutStyles = (
   body.paginated-mode svg {
     max-width: 100%;
     max-height: calc(var(--available-height) * 1px);
+  }
+
+  /* A section holding only an image (a cover, a plate) has it sized to the
+     page. A top margin above it makes its line taller than the page, and the
+     rest goes onto the next page: WebKit cuts the image there, Chromium moves
+     it whole and leaves a blank page (#6676). */
+  body.paginated-mode :has(.lone-image) {
+    margin-block-start: 0 !important;
+  }
+  /* WebKit never moves anything taller than a page: it cuts it where it falls.
+     An image sized to the page sits on the baseline with the line's descent
+     under it, so its line is a few px taller than the page and the image is
+     cut across two pages. Chromium moves it whole. Aligning an image alone on
+     its line to the top drops the descent, so its line fits; an image that
+     shares its line with text keeps the book's alignment.
+     A block that ends exactly on a page boundary also carries the margin after
+     it onto the next page, where Chromium drops it, so a second page-tall image
+     went a page further and left a blank page. Ending the line 1px early lets
+     WebKit drop that margin; :where() lets a book's own margin win.
+     -webkit-line-box-contain is supported only by WebKit (#6676). */
+  @supports (-webkit-line-box-contain: replaced) {
+    body.paginated-mode img.alone-on-line:not(.has-text-siblings),
+    body.paginated-mode .lone-image {
+      vertical-align: top;
+    }
+    :where(body.paginated-mode img.alone-on-line:not(.has-text-siblings)) {
+      margin-block-end: -1px;
+    }
   }
 
   body.scroll-mode img {
@@ -1177,8 +1227,24 @@ const getRubyStyles = (viewSettings: ViewSettings) => {
   rp {
     display: none !important;
   }
+  /* Keep each glossed word as a single line-level unit and center it under its
+     hint (#7880): Chromium 128+ makes <ruby> line-breakable, which splits words
+     and hints across lines under overflow-wrap: break-word. */
   ruby.wl-gloss {
     cursor: help;
+    white-space: nowrap;
+    ruby-align: center;
+  }
+  /* Chromium centers a word under a wider hint by moving the last glyph of the
+     word's first letter right. When that letter is a base and a combining mark
+     (Bitter draws ī as ı + U+0304), the mark leaves its base behind (#7880). An
+     empty box ahead of the word takes that space instead. Legacy WebKit, which
+     has no ruby-align, would lose the hint's overhang into the space before
+     the word, so it is left out. */
+  @supports (ruby-align: center) {
+    ruby.wl-gloss::before {
+      content: '';
+    }
   }
   ruby.wl-gloss > rt {
     font-size: ${fontSize}em;
@@ -1252,27 +1318,31 @@ export const getStyles = (
   if (!themeCode) {
     themeCode = getThemeCode();
   }
-  const pageLayoutStyles = getPageLayoutStyles(
-    viewSettings.marginTopPx,
-    viewSettings.marginRightPx,
-    viewSettings.marginBottomPx,
-    viewSettings.marginLeftPx,
-    1.0,
-    viewSettings.writingMode!,
-    viewSettings.vertical!,
+  const pageLayoutStyles = scaleFontRelativeLengths(
+    getPageLayoutStyles(
+      viewSettings.marginTopPx,
+      viewSettings.marginRightPx,
+      viewSettings.marginBottomPx,
+      viewSettings.marginLeftPx,
+      1.0,
+      viewSettings.writingMode!,
+      viewSettings.vertical!,
+    ),
   );
   const paragraphLayoutStyles = viewSettings.useBookLayout
     ? ''
-    : getParagraphLayoutStyles(
-        viewSettings.overrideLayout!,
-        viewSettings.paragraphMargin!,
-        viewSettings.lineHeight!,
-        viewSettings.wordSpacing!,
-        viewSettings.letterSpacing!,
-        viewSettings.textIndent!,
-        viewSettings.fullJustification!,
-        viewSettings.hyphenation!,
-        viewSettings.vertical!,
+    : scaleFontRelativeLengths(
+        getParagraphLayoutStyles(
+          viewSettings.overrideLayout!,
+          viewSettings.paragraphMargin!,
+          viewSettings.lineHeight!,
+          viewSettings.wordSpacing!,
+          viewSettings.letterSpacing!,
+          viewSettings.textIndent!,
+          viewSettings.fullJustification!,
+          viewSettings.hyphenation!,
+          viewSettings.vertical!,
+        ),
       );
   const fontStyles = getFontStyles(
     viewSettings.serifFont!,
@@ -1404,7 +1474,7 @@ const wrapPublisherFonts = (families: string, rewriteGenerics = false) => {
 };
 
 const FONT_SIZE =
-  /^(?:(?:\d+(?:\.\d+)?|\.\d+)(?:[a-z]+|%)|x*-?(?:small|large)|medium|smaller|larger)$/i;
+  /^(?:(?:\d+(?:\.\d+)?|\.\d+)(?:[a-z]+|%)|x*-?(?:small|large)|medium|smaller|larger|calc\([^\s/]*\))$/i;
 
 // In a `font` shorthand the family list comes last, after the size and an
 // optional `/line-height`, e.g. `font: italic 1em/1.2 Palatino, serif`.
@@ -1424,11 +1494,74 @@ const FONT_SHORTHAND_REGEX = /((?:^|[\s;{])font\s*:)([^;{}]*)/gi;
 const wrapFontFamily = (_match: string, prefix: string, families: string) =>
   prefix + wrapPublisherFonts(families);
 
+// Android WebView applies the system font size as a text zoom (#7972): it
+// grows the computed font-size and line-height by this factor, while em and
+// rem lengths keep resolving against the declared size, so `text-indent: 2em`
+// renders as 2/F characters. Measured once from the computed size of a probe,
+// which no stylesheet can override; 1 off Android and at the default size.
+let textZoom: number | undefined;
+const getTextZoom = () => {
+  if (textZoom !== undefined) return textZoom;
+  if (getOSPlatform() !== 'android' || typeof document === 'undefined' || !document.body) return 1;
+  const probe = document.createElement('span');
+  probe.style.setProperty('font-size', '100px', 'important');
+  document.body.append(probe);
+  const zoom = parseFloat(getComputedStyle(probe).fontSize) / 100;
+  probe.remove();
+  textZoom = zoom > 0 && Math.abs(zoom - 1) >= 0.01 ? zoom : 1;
+  return textZoom;
+};
+
+// font-size, line-height and the `font` shorthand are left out: the zoom
+// already scales them. So are custom properties, whose consumer may be one of
+// those. A number glued to a name (`--gap2em`, `slide2em`) is not a length, so
+// the match needs a non-name character in front of it.
+const FONT_RELATIVE_LENGTH = /(^|[^\w.-])([+-]?(?:\d*\.)?\d+(?:e[+-]?\d+)?)(rem|em)\b/gi;
+const FONT_METRIC_PROPS =
+  /^(?:font-size|font|line-height|-webkit-text-size-adjust|text-size-adjust)$/i;
+
+/**
+ * Multiply the em/rem lengths in CSS by the text zoom, so they keep their
+ * size relative to the zoomed glyphs. A no-op when the zoom is 1. Comments,
+ * strings, url() and at-rule preludes are parked first, so a `2em` in text or
+ * in `@media (min-width: 30em)` is never rewritten. The variable marks a value
+ * as scaled, so a repeated transform (#5277) leaves it alone; it is never set,
+ * and its fallback carries the factor.
+ */
+const scaleFontRelativeLengths = (css: string) => {
+  const zoom = getTextZoom();
+  if (zoom === 1) return css;
+
+  const parked: string[] = [];
+  const masked = css.replace(
+    /\/\*[\s\S]*?\*\/|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|url\(\s*(?:"[^"]*"|'[^']*'|[^)]*)\s*\)|@[\w-]+[^{;]*/gi,
+    (token) => `READEST_LEN_${parked.push(token) - 1}_PLACEHOLDER`,
+  );
+  const scaled = masked.replace(
+    /(^|[{\s;])([\w-]+)(\s*:\s*)([^;{}]*)/gi,
+    (match, prefix: string, prop: string, sep: string, value: string) => {
+      if (FONT_METRIC_PROPS.test(prop) || prop.startsWith('--')) return match;
+      if (value.includes('--readest-font-scale')) return match;
+      const rewritten = value.replace(
+        FONT_RELATIVE_LENGTH,
+        (len, before: string, number: string, unit: string) =>
+          parseFloat(number) === 0
+            ? len
+            : `${before}calc(${number}${unit} * var(--readest-font-scale, ${zoom}))`,
+      );
+      return rewritten === value ? match : prefix + prop + sep + rewritten;
+    },
+  );
+  return scaled.replace(/READEST_LEN_(\d+)_PLACEHOLDER/g, (_, i: string) => parked[+i]!);
+};
+
 // `style` attributes don't pass through transformStylesheet.
 export const transformInlineFonts = (css: string) =>
-  css
-    .replace(/(font-family\s*:)([^;{}!]*)/gi, wrapFontFamily)
-    .replace(FONT_SHORTHAND_REGEX, wrapFontShorthand);
+  scaleFontRelativeLengths(
+    css
+      .replace(/(font-family\s*:)([^;{}!]*)/gi, wrapFontFamily)
+      .replace(FONT_SHORTHAND_REGEX, wrapFontShorthand),
+  );
 
 export const transformStylesheet = (
   css: string,
@@ -1689,6 +1822,32 @@ export const transformStylesheet = (
       },
     ),
   );
+  // A section iframe spans its own columns, so its native vw/vh can depend
+  // on the number of pages. Resolve declaration values against the reader.
+  // Whole tokens are matched, so a name like `.a-10vw` is left alone (the web
+  // build rejects lookbehind, which older iOS WebViews cannot parse). The calc
+  // has no spaces so a `font` shorthand still reads it as one size token.
+  const viewportLength = /^([+-]?(?:\d*\.)?\d+(?:e[+-]?\d+)?)(vw|vh)$/i;
+  const tokens = /url\([^)]*\)|\/\*[\s\S]*?\*\/|[\w.+-]+/gi;
+  const resolveLength = (token: string, inCondition: boolean) => {
+    const length = viewportLength.exec(token);
+    if (!length) return token;
+    const axis = length[2]!.toLowerCase();
+    const unit = (axis === 'vw' ? vw : vh) / 100;
+    return inCondition
+      ? `${Number(length[1]) * unit}px`
+      : `calc(${length[1]}*var(--readest-${axis},${unit}px))`;
+  };
+  if (/\d(?:vw|vh)/i.test(css)) {
+    css = css.replace(
+      new RegExp(`@(?:media|supports|container|import)\\b[^{;]*|${tokens.source}`, 'gi'),
+      (token) =>
+        // At-rule conditions cannot read CSS custom properties.
+        token.startsWith('@')
+          ? token.replace(tokens, (word) => resolveLength(word, true))
+          : resolveLength(token, false),
+    );
+  }
   css = css.replace(/READEST_STR_(\d+)_PLACEHOLDER/g, (_, i) => quoted[+i]!);
 
   // replace absolute font sizes with rem units
@@ -1716,8 +1875,6 @@ export const transformStylesheet = (
     })
     // remove no-op backdrop-filter: brightness(100%); see #3895
     .replace(/backdrop-filter\s*:\s*brightness\(100%\)\s*[;]?/gi, '')
-    .replace(/(\d*\.?\d+)vw/gi, (_, d) => (parseFloat(d) * vw) / 100 + 'px')
-    .replace(/(\d*\.?\d+)vh/gi, (_, d) => (parseFloat(d) * vh) / 100 + 'px')
     .replace(/([\s;])-webkit-user-select\s*:\s*none/gi, '$1-webkit-user-select: unset')
     .replace(/([\s;])-moz-user-select\s*:\s*none/gi, '$1-moz-user-select: unset')
     .replace(/([\s;])-ms-user-select\s*:\s*none/gi, '$1-ms-user-select: unset')
@@ -1767,7 +1924,9 @@ export const transformStylesheet = (
     });
   }
 
-  return css.replace(FONT_SHORTHAND_REGEX, wrapFontShorthand);
+  // Last, so the passes above still read the lengths the book wrote, such as
+  // a band's negative margin (#5711).
+  return scaleFontRelativeLengths(css.replace(FONT_SHORTHAND_REGEX, wrapFontShorthand));
 };
 
 export const applyThemeModeClass = (document: Document, isDarkMode: boolean) => {
@@ -1845,6 +2004,15 @@ export const applyNamespacedAttributes = (document: Document) => {
  */
 export const applyEinkModeAttribute = (document: Document, isEink: boolean) => {
   document.documentElement.setAttribute('data-eink', isEink ? 'true' : 'false');
+};
+
+// The reading area's size, for the vw/vh lengths transformStylesheet rewrites.
+export const applyViewportUnits = (document: Document, width: number, height: number) => {
+  // A section document can briefly have no root while the reader remounts.
+  const root = document.documentElement as HTMLElement | null;
+  if (!root || width <= 0 || height <= 0) return;
+  root.style.setProperty('--readest-vw', `${width / 100}px`);
+  root.style.setProperty('--readest-vh', `${height / 100}px`);
 };
 
 type MediaNode = { media?: MediaList; styleSheet?: CSSStyleSheet | null; cssRules?: CSSRuleList };
@@ -1925,6 +2093,54 @@ const INLINE_IMAGE_CONTAINER_TAGS = new Set([
   'cite',
   'q',
 ]);
+
+// An element whose content flows on its parent's lines (a, span, a div made
+// inline); anything else but an inline-block ends the line. An empty value
+// is the initial `inline`, in environments that report unset props as ''.
+const flowsInLine = (display: string) =>
+  display === 'inline' || display === '' || display === 'contents' || display.startsWith('ruby');
+
+// What comes first on the image's line, reading `node` in one direction:
+// text, a line break (a <br> or a block), or neither
+const scanLine = (node: Node, forward: boolean, win: Window): 'text' | 'break' | null => {
+  if (node.nodeType === Node.TEXT_NODE) return node.textContent?.trim() ? 'text' : null;
+  if (node.nodeType !== Node.ELEMENT_NODE) return null;
+  const el = node as Element;
+  const display = win.getComputedStyle(el).display;
+  if (display === 'none') return null;
+  if (el.localName === 'br') return 'break';
+  if (display.startsWith('inline-')) return el.textContent?.trim() ? 'text' : null;
+  if (!flowsInLine(display)) return 'break';
+  const children = Array.from(el.childNodes);
+  for (const child of forward ? children : children.reverse()) {
+    const found = scanLine(child, forward, win);
+    if (found) return found;
+  }
+  return null;
+};
+
+// Whether text shares the image's line: read out from the image and from each
+// inline element around it (links included), up to a <br> or a block. A break
+// ends the line in that direction for every element further out too.
+const hasTextOnLine = (img: Element, win: Window): boolean => {
+  const open = { backward: true, forward: true };
+  for (let node: Element = img; node.parentElement; node = node.parentElement) {
+    for (const forward of [false, true]) {
+      const side = forward ? 'forward' : 'backward';
+      let sib = open[side] ? (forward ? node.nextSibling : node.previousSibling) : null;
+      for (; sib; sib = forward ? sib.nextSibling : sib.previousSibling) {
+        const found = scanLine(sib, forward, win);
+        if (found === 'text') return true;
+        if (found === 'break') {
+          open[side] = false;
+          break;
+        }
+      }
+    }
+    if (!flowsInLine(win.getComputedStyle(node.parentElement).display)) return false;
+  }
+  return false;
+};
 
 const hasInlineTextSibling = (container: Element, targetNode: Node): boolean => {
   const childNodes = Array.from(container.childNodes);
@@ -2031,6 +2247,7 @@ export const applyImageStyle = (document: Document, isDarkMode = false, isFixedL
       keepBaseline,
       noEnlarge,
       leadingImageParagraph,
+      aloneOnLine: !hasTextOnLine(img, win),
     };
   });
 
@@ -2059,8 +2276,10 @@ export const applyImageStyle = (document: Document, isDarkMode = false, isFixedL
     keepBaseline,
     noEnlarge,
     leadingImageParagraph,
+    aloneOnLine,
   } of plans) {
     leadingImageParagraph?.classList.add('leading-image');
+    if (aloneOnLine) img.classList.add('alone-on-line');
     if (!isNaN(percentWidth)) {
       img.style.width = `${(percentWidth / 100) * baseWidth}px`;
       img.removeAttribute('width');
@@ -2087,6 +2306,19 @@ export const applyImageStyle = (document: Document, isDarkMode = false, isFixedL
     }
   });
   classifyAndTagStandaloneDiagrams(document, isDarkMode, isFixedLayout);
+  // A section holding only one image, with no text, is a picture page.
+  // An svg's title and desc are never drawn.
+  const images = document.body?.querySelectorAll('img, svg');
+  if (images?.length === 1) {
+    const texts = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    let hasText = false;
+    for (let node = texts.nextNode(); node && !hasText; node = texts.nextNode()) {
+      hasText =
+        !!node.textContent?.trim() &&
+        !node.parentElement?.closest('title, desc, metadata, style, script');
+    }
+    if (!hasText) images[0]!.classList.add('lone-image');
+  }
 };
 
 // The enlarged link hit area positions every link and its ::before box, and

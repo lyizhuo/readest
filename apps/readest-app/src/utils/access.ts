@@ -5,6 +5,7 @@ import {
   DEFAULT_DAILY_TRANSLATION_QUOTA,
   DEFAULT_DAILY_TTS_QUOTA,
   DEFAULT_STORAGE_QUOTA,
+  FREE_PLAN_DEVICE_LIMIT,
 } from '@/services/constants';
 import { isWebAppPlatform } from '@/services/environment';
 import { getDailyUsage } from '@/services/translators/dailyUsage';
@@ -199,6 +200,16 @@ export const isCustomizationAllowed = (plan: UserPlan, customizationPurchased: b
   isSelfHosted() || customizationPurchased || PREMIUM_PLANS.includes(plan);
 
 /**
+ * How many devices the account may sign in to sync on: three on the Free
+ * plan, or null for no limit, which is every other plan, any purchase and a
+ * self-hosted deployment.
+ */
+export const getDeviceLimit = (token: string): number | null =>
+  isSelfHosted() || getUserProfilePlan(token) !== 'free' || getCustomizationPurchased(token)
+    ? null
+    : FREE_PLAN_DEVICE_LIMIT;
+
+/**
  * Custom translators (the user's own OpenAI-compatible LLM or DeepL key) are a
  * premium feature. Requests go straight from the device, so this is a
  * client-side gate, like the TTS cache. It reads the session token directly so
@@ -298,6 +309,15 @@ export const getAccessToken = async (): Promise<string | null> => {
   const { data } = await supabase.auth.getSession();
   return data?.session?.access_token ?? null;
 };
+
+/**
+ * The token of the account the app shows as signed in, for the plan claims of
+ * client-side premium gates (the same token `useAuth()` hands the translator
+ * popup). AuthContext keeps it through offline spells and login-server
+ * outages, while {@link getAccessToken} returns null once the session expires
+ * and can't refresh (#7827). It may be expired, so never send it to a server.
+ */
+export const getSignedInToken = (): string | null => localStorage.getItem('token');
 
 export const getUserID = async (): Promise<string | null> => {
   if (isWebAppPlatform()) {
